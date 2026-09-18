@@ -21,6 +21,12 @@ namespace KnowledgeManagement.SmartStandards.Endpoints {
 
     internal const string _HtmlArea = "KnowledgeRepository.Html.Area";
 
+    internal const string _HtmlSearch = "KnowledgeRepository.Html.Search";
+
+    internal const string _HtmlRefresh = "KnowledgeRepository.Html.Refresh";
+
+    internal const string _HtmlEdit = "KnowledgeRepository.Html.Edit";
+
   }
 
 }

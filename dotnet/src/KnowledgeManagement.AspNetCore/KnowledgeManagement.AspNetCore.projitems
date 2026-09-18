@@ -9,6 +9,7 @@
     <Import_RootNamespace>KnowledgeManagement.SmartStandards</Import_RootNamespace>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="$(MSBuildThisFileDirectory)Endpoints\Html\KnowledgeRepositoryHtmlOptions.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Endpoints\Html\KnowledgeRepositoryHtmlController.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Endpoints\KnowledgeRepositoryHttpRouteNames.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Endpoints\Joplin\IJoplinSyncStateStore.cs" />
