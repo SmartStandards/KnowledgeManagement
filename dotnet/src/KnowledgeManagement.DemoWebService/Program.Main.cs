@@ -40,6 +40,8 @@ namespace KnowledgeManagement.SmartStandards.DemoWebService {
         builder = WebApplication.CreateBuilder(args);
       }
 
+      builder.Configuration.AddJsonFile("appsettings.EXCLUDED-FROM-COMMIT.json", optional: true, reloadOnChange: true);
+
       builder.AddBranchSpecificConfigurationFiles();
 
       IWebHostBuilder webHostBuilder = builder.WebHost;

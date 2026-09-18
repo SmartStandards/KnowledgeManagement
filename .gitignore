@@ -251,3 +251,4 @@ Lib_JS/lib/*
 js/*.tgz
 .vscode/settings.json
 /**/vendor/nuget
+/dotnet/src/KnowledgeManagement.DemoWebService/appsettings.EXCLUDED-FROM-COMMIT.json

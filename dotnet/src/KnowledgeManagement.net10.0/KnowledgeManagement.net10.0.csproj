@@ -35,10 +35,8 @@
     <InternalsVisibleTo Include="KnowledgeManagement.Tests" />-->
 
     <InternalsVisibleTo Include="SmartStandards.KnowledgeManagement.CommonProviders" />
-    <InternalsVisibleTo Include="SmartStandards.KnowledgeManagement.CommonProviders.net8.0" />
-    <InternalsVisibleTo Include="SmartStandards.KnowledgeManagement.CommonProviders.net10.0" />
+    <InternalsVisibleTo Include="SmartStandards.KnowledgeManagement.OneNoteProvider" />
     <InternalsVisibleTo Include="SmartStandards.KnowledgeManagement.AspNetCore" />
-    <InternalsVisibleTo Include="SmartStandards.KnowledgeManagement.AspNetCore.net10.0" />
     <InternalsVisibleTo Include="SmartStandards.KnowledgeManagement.Tests" />
     
     

@@ -1,8 +1,0 @@
-﻿
-namespace KnowledgeManagement.SmartStandards.Providers {
-
-
-
-
-}
-

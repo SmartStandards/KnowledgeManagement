@@ -9,6 +9,9 @@
     <Import_RootNamespace>KnowledgeManagement.SmartStandards</Import_RootNamespace>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="$(MSBuildThisFileDirectory)OneNoteKnowledgeRepositoryProxy.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Providers\IOneNoteGraphAuthenticationProvider.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Providers\OneNoteKnowledgeRepositoryProxy.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Providers\StaticTokenCredential.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Providers\TokenCredentialOneNoteGraphAuthenticationProvider.cs" />
   </ItemGroup>
 </Project>

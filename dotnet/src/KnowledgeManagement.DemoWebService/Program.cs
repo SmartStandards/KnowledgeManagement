@@ -40,21 +40,79 @@ namespace KnowledgeManagement.SmartStandards.DemoWebService {
         }
       );
 
-
-
       AggregatedKnowledgeRepository agg = new AggregatedKnowledgeRepository();
+
+      //////////////////////////////////////////////////////////////////////////////////////////
+      //FILESYSTEM
+
       agg.Add(new FileBasedKnowledgeRepository("C:\\Temp\\_OneNoteExport", false, true));
 
-      agg.Add(
-        new GitBasedKnowledgeRepository(
-          "https://github.com/SmartStandards/FUSE-fx.RepositoryContract",
-          true, "","/doc/"
-        ),
-        "/FUSE-fx.RepositoryContract/"
+      //////////////////////////////////////////////////////////////////////////////////////////
+      //GITHUB
+
+      //agg.Add(
+      //  new GitBasedKnowledgeRepository(
+      //    "https://github.com/SmartStandards/FUSE-fx.RepositoryContract",
+      //    true, "","/doc/"
+      //  ),
+      //  "/FUSE-fx.RepositoryContract/"
+      //);
+
+      //////////////////////////////////////////////////////////////////////////////////////////
+      // UJMW-REMOTE (mit cache)
+
+      //IKnowledgeRepository smartStandardsUjmwRemoteSource = DynamicClientFactory.CreateInstance<IKnowledgeRepository>(
+      //  "https://re-define-it.de/wiki/ujmw/IKnowledgeRepository",
+      //);
+
+      //IKnowledgeRepository smartStandardsCached = new KnowledgeRepositoryCacheWrapper(
+      //  smartStandardsUjmwRemoteSource, 5, "C:\\Temp\\_KnowledgeCache\\SmartStandards"
+      //);
+
+      //agg.Add(smartStandardsCached, "/SmartStandards/" );
+
+      //////////////////////////////////////////////////////////////////////////////////////////
+      // OneNote (via AzureGraph
+
+      //  1 OPEN: https://developer.microsoft.com/en-us/graph/graph-explorer
+      //  2 SIGN IN (upper right) -> COMPANY-Account -> follow MFA-flow
+      //  3 QUERY: https://graph.microsoft.com/v1.0/me/onenote/notebooks
+      //  4 Modify Permission -> Consent for Notes.Read / Notes.Read.All
+      //  5 Copy access token from the "Access Token"-Tab and paste it into a new config-file:
+      /*     appsettings.EXCLUDED-FROM-COMMIT.json:       
+             {
+               "oneNoteOrSiteUrl": "...",
+               "graphApiToken": "..."
+               "entraTenantId": "..."
+             }
+       */
+
+      StaticTokenCredential credential = new StaticTokenCredential(
+        config.GetValue<string>("graphApiToken")
       );
 
-      services.AddSingleton<IKnowledgeRepository>(agg);
+      IOneNoteGraphAuthenticationProvider authenticationProvider = new TokenCredentialOneNoteGraphAuthenticationProvider(
+        credential,
+        new string[] { "https://graph.microsoft.com/.default" },
+        new string[] { "https://graph.microsoft.com/.default" }
+      );
 
+      IKnowledgeRepository oneNoteUjmwRemoteSource = new OneNoteKnowledgeRepositoryProxy(
+        oneNoteOrSiteUrl: config.GetValue<string>("oneNoteOrSiteUrl"),
+        authenticationProvider: authenticationProvider,
+        readOnly: true,
+        notebookName: "1 x 1 der Programmierung"
+      );
+
+      //IKnowledgeRepository oneNoteCached = new KnowledgeRepositoryCacheWrapper(
+      //  oneNoteUjmwRemoteSource, 5, "C:\\Temp\\_KnowledgeCache\\OneNote"
+      //);
+
+      agg.Add(oneNoteUjmwRemoteSource, "/OneNote/1 x 1 der Programmierung");
+
+      //////////////////////////////////////////////////////////////////////////////////////////
+
+      services.AddSingleton<IKnowledgeRepository>(agg);
 
       services.AddSingleton<IJoplinWebDavAuthenticationValidator>(
         new DelegateBasedJoplinWebDavAuthenticationValidator((userName, password, syncId, context) => {
@@ -68,25 +126,18 @@ namespace KnowledgeManagement.SmartStandards.DemoWebService {
       //services.AddSingleton<IJoplinSyncStateStore>(
       //  new FileBasedJoplinSyncStateStore("C:\\Temp\\Joplin")
       //);
+
       services.AddSingleton<IJoplinSyncStateStoreFactory>(
         new FileBasedJoplinSyncStateStoreFactory("C:\\Temp\\Joplin")
       );
 
+      //services.AddKnowledgeManagement((ai) => { 
+
+      //  //TODO: ...
+
+      //});
 
 
-      services.AddKnowledgeManagement((ai) => { 
-
-        //TODO: ...
-
-      });
-
-
-
-
-
-
-
-  
       services.AddSwaggerGenSmartStandardsFlavored();
 
       int tid = Thread.CurrentThread.ManagedThreadId;
