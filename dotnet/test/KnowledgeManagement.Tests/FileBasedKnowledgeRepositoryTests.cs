@@ -1,4 +1,5 @@
 ﻿using KnowledgeManagement.SmartStandards;
+using KnowledgeManagement.SmartStandards.Providers;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 using System;
 using System.IO;
