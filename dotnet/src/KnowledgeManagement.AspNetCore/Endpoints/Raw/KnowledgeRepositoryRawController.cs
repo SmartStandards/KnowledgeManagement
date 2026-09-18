@@ -20,8 +20,8 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Raw {
   /// 
   /// - GET on a BeyondContent area returns a self-describing Markdown navigation response
   ///   containing logical child area paths and fully qualified absolute URLs.
-  /// - GET on a ContentAggregation area returns the same self-describing navigation
-  ///   preamble followed by the one-level aggregated Markdown content of that area.
+  /// - GET on a ContentAggregation area returns direct navigation only. Callers descend
+  ///   explicitly until a concrete content container is reached.
   /// - GET on a ContentContainer area returns the complete aggregated Markdown content
   ///   exposed through that container.
   /// - POST appends Markdown content through <see cref="IKnowledgeRepository.TryAppendContent(string, string)"/>.
@@ -37,6 +37,9 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Raw {
   public class KnowledgeRepositoryRawController : ControllerBase {
 
     private const string _MarkdownContentType = "text/markdown; charset=utf-8";
+    private const string _RouteEscapeMarker = "~";
+    private const string _RouteEscapedTilde = "~7E";
+    private const string _RouteEscapedPercent = "~25";
     private const string _KnowledgeResourceReferencePrefix = "knowledge-resource:";
 
     private static readonly Regex _KnowledgeResourceReferenceRegex = new Regex(
@@ -82,7 +85,7 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Raw {
     /// BeyondContent areas return a compact Markdown navigation document containing
     /// logical direct child paths and fully qualified direct child URLs.
     /// 
-    /// ContentAggregation and ContentContainer areas return
+    /// ContentAggregation areas return direct navigation. ContentContainer areas return
     /// <see cref="IKnowledgeRepository.GetAggregatedContent(string)"/> as Markdown.
     /// </summary>
     /// <param name="area">The catch-all logical area path relative to the controller route.</param>
@@ -395,10 +398,10 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Raw {
         return builder.ToString();
       }
 
-      string[] childAreas = _KnowledgeRepository.GetAreas(
-        false,
-        repositoryArea
-      );
+      string[] childAreas =
+        this.GetDirectAreas(
+          repositoryArea
+        );
 
       if (childAreas.Length == 0) {
         builder.Append("This knowledge area contains no directly accessible sub-areas.");
@@ -425,14 +428,28 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Raw {
     }
 
     /// <summary>
+    /// Returns only direct child areas for interactive/raw navigation.
+    ///
+    /// The raw facade intentionally never performs recursive area enumeration. Clients
+    /// discover larger repositories by following the returned direct-child URLs one level
+    /// at a time.
+    /// </summary>
+    private string[] GetDirectAreas(
+      string repositoryArea
+    ) {
+      return _KnowledgeRepository.GetAreas(
+        false,
+        repositoryArea
+      );
+    }
+
+    /// <summary>
     /// Builds the self-describing response for a ContentAggregation area.
     /// 
-    /// Direct child URLs are rendered first so a simple client can continue navigating
-    /// into subdirectories or address individual content containers directly. The
-    /// repository's one-level aggregated Markdown content follows after a separator.
-    /// 
-    /// The repository implementation is responsible for ensuring that aggregation does
-    /// not recursively absorb independent child navigation scopes.
+    /// Only direct child URLs are rendered. The raw facade deliberately does not request
+    /// aggregated content for an aggregation area because doing so may require a complete
+    /// provider subtree. Callers continue one level at a time until a content container is
+    /// reached.
     /// </summary>
     private string BuildContentAggregationResponse(
       string repositoryArea,
@@ -449,26 +466,11 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Raw {
         builder.Append(navigation.TrimEnd('\r', '\n'));
       }
 
-      string content = _KnowledgeRepository.GetAggregatedContent(
-        repositoryArea
-      );
-
-      content = this.ResolveKnowledgeResourceReferences(
-        content
-      );
-
-      if (!string.IsNullOrWhiteSpace(content)) {
-        if (builder.Length > 0) {
-          builder.Append(Environment.NewLine);
-          builder.Append(Environment.NewLine);
-          builder.Append("---");
-          builder.Append(Environment.NewLine);
-          builder.Append(Environment.NewLine);
-        }
-
-        builder.Append(content.TrimStart('\r', '\n'));
-      }
-
+      // ContentAggregation areas are navigation scopes in the raw HTTP facade. Calling
+      // GetAggregatedContent here can force an arbitrarily large provider subtree to be
+      // materialized, especially when an AggregatedKnowledgeRepository is mounted at a
+      // high level. Clients should follow one of the direct child URLs and retrieve
+      // concrete ContentContainer Markdown on demand.
       return builder.ToString();
     }
 
@@ -633,7 +635,7 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Raw {
       else {
         routeName = KnowledgeRepositoryHttpRouteNames._RawArea;
         routeValues = new {
-          area = repositoryArea.TrimStart('/')
+          area = EncodeAreaForRoute(repositoryArea)
         };
       }
 
@@ -668,7 +670,71 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Raw {
         return "/";
       }
 
-      return "/" + normalized;
+      string[] parts = normalized.Split(
+        '/',
+        StringSplitOptions.RemoveEmptyEntries
+      );
+
+      for (int index = 0; index < parts.Length; index++) {
+        parts[index] = DecodeAreaSegmentFromRoute(
+          parts[index]
+        );
+      }
+
+      return "/" + string.Join("/", parts);
+    }
+
+    /// <summary>
+    /// Encodes one complete logical area for public URL transport without producing IIS
+    /// double-escape sequences for logical percent characters.
+    /// </summary>
+    private static string EncodeAreaForRoute(
+      string area
+    ) {
+      string[] parts = area
+        .TrimStart('/')
+        .Split(
+          '/',
+          StringSplitOptions.RemoveEmptyEntries
+        );
+
+      for (int index = 0; index < parts.Length; index++) {
+        parts[index] = parts[index]
+          .Replace(
+            _RouteEscapeMarker,
+            _RouteEscapedTilde,
+            StringComparison.Ordinal
+          )
+          .Replace(
+            "%",
+            _RouteEscapedPercent,
+            StringComparison.Ordinal
+          );
+      }
+
+      return string.Join(
+        "/",
+        parts
+      );
+    }
+
+    /// <summary>
+    /// Restores one logical area segment from the route-safe transport representation.
+    /// </summary>
+    private static string DecodeAreaSegmentFromRoute(
+      string segment
+    ) {
+      return segment
+        .Replace(
+          _RouteEscapedPercent,
+          "%",
+          StringComparison.Ordinal
+        )
+        .Replace(
+          _RouteEscapedTilde,
+          _RouteEscapeMarker,
+          StringComparison.Ordinal
+        );
     }
 
     /// <summary>

@@ -258,7 +258,10 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
           // Knowledge projection and can therefore be served directly.
         }
         else {
-          projection = this.BuildProjection();
+          projection =
+            this.BuildProjectionForWebDavPath(
+              path
+            );
 
           entry = this.ResolveWebDavEntry(
             path,
@@ -412,7 +415,10 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
           );
         }
 
-        JoplinProjection projection = this.BuildProjection();
+        JoplinProjection projection =
+          this.BuildProjectionForWebDavPath(
+            path
+          );
 
         JoplinWebDavEntry entry = this.ResolveWebDavEntry(
           path,
@@ -465,7 +471,10 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
           return this.Ok();
         }
 
-        JoplinProjection projection = this.BuildProjection();
+        JoplinProjection projection =
+          this.BuildProjectionForWebDavPath(
+            path
+          );
 
         JoplinWebDavEntry entry = this.ResolveWebDavEntry(
           path,
@@ -643,8 +652,13 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
           );
         }
 
-        JoplinProjection projection = this.BuildProjection();
-        JoplinProjectionRecord existingRecord = projection.FindRecordById(itemId);
+        JoplinProjection projection =
+          this.BuildStateProjection();
+
+        JoplinProjectionRecord existingRecord =
+          projection.FindRecordById(
+            itemId
+          );
 
         MaterializationResult materializationResult;
 
@@ -726,7 +740,8 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
       this.TraceWebDavRequest();
 
       lock (_SyncRoot) {
-        JoplinProjection projection = this.BuildProjection();
+        JoplinProjection projection =
+          this.BuildStateProjection();
 
         if (this.IsRootItemFile(path)) {
           string itemId = Path.GetFileNameWithoutExtension(path);
@@ -2391,7 +2406,8 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
         progress = false;
 
         JoplinSyncStateEntry[] rootEntries = _SyncStateStore.GetChildren("/");
-        JoplinProjection projection = this.BuildProjection();
+        JoplinProjection projection =
+          this.BuildStateProjection();
 
         foreach (JoplinSyncStateEntry entry in rootEntries) {
           if (entry.IsCollection) {
@@ -2469,16 +2485,258 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
     }
 
     /// <summary>
+    /// Creates a lightweight projection containing only the persistent Joplin mapping
+    /// state. Mutation paths use this form because parent and existing-item resolution do
+    /// not require a complete traversal of the knowledge repository.
+    /// </summary>
+    private JoplinProjection BuildStateProjection() {
+      return new JoplinProjection(
+        this.LoadProjectionState(),
+        Array.Empty<JoplinProjectedItem>()
+      );
+    }
+
+    /// <summary>
+    /// Builds only the projection required to resolve one WebDAV path.
+    ///
+    /// The synchronization root is the single protocol location that legitimately needs
+    /// the complete flat list of projected Joplin items. Exact note/folder GET, HEAD and
+    /// PROPFIND requests are resolved from the persistent mapping and materialize at most
+    /// one knowledge-backed item.
+    /// </summary>
+    private JoplinProjection BuildProjectionForWebDavPath(
+      string path
+    ) {
+      if (string.Equals(
+            path,
+            "/",
+            StringComparison.Ordinal
+          )) {
+        return this.BuildProjection();
+      }
+
+      if (!this.IsRootItemFile(
+            path
+          )) {
+        return this.BuildStateProjection();
+      }
+
+      string itemId =
+        Path.GetFileNameWithoutExtension(
+          path
+        );
+
+      JoplinProjectionState state =
+        this.LoadProjectionState();
+
+      JoplinProjectionRecord record = state.Records
+        .FirstOrDefault((JoplinProjectionRecord candidate) =>
+          string.Equals(
+            candidate.Id,
+            itemId,
+            StringComparison.OrdinalIgnoreCase
+          ));
+
+      if (record == null ||
+          record.IsSuppressed) {
+        // Exact item requests never trigger repository-wide discovery. Joplin learns the
+        // complete item set through root PROPFIND; an unknown item is therefore simply not
+        // part of the currently known projection.
+        return new JoplinProjection(
+          state,
+          Array.Empty<JoplinProjectedItem>()
+        );
+      }
+
+      JoplinProjectedItem item =
+        this.BuildProjectedItem(
+          record,
+          state
+        );
+
+      this.SaveProjectionState(
+        state
+      );
+
+      return new JoplinProjection(
+        state,
+        new JoplinProjectedItem[] {
+          item
+        }
+      );
+    }
+
+    /// <summary>
+    /// Enumerates the complete knowledge tree iteratively using only direct-child provider
+    /// requests.
+    ///
+    /// Joplin's root PROPFIND must expose a flat list of every synchronization item, so a
+    /// complete traversal of navigable notebook/document boundaries is unavoidable there.
+    /// The important boundary is that no provider ever receives GetAreas(true, ...): every
+    /// structural level is requested independently, and traversal stops at the first content
+    /// container because subordinate containers are headings inside that note.
+    /// </summary>
+    private string[] GetAllKnowledgeAreasIteratively() {
+      List<string> result =
+        new List<string>();
+
+      Stack<string> pending =
+        new Stack<string>();
+
+      string[] rootChildren =
+        _KnowledgeRepository.GetAreas(
+          false,
+          "/"
+        );
+
+      for (int index = rootChildren.Length - 1;
+           index >= 0;
+           index--) {
+        pending.Push(
+          rootChildren[index]
+        );
+      }
+
+      int processed =
+        0;
+
+      while (pending.Count > 0) {
+        string area =
+          pending.Pop();
+
+        result.Add(
+          area
+        );
+
+        ContentLevel contentLevel;
+
+        if (!this.TryGetContentLevel(
+              area,
+              out contentLevel
+            )) {
+          continue;
+        }
+
+        // The first content container is the Joplin note boundary. Descendant content
+        // containers are Markdown headings inside that note and must neither become
+        // additional sync items nor be traversed just to discover them.
+        if (contentLevel != ContentLevel.ContentContainer) {
+          string[] children =
+            _KnowledgeRepository.GetAreas(
+              false,
+              area
+            );
+
+          for (int index = children.Length - 1;
+               index >= 0;
+               index--) {
+            pending.Push(
+              children[index]
+            );
+          }
+        }
+
+        processed++;
+
+        // Large remote knowledge sources should not monopolize the executing thread for
+        // an arbitrarily long uninterrupted traversal.
+        if (processed % 128 == 0) {
+          System.Threading.Thread.Yield();
+        }
+      }
+
+      return result.ToArray();
+    }
+
+    /// <summary>
+    /// Materializes one already mapped Joplin note or folder from its exact knowledge area.
+    /// </summary>
+    private JoplinProjectedItem BuildProjectedItem(
+      JoplinProjectionRecord record,
+      JoplinProjectionState state
+    ) {
+      JoplinProjectedItem projectedItem =
+        new JoplinProjectedItem();
+
+      projectedItem.Record =
+        record;
+
+      projectedItem.Title =
+        _KnowledgeRepository.GetAreaName(
+          record.Area
+        );
+
+      projectedItem.ParentId =
+        this.ResolveProjectedParentId(
+          record.Area,
+          record,
+          state
+        );
+
+      if (record.Type == _JoplinNoteType) {
+        string knowledgeBody =
+          _KnowledgeRepository.GetAggregatedContent(
+            record.Area
+          );
+
+        projectedItem.Body =
+          this.TranslateKnowledgeBodyToJoplin(
+            record.Area,
+            knowledgeBody,
+            state
+          );
+      }
+      else {
+        projectedItem.Body =
+          string.Empty;
+      }
+
+      string semanticHash =
+        this.ComputeProjectedSemanticHash(
+          projectedItem
+        );
+
+      if (!string.Equals(
+            record.LastContentHash,
+            semanticHash,
+            StringComparison.Ordinal
+          )) {
+        record.LastContentHash =
+          semanticHash;
+
+        record.ModifiedUtc =
+          DateTime.UtcNow;
+      }
+
+      string serialized =
+        this.SerializeJoplinItem(
+          projectedItem
+        );
+
+      projectedItem.SerializedContent =
+        serialized;
+
+      projectedItem.ContentHash =
+        this.ComputeHash(
+          serialized
+        );
+
+      return projectedItem;
+    }
+
+    /// <summary>
     /// Builds the current deterministic projection from logical knowledge areas to flat
     /// Joplin WebDAV sync-item files.
+    ///
+    /// This is intentionally an explicit bulk operation used for the Joplin synchronization
+    /// root. It walks the repository level by level and never delegates recursive traversal
+    /// to a provider.
     /// </summary>
     private JoplinProjection BuildProjection() {
       JoplinProjectionState state = this.LoadProjectionState();
 
-      string[] areas = _KnowledgeRepository.GetAreas(
-        true,
-        "/"
-      );
+      string[] areas =
+        this.GetAllKnowledgeAreasIteratively();
 
       HashSet<string> currentlyProjectedAreas =
         new HashSet<string>(StringComparer.Ordinal);
@@ -2583,8 +2841,7 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
         projectedItem.ParentId = this.ResolveProjectedParentId(
           area,
           record,
-          state,
-          areas
+          state
         );
 
         if (type == _JoplinNoteType) {
@@ -2667,8 +2924,7 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
     private string ResolveProjectedParentId(
       string area,
       JoplinProjectionRecord record,
-      JoplinProjectionState state,
-      string[] allAreas
+      JoplinProjectionState state
     ) {
       if (!string.IsNullOrWhiteSpace(record.ParentIdOverride)) {
         JoplinProjectionRecord overriddenParent = state.Records

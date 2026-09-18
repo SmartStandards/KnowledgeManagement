@@ -150,19 +150,64 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         AggregatedTree tree = this.BuildTree();
         string normalizedStartArea = this.NormalizeAreaPath(startArea);
 
-        AggregatedNode startNode = tree.Find(normalizedStartArea);
+        AggregatedNode startNode =
+          this.EnsureAreaPathMaterialized(
+            tree,
+            normalizedStartArea
+          );
 
         if (startNode == null) {
           return Array.Empty<string>();
         }
 
-        List<string> result = new List<string>();
+        this.EnsureDirectChildrenMaterialized(
+          tree,
+          startNode
+        );
 
-        foreach (AggregatedNode child in startNode.Children) {
-          result.Add(child.Path);
+        if (!recurse) {
+          return startNode.Children
+            .Select((AggregatedNode child) => child.Path)
+            .ToArray();
+        }
 
-          if (recurse) {
-            this.CollectDescendants(child, result);
+        // Recursive enumeration remains available as an explicit bulk operation, but it
+        // is deliberately implemented as iterative one-level traversal. No child provider
+        // ever receives GetAreas(true, ...), preventing one recursive provider request from
+        // materializing an arbitrarily large tree or overflowing its own call stack.
+        this.EnsureSubtreeMaterialized(
+          tree,
+          startNode
+        );
+
+        List<string> result =
+          new List<string>();
+
+        Stack<AggregatedNode> pending =
+          new Stack<AggregatedNode>();
+
+        for (int index = startNode.Children.Count - 1;
+             index >= 0;
+             index--) {
+          pending.Push(
+            startNode.Children[index]
+          );
+        }
+
+        while (pending.Count > 0) {
+          AggregatedNode current =
+            pending.Pop();
+
+          result.Add(
+            current.Path
+          );
+
+          for (int index = current.Children.Count - 1;
+               index >= 0;
+               index--) {
+            pending.Push(
+              current.Children[index]
+            );
           }
         }
 
@@ -178,9 +223,16 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     ) {
       lock (_SyncRoot) {
         AggregatedTree tree = this.BuildTree();
-        AggregatedNode node = tree.Find(
-          this.NormalizeAreaPath(area)
-        );
+        string normalizedArea =
+          this.NormalizeAreaPath(
+            area
+          );
+
+        AggregatedNode node =
+          this.EnsureAreaPathMaterialized(
+            tree,
+            normalizedArea
+          );
 
         if (node == null) {
           throw new InvalidOperationException(
@@ -218,7 +270,11 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       lock (_SyncRoot) {
         string normalizedStartArea = this.NormalizeAreaPath(startArea);
         AggregatedTree tree = this.BuildTree();
-        AggregatedNode startNode = tree.Find(normalizedStartArea);
+        AggregatedNode startNode =
+          this.EnsureAreaPathMaterialized(
+            tree,
+            normalizedStartArea
+          );
 
         if (startNode == null) {
           return Array.Empty<string>();
@@ -226,7 +282,15 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
 
         HashSet<string> matches = new HashSet<string>(StringComparer.Ordinal);
 
-        string[] visibleAreas = this.GetAreas(true, normalizedStartArea);
+        this.EnsureSubtreeMaterialized(
+          tree,
+          startNode
+        );
+
+        string[] visibleAreas =
+          this.GetMaterializedDescendantPaths(
+            startNode
+          );
 
         foreach (string visibleArea in visibleAreas) {
           AggregatedNode node = tree.Find(visibleArea);
@@ -324,13 +388,22 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       lock (_SyncRoot) {
         string normalizedArea = this.NormalizeAreaPath(area);
         AggregatedTree tree = this.BuildTree();
-        AggregatedNode node = tree.Find(normalizedArea);
+        AggregatedNode node =
+          this.EnsureAreaPathMaterialized(
+            tree,
+            normalizedArea
+          );
 
         if (node == null) {
           throw new InvalidOperationException(
             "The aggregated knowledge area does not exist: " + normalizedArea
           );
         }
+
+        this.EnsureDirectChildrenMaterialized(
+          tree,
+          node
+        );
 
         contentLevel = this.ResolveCombinedContentLevel(node);
         supportsSubAreas = node.Children.Count > 0;
@@ -743,11 +816,23 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       lock (_SyncRoot) {
         string normalizedArea = this.NormalizeAreaPath(area);
         AggregatedTree tree = this.BuildTree();
-        AggregatedNode node = tree.Find(normalizedArea);
+        AggregatedNode node =
+          this.EnsureAreaPathMaterialized(
+            tree,
+            normalizedArea
+          );
 
         if (node == null) {
           return string.Empty;
         }
+
+        // Aggregated content is an explicit subtree operation. Materialize only the
+        // requested scope, one provider level at a time, instead of eagerly building the
+        // complete repository tree from the global root.
+        this.EnsureSubtreeMaterialized(
+          tree,
+          node
+        );
 
         ContentLevel contentLevel = this.ResolveCombinedContentLevel(node);
 
@@ -1560,12 +1645,19 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     private AggregatedTree BuildTreeCore() {
       AggregatedTree tree = new AggregatedTree();
 
+      // Only mount structure and provider roots are materialized eagerly. Concrete
+      // provider descendants are discovered later, one direct level at a time.
       foreach (MountedRepository mountedRepository in _Repositories) {
-        this.EnsureMountPath(tree, mountedRepository);
+        this.EnsureMountPath(
+          tree,
+          mountedRepository
+        );
 
         AggregatedNode mountNode = tree.GetOrCreate(
           mountedRepository.MountPoint,
-          this.GetLastAreaSegment(mountedRepository.MountPoint)
+          this.GetLastAreaSegment(
+            mountedRepository.MountPoint
+          )
         );
 
         mountNode.AddContribution(
@@ -1574,37 +1666,231 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
             _RootArea
           )
         );
+      }
 
-        string[] localAreas = mountedRepository.Repository.GetAreas(
-          true,
+      return tree;
+    }
+
+    /// <summary>
+    /// Materializes the path from the global root to one requested area by loading only
+    /// direct child levels that are actually required to resolve that path.
+    /// </summary>
+    private AggregatedNode EnsureAreaPathMaterialized(
+      AggregatedTree tree,
+      string area
+    ) {
+      string normalizedArea =
+        this.NormalizeAreaPath(
+          area
+        );
+
+      AggregatedNode current =
+        tree.Find(
           _RootArea
         );
 
-        foreach (string localArea in localAreas) {
-          string globalArea = this.ToGlobalPath(
-            mountedRepository,
-            localArea
+      if (normalizedArea == _RootArea) {
+        return current;
+      }
+
+      string[] segments =
+        normalizedArea.Split(
+          '/',
+          StringSplitOptions.RemoveEmptyEntries
+        );
+
+      string currentPath =
+        _RootArea;
+
+      foreach (string segment in segments) {
+        this.EnsureDirectChildrenMaterialized(
+          tree,
+          current
+        );
+
+        currentPath =
+          this.CombineAreaPath(
+            currentPath,
+            segment
           );
 
-          string displayName = mountedRepository.Repository.GetAreaName(
-            localArea
+        current =
+          tree.Find(
+            currentPath
           );
 
-          AggregatedNode globalNode = tree.GetOrCreate(
-            globalArea,
-            displayName
+        if (current == null) {
+          return null;
+        }
+      }
+
+      return current;
+    }
+
+    /// <summary>
+    /// Loads direct children of one aggregate node from every concrete provider
+    /// contribution. Child providers are always queried with recurse=false.
+    /// </summary>
+    private void EnsureDirectChildrenMaterialized(
+      AggregatedTree tree,
+      AggregatedNode node
+    ) {
+      if (node.ChildrenMaterialized) {
+        return;
+      }
+
+      foreach (AreaContribution contribution in node.Contributions) {
+        string[] localChildren =
+          contribution.MountedRepository.Repository.GetAreas(
+            false,
+            contribution.LocalArea
           );
+
+        foreach (string localChild in localChildren) {
+          string globalChild =
+            this.ToGlobalPath(
+              contribution.MountedRepository,
+              localChild
+            );
+
+          string expectedParent =
+            this.GetParentAreaPath(
+              globalChild
+            );
+
+          if (!string.Equals(
+                expectedParent,
+                node.Path,
+                StringComparison.Ordinal
+              )) {
+            continue;
+          }
+
+          string displayName =
+            contribution.MountedRepository.Repository.GetAreaName(
+              localChild
+            );
+
+          AggregatedNode globalNode =
+            tree.GetOrCreate(
+              globalChild,
+              displayName
+            );
 
           globalNode.AddContribution(
             new AreaContribution(
-              mountedRepository,
-              localArea
+              contribution.MountedRepository,
+              localChild
             )
           );
         }
       }
 
-      return tree;
+      node.ChildrenMaterialized =
+        true;
+    }
+
+    /// <summary>
+    /// Returns all already materialized descendants in deterministic depth-first pre-order.
+    /// </summary>
+    private string[] GetMaterializedDescendantPaths(
+      AggregatedNode startNode
+    ) {
+      List<string> result =
+        new List<string>();
+
+      Stack<AggregatedNode> pending =
+        new Stack<AggregatedNode>();
+
+      for (int index = startNode.Children.Count - 1;
+           index >= 0;
+           index--) {
+        pending.Push(
+          startNode.Children[index]
+        );
+      }
+
+      while (pending.Count > 0) {
+        AggregatedNode current =
+          pending.Pop();
+
+        result.Add(
+          current.Path
+        );
+
+        for (int index = current.Children.Count - 1;
+             index >= 0;
+             index--) {
+          pending.Push(
+            current.Children[index]
+          );
+        }
+      }
+
+      return result.ToArray();
+    }
+
+    /// <summary>
+    /// Materializes one requested aggregate subtree iteratively. This is used only by
+    /// explicit bulk operations such as recursive enumeration and aggregated-content
+    /// rendering.
+    /// </summary>
+    private void EnsureSubtreeMaterialized(
+      AggregatedTree tree,
+      AggregatedNode startNode
+    ) {
+      Stack<AggregatedNode> pending =
+        new Stack<AggregatedNode>();
+
+      pending.Push(
+        startNode
+      );
+
+      while (pending.Count > 0) {
+        AggregatedNode current =
+          pending.Pop();
+
+        this.EnsureDirectChildrenMaterialized(
+          tree,
+          current
+        );
+
+        for (int index = current.Children.Count - 1;
+             index >= 0;
+             index--) {
+          pending.Push(
+            current.Children[index]
+          );
+        }
+      }
+    }
+
+    /// <summary>
+    /// Returns the canonical parent path of one absolute logical area.
+    /// </summary>
+    private string GetParentAreaPath(
+      string area
+    ) {
+      string normalizedArea =
+        this.NormalizeAreaPath(
+          area
+        );
+
+      if (normalizedArea == _RootArea) {
+        return _RootArea;
+      }
+
+      int separatorIndex =
+        normalizedArea.LastIndexOf('/');
+
+      if (separatorIndex <= 0) {
+        return _RootArea;
+      }
+
+      return normalizedArea.Substring(
+        0,
+        separatorIndex
+      );
     }
 
     /// <summary>
@@ -1634,18 +1920,6 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       }
     }
 
-    /// <summary>
-    /// Recursively collects descendants using the already ordered global child list.
-    /// </summary>
-    private void CollectDescendants(
-      AggregatedNode node,
-      List<string> result
-    ) {
-      foreach (AggregatedNode child in node.Children) {
-        result.Add(child.Path);
-        this.CollectDescendants(child, result);
-      }
-    }
 
     /// <summary>
     /// Resolves the effective read-oriented content level of a merged global area.
@@ -1933,7 +2207,11 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     private AggregatedNode RequireNode(string area) {
       string normalizedArea = this.NormalizeAreaPath(area);
       AggregatedTree tree = this.BuildTree();
-      AggregatedNode node = tree.Find(normalizedArea);
+      AggregatedNode node =
+        this.EnsureAreaPathMaterialized(
+          tree,
+          normalizedArea
+        );
 
       if (node == null) {
         throw new InvalidOperationException(
@@ -2264,6 +2542,7 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       private AggregatedNode _Parent;
       private readonly List<AggregatedNode> _Children;
       private readonly List<AreaContribution> _Contributions;
+      private bool _ChildrenMaterialized;
 
       /// <summary>
       /// Creates one global tree node.
@@ -2276,6 +2555,7 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         _DisplayName = displayName;
         _Children = new List<AggregatedNode>();
         _Contributions = new List<AreaContribution>();
+        _ChildrenMaterialized = false;
       }
 
       /// <summary>
@@ -2323,6 +2603,19 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       public List<AreaContribution> Contributions {
         get {
           return _Contributions;
+        }
+      }
+
+      /// <summary>
+      /// Gets or sets whether direct provider children have already been materialized for
+      /// this node.
+      /// </summary>
+      public bool ChildrenMaterialized {
+        get {
+          return _ChildrenMaterialized;
+        }
+        set {
+          _ChildrenMaterialized = value;
         }
       }
 

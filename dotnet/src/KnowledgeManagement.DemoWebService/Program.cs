@@ -100,15 +100,15 @@ namespace KnowledgeManagement.SmartStandards.DemoWebService {
       IKnowledgeRepository oneNoteUjmwRemoteSource = new OneNoteKnowledgeRepositoryProxy(
         oneNoteOrSiteUrl: config.GetValue<string>("oneNoteOrSiteUrl"),
         authenticationProvider: authenticationProvider,
-        readOnly: true,
-        notebookName: "1 x 1 der Programmierung"
+        readOnly: true         ,notebookName: "1 x 1 der Programmierung"
       );
 
-      //IKnowledgeRepository oneNoteCached = new KnowledgeRepositoryCacheWrapper(
-      //  oneNoteUjmwRemoteSource, 5, "C:\\Temp\\_KnowledgeCache\\OneNote"
-      //);
+      IKnowledgeRepository oneNoteCached = new KnowledgeRepositoryCacheWrapper(
+        oneNoteUjmwRemoteSource, 60 * 4, "C:\\Temp\\_KnowledgeCache\\OneNote"
+      );
 
-      agg.Add(oneNoteUjmwRemoteSource, "/OneNote/1 x 1 der Programmierung");
+      agg.Add(oneNoteCached, "/OneNote/1 x 1 der Programmierung");
+      //agg.Add(oneNoteUjmwRemoteSource, "/OneNote/");
 
       //////////////////////////////////////////////////////////////////////////////////////////
 

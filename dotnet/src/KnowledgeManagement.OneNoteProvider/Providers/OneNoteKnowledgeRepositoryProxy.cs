@@ -4,11 +4,17 @@ using Markdig;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using ReverseMarkdown;
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
 using System.Net;
+using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 
 namespace KnowledgeManagement.SmartStandards.Providers {
 
@@ -23,12 +29,21 @@ namespace KnowledgeManagement.SmartStandards.Providers {
 
     private const string _GraphBaseUrl = "https://graph.microsoft.com/v1.0";
     private const string _ResourcePrefix = "knowledge-resource:";
+    private const int _MaximumGraphRetryCount = 6;
+    private const int _MinimumGraphRequestIntervalMilliseconds = 550;
+    private const int _InitialBackoffMilliseconds = 2000;
+    private const int _MaximumBackoffMilliseconds = 60000;
     private readonly object _SyncRoot = new object();
+    private readonly object _GraphRequestSyncRoot = new object();
+    private readonly ConcurrentDictionary<string, HtmlDocument> _PageCache = new ConcurrentDictionary<string, HtmlDocument>(StringComparer.Ordinal);
     private readonly bool _ReadOnly;
     private readonly string _NotebookName;
     private readonly HttpClient _HttpClient;
     private readonly Converter _HtmlToMarkdown;
     private readonly string _SiteId;
+    private AreaNode _CachedTree;
+    private NotebookInfo[] _CachedNotebooks;
+    private DateTime _LastGraphRequestUtc = DateTime.MinValue;
     private bool _Disposed;
 
     /// <summary>
@@ -50,7 +65,8 @@ namespace KnowledgeManagement.SmartStandards.Providers {
       _ReadOnly = readOnly;
       if (notebookName == null) {
         _NotebookName = string.Empty;
-      } else {
+      }
+      else {
         _NotebookName = notebookName.Trim();
       }
       _HttpClient = authenticationProvider.CreateHttpClient(_ReadOnly);
@@ -78,6 +94,7 @@ namespace KnowledgeManagement.SmartStandards.Providers {
       lock (_SyncRoot) {
         AreaNode root = this.BuildTree();
         AreaNode start = this.ResolveArea(root, startArea);
+        this.EnsureAreaChildrenLoaded(start);
         List<string> result = new List<string>();
         foreach (AreaNode child in start.Children) {
           result.Add(child.Path);
@@ -186,7 +203,7 @@ namespace KnowledgeManagement.SmartStandards.Providers {
     public byte[] GetResourceContent(string resourceId) {
       ResourceIdentity identity = this.DecodeResourceId(resourceId);
       string url = _GraphBaseUrl + "/sites/" + Uri.EscapeDataString(_SiteId) + "/onenote/resources/" + Uri.EscapeDataString(identity.NativeId) + "/content";
-      using (HttpResponseMessage response = _HttpClient.GetAsync(url).GetAwaiter().GetResult()) {
+      using (HttpResponseMessage response = this.SendGraphRequest(HttpMethod.Get, url, null)) {
         this.EnsureSuccess(response, "OneNote resource read failed.");
         return response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
       }
@@ -205,19 +222,21 @@ namespace KnowledgeManagement.SmartStandards.Providers {
           AreaNode node = this.ResolveArea(this.BuildTree(), area);
           string pageId = this.RequirePageId(node);
           string[] before = this.GetResources(area).Select((item) => item.ResourceId).ToArray();
-          HtmlDocument document = this.LoadPage(pageId);
+          HtmlDocument document = this.LoadPageFresh(pageId);
           Target target = this.GetInsertionTarget(node, document);
           string part = "Resource" + Guid.NewGuid().ToString("N");
           string name;
           if (string.IsNullOrWhiteSpace(preferredFileName)) {
             name = "Resource.bin";
-          } else {
+          }
+          else {
             name = preferredFileName.Trim();
           }
           string html;
           if (contentType.StartsWith("image/", StringComparison.OrdinalIgnoreCase)) {
             html = "<img src=\"name:" + part + "\" alt=\"" + WebUtility.HtmlEncode(name) + "\" />";
-          } else {
+          }
+          else {
             html = "<object data-attachment=\"" + WebUtility.HtmlEncode(name) + "\" data=\"name:" + part + "\" type=\"" + WebUtility.HtmlEncode(contentType) + "\" />";
           }
           this.SendMultipartPatch(pageId, new Patch[] { new Patch(target.Id, "insert", target.Position, html) }, part, contentType, content);
@@ -228,10 +247,12 @@ namespace KnowledgeManagement.SmartStandards.Providers {
           }
           resourceId = created.ResourceId;
           return true;
-        } catch (HttpRequestException ex) {
+        }
+        catch (HttpRequestException ex) {
           DevLogger.LogError(ex);
           return false;
-        } catch (InvalidOperationException ex) {
+        }
+        catch (InvalidOperationException ex) {
           DevLogger.LogError(ex);
           return false;
         }
@@ -247,7 +268,7 @@ namespace KnowledgeManagement.SmartStandards.Providers {
       }
       try {
         ResourceIdentity identity = this.DecodeResourceId(resourceId);
-        HtmlDocument document = this.LoadPage(identity.PageId);
+        HtmlDocument document = this.LoadPageFresh(identity.PageId);
         HtmlNode node = this.FindResource(document, identity.NativeId);
         if (node == null) {
           return false;
@@ -260,15 +281,18 @@ namespace KnowledgeManagement.SmartStandards.Providers {
         string html;
         if (node.Name.Equals("img", StringComparison.OrdinalIgnoreCase)) {
           html = "<img src=\"name:" + part + "\" alt=\"" + WebUtility.HtmlEncode(node.GetAttributeValue("alt", string.Empty)) + "\" />";
-        } else {
+        }
+        else {
           html = "<object data-attachment=\"" + WebUtility.HtmlEncode(node.GetAttributeValue("data-attachment", "attachment")) + "\" data=\"name:" + part + "\" type=\"" + WebUtility.HtmlEncode(contentType) + "\" />";
         }
         this.SendMultipartPatch(identity.PageId, new Patch[] { new Patch(id, "replace", string.Empty, html) }, part, contentType, content);
         return true;
-      } catch (HttpRequestException ex) {
+      }
+      catch (HttpRequestException ex) {
         DevLogger.LogError(ex);
         return false;
-      } catch (InvalidOperationException ex) {
+      }
+      catch (InvalidOperationException ex) {
         DevLogger.LogError(ex);
         return false;
       }
@@ -342,20 +366,26 @@ namespace KnowledgeManagement.SmartStandards.Providers {
         string collection;
         if (node.Kind == NodeKind.Page) {
           collection = "pages";
-        } else if (node.Kind == NodeKind.Section) {
+        }
+        else if (node.Kind == NodeKind.Section) {
           collection = "sections";
-        } else if (node.Kind == NodeKind.SectionGroup) {
+        }
+        else if (node.Kind == NodeKind.SectionGroup) {
           collection = "sectionGroups";
-        } else {
+        }
+        else {
           return false;
         }
-        using (HttpResponseMessage response = _HttpClient.DeleteAsync(_GraphBaseUrl + "/sites/" + Uri.EscapeDataString(_SiteId) + "/onenote/" + collection + "/" + Uri.EscapeDataString(node.NativeId)).GetAwaiter().GetResult()) {
+        string deleteUrl = _GraphBaseUrl + "/sites/" + Uri.EscapeDataString(_SiteId) + "/onenote/" + collection + "/" + Uri.EscapeDataString(node.NativeId);
+        using (HttpResponseMessage response = this.SendGraphRequest(HttpMethod.Delete, deleteUrl, null)) {
           return response.IsSuccessStatusCode;
         }
-      } catch (HttpRequestException ex) {
+      }
+      catch (HttpRequestException ex) {
         DevLogger.LogError(ex);
         return false;
-      } catch (InvalidOperationException ex) {
+      }
+      catch (InvalidOperationException ex) {
         DevLogger.LogError(ex);
         return false;
       }
@@ -379,7 +409,7 @@ namespace KnowledgeManagement.SmartStandards.Providers {
         if (node.Kind != NodeKind.Heading) {
           return false;
         }
-        HtmlDocument document = this.LoadPage(node.PageId);
+        HtmlDocument document = this.LoadPageFresh(node.PageId);
         HtmlNode heading = this.FindHeading(node, document);
         if (heading == null) {
           return false;
@@ -388,10 +418,12 @@ namespace KnowledgeManagement.SmartStandards.Providers {
         string html = "<h" + node.HeadingLevel + ">" + WebUtility.HtmlEncode(newName.Trim()) + "</h" + node.HeadingLevel + ">";
         this.SendPatch(node.PageId, new Patch[] { new Patch(id, "replace", string.Empty, html) });
         return true;
-      } catch (HttpRequestException ex) {
+      }
+      catch (HttpRequestException ex) {
         DevLogger.LogError(ex);
         return false;
-      } catch (InvalidOperationException ex) {
+      }
+      catch (InvalidOperationException ex) {
         DevLogger.LogError(ex);
         return false;
       }
@@ -411,13 +443,14 @@ namespace KnowledgeManagement.SmartStandards.Providers {
           int level;
           if (parent.Kind == NodeKind.Page) {
             level = 1;
-          } else {
+          }
+          else {
             level = parent.HeadingLevel + 1;
           }
           if (level > 6) {
             return false;
           }
-          HtmlDocument document = this.LoadPage(this.RequirePageId(parent));
+          HtmlDocument document = this.LoadPageFresh(this.RequirePageId(parent));
           Target target = this.GetInsertionTarget(parent, document);
           string html = "<h" + level + ">" + WebUtility.HtmlEncode(name.Trim()) + "</h" + level + ">";
           this.SendPatch(this.RequirePageId(parent), new Patch[] { new Patch(target.Id, "insert", target.Position, html) });
@@ -427,10 +460,12 @@ namespace KnowledgeManagement.SmartStandards.Providers {
           return this.CreatePage(parent, name.Trim());
         }
         return false;
-      } catch (HttpRequestException ex) {
+      }
+      catch (HttpRequestException ex) {
         DevLogger.LogError(ex);
         return false;
-      } catch (InvalidOperationException ex) {
+      }
+      catch (InvalidOperationException ex) {
         DevLogger.LogError(ex);
         return false;
       }
@@ -455,15 +490,17 @@ namespace KnowledgeManagement.SmartStandards.Providers {
         if (content.IndexOf(_ResourcePrefix, StringComparison.Ordinal) >= 0) {
           return false;
         }
-        HtmlDocument document = this.LoadPage(this.RequirePageId(node));
+        HtmlDocument document = this.LoadPageFresh(this.RequirePageId(node));
         Target target = this.GetInsertionTarget(node, document);
         string html = Markdown.ToHtml(content, new MarkdownPipelineBuilder().UseAdvancedExtensions().Build());
         this.SendPatch(this.RequirePageId(node), new Patch[] { new Patch(target.Id, "insert", target.Position, html) });
         return true;
-      } catch (HttpRequestException ex) {
+      }
+      catch (HttpRequestException ex) {
         DevLogger.LogError(ex);
         return false;
-      } catch (InvalidOperationException ex) {
+      }
+      catch (InvalidOperationException ex) {
         DevLogger.LogError(ex);
         return false;
       }
@@ -519,7 +556,7 @@ namespace KnowledgeManagement.SmartStandards.Providers {
         if (!source.PageId.Equals(this.RequirePageId(target), StringComparison.Ordinal)) {
           return false;
         }
-        HtmlDocument document = this.LoadPage(source.PageId);
+        HtmlDocument document = this.LoadPageFresh(source.PageId);
         HtmlNode sourceHeading = this.FindHeading(source, document);
         if (sourceHeading == null) {
           return false;
@@ -528,7 +565,8 @@ namespace KnowledgeManagement.SmartStandards.Providers {
         int targetLevel;
         if (target.Kind == NodeKind.Page) {
           targetLevel = 1;
-        } else {
+        }
+        else {
           targetLevel = target.HeadingLevel + 1;
         }
         string movedHtml = this.Rebase(subtree, source.HeadingLevel, targetLevel);
@@ -543,10 +581,12 @@ namespace KnowledgeManagement.SmartStandards.Providers {
         }
         this.SendPatch(source.PageId, patches.ToArray());
         return true;
-      } catch (HttpRequestException ex) {
+      }
+      catch (HttpRequestException ex) {
         DevLogger.LogError(ex);
         return false;
-      } catch (InvalidOperationException ex) {
+      }
+      catch (InvalidOperationException ex) {
         DevLogger.LogError(ex);
         return false;
       }
@@ -568,17 +608,28 @@ namespace KnowledgeManagement.SmartStandards.Providers {
     /// </summary>
     private AreaNode BuildTree() {
       this.EnsureNotDisposed();
-      AreaNode root = new AreaNode(NodeKind.Root, "/", "/", string.Empty, string.Empty, string.Empty, 0, ContentLevel.ContentAggregation);
-      NotebookInfo[] notebooks = this.LoadNotebooks();
-      if (!string.IsNullOrWhiteSpace(_NotebookName)) {
-        this.LoadNotebook(root, this.GetConfiguredNotebook(notebooks));
-        return root;
+      lock (_SyncRoot) {
+        if (_CachedTree != null) {
+          DevLogger.LogTrace(0, 99999, "OneNote repository tree cache hit.");
+          return _CachedTree;
+        }
+
+        DevLogger.LogTrace(0, 99999, "OneNote repository tree cache miss. Loading notebook metadata from Microsoft Graph.");
+        NotebookInfo[] notebooks = this.LoadNotebooks();
+        if (!string.IsNullOrWhiteSpace(_NotebookName)) {
+          NotebookInfo configuredNotebook = this.GetConfiguredNotebook(notebooks);
+          _CachedTree = new AreaNode(NodeKind.Root, "/", "/", configuredNotebook.Id, string.Empty, string.Empty, 0, ContentLevel.ContentAggregation);
+          return _CachedTree;
+        }
+
+        AreaNode root = new AreaNode(NodeKind.Root, "/", "/", string.Empty, string.Empty, string.Empty, 0, ContentLevel.ContentAggregation);
+        foreach (NotebookInfo notebook in notebooks) {
+          this.AddChild(root, NodeKind.Notebook, notebook.Name, notebook.Id, string.Empty, string.Empty, 0, ContentLevel.ContentAggregation);
+        }
+        root.ChildrenLoaded = true;
+        _CachedTree = root;
+        return _CachedTree;
       }
-      foreach (NotebookInfo notebook in notebooks) {
-        AreaNode node = this.AddChild(root, NodeKind.Notebook, notebook.Name, notebook.Id, string.Empty, string.Empty, 0, ContentLevel.ContentAggregation);
-        this.LoadNotebook(node, notebook);
-      }
-      return root;
     }
 
     /// <summary>
@@ -586,37 +637,32 @@ namespace KnowledgeManagement.SmartStandards.Providers {
     /// </summary>
     private void LoadNotebook(AreaNode parent, NotebookInfo notebook) {
       foreach (JObject section in this.GetValues(this.GetJson(this.SiteOneNoteUrl("/notebooks/" + Uri.EscapeDataString(notebook.Id) + "/sections")))) {
-        this.LoadSection(parent, section);
+        this.AddChild(parent, NodeKind.Section, this.Display(section, "displayName", "Unnamed Section"), this.Required(section, "id"), string.Empty, string.Empty, 0, ContentLevel.ContentAggregation);
       }
       foreach (JObject group in this.GetValues(this.GetJson(this.SiteOneNoteUrl("/notebooks/" + Uri.EscapeDataString(notebook.Id) + "/sectionGroups")))) {
-        this.LoadSectionGroup(parent, group);
+        this.AddChild(parent, NodeKind.SectionGroup, this.Display(group, "displayName", "Unnamed Group"), this.Required(group, "id"), string.Empty, string.Empty, 0, ContentLevel.ContentAggregation);
       }
     }
 
     /// <summary>
-    /// Loads a section group recursively.
+    /// Loads direct sections and section groups of an existing section-group node.
     /// </summary>
-    private void LoadSectionGroup(AreaNode parent, JObject json) {
-      string id = this.Required(json, "id");
-      AreaNode group = this.AddChild(parent, NodeKind.SectionGroup, this.Display(json, "displayName", "Unnamed Group"), id, string.Empty, string.Empty, 0, ContentLevel.ContentAggregation);
-      foreach (JObject section in this.GetValues(this.GetJson(this.SiteOneNoteUrl("/sectionGroups/" + Uri.EscapeDataString(id) + "/sections")))) {
-        this.LoadSection(group, section);
+    private void LoadSectionGroupChildren(AreaNode group) {
+      foreach (JObject section in this.GetValues(this.GetJson(this.SiteOneNoteUrl("/sectionGroups/" + Uri.EscapeDataString(group.NativeId) + "/sections")))) {
+        this.AddChild(group, NodeKind.Section, this.Display(section, "displayName", "Unnamed Section"), this.Required(section, "id"), string.Empty, string.Empty, 0, ContentLevel.ContentAggregation);
       }
-      foreach (JObject child in this.GetValues(this.GetJson(this.SiteOneNoteUrl("/sectionGroups/" + Uri.EscapeDataString(id) + "/sectionGroups")))) {
-        this.LoadSectionGroup(group, child);
+      foreach (JObject child in this.GetValues(this.GetJson(this.SiteOneNoteUrl("/sectionGroups/" + Uri.EscapeDataString(group.NativeId) + "/sectionGroups")))) {
+        this.AddChild(group, NodeKind.SectionGroup, this.Display(child, "displayName", "Unnamed Group"), this.Required(child, "id"), string.Empty, string.Empty, 0, ContentLevel.ContentAggregation);
       }
     }
 
     /// <summary>
-    /// Loads a section and its pages.
+    /// Loads page metadata of one section without downloading page HTML.
     /// </summary>
-    private void LoadSection(AreaNode parent, JObject json) {
-      string id = this.Required(json, "id");
-      AreaNode section = this.AddChild(parent, NodeKind.Section, this.Display(json, "displayName", "Unnamed Section"), id, string.Empty, string.Empty, 0, ContentLevel.ContentAggregation);
-      foreach (JObject page in this.GetValues(this.GetJson(this.SiteOneNoteUrl("/sections/" + Uri.EscapeDataString(id) + "/pages")))) {
+    private void LoadSectionChildren(AreaNode section) {
+      foreach (JObject page in this.GetValues(this.GetJson(this.SiteOneNoteUrl("/sections/" + Uri.EscapeDataString(section.NativeId) + "/pages")))) {
         string pageId = this.Required(page, "id");
-        AreaNode pageNode = this.AddChild(section, NodeKind.Page, this.Display(page, "title", "Untitled"), pageId, pageId, string.Empty, 0, ContentLevel.ContentAggregation);
-        this.LoadHeadings(pageNode, this.LoadPage(pageId));
+        this.AddChild(section, NodeKind.Page, this.Display(page, "title", "Untitled"), pageId, pageId, string.Empty, 0, ContentLevel.ContentAggregation);
       }
     }
 
@@ -639,7 +685,8 @@ namespace KnowledgeManagement.SmartStandards.Providers {
         AreaNode parent;
         if (parents[parentLevel] == null) {
           parent = page;
-        } else {
+        }
+        else {
           parent = parents[parentLevel];
         }
         string name = WebUtility.HtmlDecode(heading.InnerText).Trim();
@@ -716,6 +763,7 @@ namespace KnowledgeManagement.SmartStandards.Providers {
           result.AppendLine();
         }
       }
+      this.EnsureAreaChildrenLoaded(node);
       foreach (AreaNode child in node.Children) {
         this.AppendAggregated(child, result);
       }
@@ -726,7 +774,7 @@ namespace KnowledgeManagement.SmartStandards.Providers {
     /// </summary>
     private bool ReplaceHeadingBody(AreaNode node, string markdown) {
       try {
-        HtmlDocument document = this.LoadPage(node.PageId);
+        HtmlDocument document = this.LoadPageFresh(node.PageId);
         HtmlNode heading = this.FindHeading(node, document);
         if (heading == null) {
           return false;
@@ -748,10 +796,12 @@ namespace KnowledgeManagement.SmartStandards.Providers {
           this.SendPatch(node.PageId, patches.ToArray());
         }
         return true;
-      } catch (HttpRequestException ex) {
+      }
+      catch (HttpRequestException ex) {
         DevLogger.LogError(ex);
         return false;
-      } catch (InvalidOperationException ex) {
+      }
+      catch (InvalidOperationException ex) {
         DevLogger.LogError(ex);
         return false;
       }
@@ -761,7 +811,7 @@ namespace KnowledgeManagement.SmartStandards.Providers {
     /// Deletes one heading subtree using targeted replacements.
     /// </summary>
     private bool DeleteHeading(AreaNode node) {
-      HtmlDocument document = this.LoadPage(node.PageId);
+      HtmlDocument document = this.LoadPageFresh(node.PageId);
       HtmlNode heading = this.FindHeading(node, document);
       if (heading == null) {
         return false;
@@ -785,8 +835,13 @@ namespace KnowledgeManagement.SmartStandards.Providers {
     /// </summary>
     private bool CreatePage(AreaNode section, string name) {
       string html = "<!DOCTYPE html><html><head><title>" + WebUtility.HtmlEncode(name) + "</title></head><body><h1>" + WebUtility.HtmlEncode(name) + "</h1></body></html>";
-      using (StringContent content = new StringContent(html, Encoding.UTF8, "text/html"))
-      using (HttpResponseMessage response = _HttpClient.PostAsync(this.SiteOneNoteUrl("/sections/" + Uri.EscapeDataString(section.NativeId) + "/pages"), content).GetAwaiter().GetResult()) {
+      byte[] pageBytes = Encoding.UTF8.GetBytes(html);
+      string createUrl = this.SiteOneNoteUrl("/sections/" + Uri.EscapeDataString(section.NativeId) + "/pages");
+      using (HttpResponseMessage response = this.SendGraphRequest(HttpMethod.Post, createUrl, () => {
+        ByteArrayContent retryContent = new ByteArrayContent(pageBytes);
+        retryContent.Headers.ContentType = new MediaTypeHeaderValue("text/html");
+        return retryContent;
+      })) {
         this.EnsureSuccess(response, "OneNote page creation failed.");
       }
       return true;
@@ -864,9 +919,25 @@ namespace KnowledgeManagement.SmartStandards.Providers {
     /// Loads current OneNote HTML including generated element IDs.
     /// </summary>
     private HtmlDocument LoadPage(string pageId) {
+      if (_PageCache.TryGetValue(pageId, out HtmlDocument cached)) {
+        DevLogger.LogTrace(0, 99999, "OneNote page cache hit: " + pageId);
+        return cached;
+      }
+
+      return this.LoadPageFresh(pageId);
+    }
+
+    /// <summary>
+    /// Loads the current OneNote HTML from Graph and replaces the cached page snapshot.
+    /// This method is used before mutations because Graph-generated element IDs can change
+    /// after every page update.
+    /// </summary>
+    private HtmlDocument LoadPageFresh(string pageId) {
+      DevLogger.LogTrace(0, 99999, "OneNote page cache miss/fresh load: " + pageId);
       string html = this.GetString(this.SiteOneNoteUrl("/pages/" + Uri.EscapeDataString(pageId) + "/content?includeIDs=true"));
       HtmlDocument document = new HtmlDocument();
       document.LoadHtml(html);
+      _PageCache[pageId] = document;
       return document;
     }
 
@@ -903,11 +974,10 @@ namespace KnowledgeManagement.SmartStandards.Providers {
       foreach (Patch patch in patches) {
         array.Add(patch.ToJson());
       }
-      using (HttpRequestMessage request = new HttpRequestMessage(new HttpMethod("PATCH"), this.SiteOneNoteUrl("/pages/" + Uri.EscapeDataString(pageId) + "/content"))) {
-        request.Content = new StringContent(array.ToString(Formatting.None), Encoding.UTF8, "application/json");
-        using (HttpResponseMessage response = _HttpClient.SendAsync(request).GetAwaiter().GetResult()) {
-          this.EnsureSuccess(response, "OneNote page PATCH failed.");
-        }
+      string json = array.ToString(Formatting.None);
+      string url = this.SiteOneNoteUrl("/pages/" + Uri.EscapeDataString(pageId) + "/content");
+      using (HttpResponseMessage response = this.SendGraphRequest(new HttpMethod("PATCH"), url, () => new StringContent(json, Encoding.UTF8, "application/json"))) {
+        this.EnsureSuccess(response, "OneNote page PATCH failed.");
       }
     }
 
@@ -919,17 +989,18 @@ namespace KnowledgeManagement.SmartStandards.Providers {
       foreach (Patch patch in patches) {
         array.Add(patch.ToJson());
       }
-      using (MultipartFormDataContent multipart = new MultipartFormDataContent("KnowledgeBoundary" + Guid.NewGuid().ToString("N"))) {
-        multipart.Add(new StringContent(array.ToString(Formatting.None), Encoding.UTF8, "application/json"), "Commands");
+
+      string json = array.ToString(Formatting.None);
+      string url = this.SiteOneNoteUrl("/pages/" + Uri.EscapeDataString(pageId) + "/content");
+      using (HttpResponseMessage response = this.SendGraphRequest(new HttpMethod("PATCH"), url, () => {
+        MultipartFormDataContent multipart = new MultipartFormDataContent("KnowledgeBoundary" + Guid.NewGuid().ToString("N"));
+        multipart.Add(new StringContent(json, Encoding.UTF8, "application/json"), "Commands");
         ByteArrayContent binary = new ByteArrayContent(bytes);
         binary.Headers.ContentType = new MediaTypeHeaderValue(contentType);
         multipart.Add(binary, partName);
-        using (HttpRequestMessage request = new HttpRequestMessage(new HttpMethod("PATCH"), this.SiteOneNoteUrl("/pages/" + Uri.EscapeDataString(pageId) + "/content"))) {
-          request.Content = multipart;
-          using (HttpResponseMessage response = _HttpClient.SendAsync(request).GetAwaiter().GetResult()) {
-            this.EnsureSuccess(response, "OneNote multipart PATCH failed.");
-          }
-        }
+        return multipart;
+      })) {
+        this.EnsureSuccess(response, "OneNote multipart PATCH failed.");
       }
     }
 
@@ -950,11 +1021,16 @@ namespace KnowledgeManagement.SmartStandards.Providers {
     /// Loads all accessible notebooks.
     /// </summary>
     private NotebookInfo[] LoadNotebooks() {
+      if (_CachedNotebooks != null) {
+        return _CachedNotebooks;
+      }
+
       List<NotebookInfo> result = new List<NotebookInfo>();
       foreach (JObject notebook in this.GetValues(this.GetJson(this.SiteOneNoteUrl("/notebooks")))) {
         result.Add(new NotebookInfo(this.Required(notebook, "id"), this.Display(notebook, "displayName", "Unnamed Notebook")));
       }
-      return result.ToArray();
+      _CachedNotebooks = result.ToArray();
+      return _CachedNotebooks;
     }
 
     /// <summary>
@@ -975,14 +1051,16 @@ namespace KnowledgeManagement.SmartStandards.Providers {
       string segmentValue;
       if (string.IsNullOrWhiteSpace(name)) {
         segmentValue = "_";
-      } else {
+      }
+      else {
         segmentValue = name.Trim();
       }
       string segment = Uri.EscapeDataString(segmentValue);
       string path;
       if (parent.Path == "/") {
         path = "/" + segment;
-      } else {
+      }
+      else {
         path = parent.Path + "/" + segment;
       }
       if (parent.Children.Any((item) => item.Path.Equals(path, StringComparison.Ordinal))) {
@@ -1001,28 +1079,80 @@ namespace KnowledgeManagement.SmartStandards.Providers {
       if (string.IsNullOrWhiteSpace(area) || !area.StartsWith("/", StringComparison.Ordinal)) {
         throw new ArgumentException("Area paths must be absolute.", nameof(area));
       }
+
       string normalized;
       if (area.Length > 1) {
         normalized = area.TrimEnd('/');
-      } else {
+      }
+      else {
         normalized = area;
       }
       if (normalized == "/") {
         return root;
       }
-      List<AreaNode> nodes = new List<AreaNode>();
-      this.AddNodes(root, nodes);
-      AreaNode result = nodes.FirstOrDefault((item) => item.Path.Equals(normalized, StringComparison.Ordinal));
-      if (result == null) {
-        throw new InvalidOperationException("Area '" + normalized + "' does not exist.");
+
+      string[] segments = normalized.Split('/', StringSplitOptions.RemoveEmptyEntries);
+      AreaNode current = root;
+      string currentPath = string.Empty;
+      foreach (string segment in segments) {
+        this.EnsureAreaChildrenLoaded(current);
+        currentPath += "/" + segment;
+        AreaNode child = current.Children.FirstOrDefault((item) => item.Path.Equals(currentPath, StringComparison.Ordinal));
+        if (child == null) {
+          throw new InvalidOperationException("Area '" + normalized + "' does not exist.");
+        }
+        current = child;
       }
-      return result;
+      return current;
     }
 
     /// <summary>
-    /// Adds descendants in pre-order.
+    /// Lazily materializes page headings. Structural metadata is loaded independently from
+    /// page HTML so ordinary navigation does not prefetch every OneNote page body.
+    /// </summary>
+    private void EnsureAreaChildrenLoaded(AreaNode node) {
+      if (node.ChildrenLoaded) {
+        return;
+      }
+
+      lock (_SyncRoot) {
+        if (node.ChildrenLoaded) {
+          return;
+        }
+
+        if (node.Kind == NodeKind.Root) {
+          if (!string.IsNullOrWhiteSpace(node.NativeId)) {
+            DevLogger.LogTrace(0, 99999, "OneNote notebook metadata cache miss for configured repository root.");
+            this.LoadNotebook(node, new NotebookInfo(node.NativeId, _NotebookName));
+          }
+        }
+        else if (node.Kind == NodeKind.Notebook) {
+          DevLogger.LogTrace(0, 99999, "OneNote notebook metadata cache miss: " + node.Path);
+          this.LoadNotebook(node, new NotebookInfo(node.NativeId, node.Name));
+        }
+        else if (node.Kind == NodeKind.SectionGroup) {
+          DevLogger.LogTrace(0, 99999, "OneNote section-group metadata cache miss: " + node.Path);
+          this.LoadSectionGroupChildren(node);
+        }
+        else if (node.Kind == NodeKind.Section) {
+          DevLogger.LogTrace(0, 99999, "OneNote section page-metadata cache miss: " + node.Path);
+          this.LoadSectionChildren(node);
+        }
+        else if (node.Kind == NodeKind.Page) {
+          DevLogger.LogTrace(0, 99999, "OneNote heading projection cache miss: " + node.Path);
+          this.LoadHeadings(node, this.LoadPage(node.PageId));
+        }
+
+        node.ChildrenLoaded = true;
+      }
+    }
+
+    /// <summary>
+    /// Adds descendants in pre-order and lazily expands page heading projections only when
+    /// recursive enumeration actually requires them.
     /// </summary>
     private void AddNodes(AreaNode parent, List<AreaNode> result) {
+      this.EnsureAreaChildrenLoaded(parent);
       foreach (AreaNode child in parent.Children) {
         result.Add(child);
         this.AddNodes(child, result);
@@ -1030,9 +1160,11 @@ namespace KnowledgeManagement.SmartStandards.Providers {
     }
 
     /// <summary>
-    /// Adds descendant paths in pre-order.
+    /// Adds descendant paths in pre-order and lazily expands page heading projections only
+    /// when recursive enumeration actually requires them.
     /// </summary>
     private void AddPaths(AreaNode parent, List<string> result) {
+      this.EnsureAreaChildrenLoaded(parent);
       foreach (AreaNode child in parent.Children) {
         result.Add(child.Path);
         this.AddPaths(child, result);
@@ -1138,6 +1270,106 @@ namespace KnowledgeManagement.SmartStandards.Providers {
     }
 
     /// <summary>
+    /// Sends one Microsoft Graph request through the central repository governor.
+    /// The governor serializes requests, spaces them locally, retries transient failures,
+    /// respects Retry-After when supplied and applies exponential backoff otherwise.
+    /// </summary>
+    private HttpResponseMessage SendGraphRequest(HttpMethod method, string url, Func<HttpContent> contentFactory) {
+      this.EnsureNotDisposed();
+      if (_ReadOnly && method != HttpMethod.Get && method != HttpMethod.Head) {
+        throw new InvalidOperationException("The OneNote repository is read-only. Graph mutation requests are blocked centrally.");
+      }
+
+      lock (_GraphRequestSyncRoot) {
+        int retry = 0;
+        while (true) {
+          this.WaitForGraphRequestSlot();
+          using (HttpRequestMessage request = new HttpRequestMessage(method, url)) {
+            if (contentFactory != null) {
+              request.Content = contentFactory();
+            }
+
+            DevLogger.LogTrace(0, 99999, "OneNote Graph request: " + method.Method + " " + url);
+            _LastGraphRequestUtc = DateTime.UtcNow;
+            HttpResponseMessage response = _HttpClient.SendAsync(request).GetAwaiter().GetResult();
+            if (!this.IsTransientGraphFailure(response.StatusCode) || retry >= _MaximumGraphRetryCount) {
+              if (response.IsSuccessStatusCode && method != HttpMethod.Get && method != HttpMethod.Head) {
+                this.InvalidateRepositoryCache();
+              }
+              return response;
+            }
+
+            int delayMilliseconds = this.GetRetryDelayMilliseconds(response, retry);
+            DevLogger.LogTrace(0, 99999, "OneNote Graph transient HTTP " + (int)response.StatusCode + ". Retry " + (retry + 1) + "/" + _MaximumGraphRetryCount + " after " + delayMilliseconds + " ms.");
+            response.Dispose();
+            Thread.Sleep(delayMilliseconds);
+            retry++;
+          }
+        }
+      }
+    }
+
+    /// <summary>
+    /// Enforces a conservative minimum interval between Graph requests.
+    /// This protects Graph independently from repository caching and consumer behavior.
+    /// </summary>
+    private void WaitForGraphRequestSlot() {
+      if (_LastGraphRequestUtc == DateTime.MinValue) {
+        return;
+      }
+
+      TimeSpan elapsed = DateTime.UtcNow - _LastGraphRequestUtc;
+      int remaining = _MinimumGraphRequestIntervalMilliseconds - (int)elapsed.TotalMilliseconds;
+      if (remaining > 0) {
+        DevLogger.LogTrace(0, 99999, "OneNote Graph local governor delay: " + remaining + " ms.");
+        Thread.Sleep(remaining);
+      }
+    }
+
+    /// <summary>
+    /// Returns whether Graph may recover from the response when retried later.
+    /// </summary>
+    private bool IsTransientGraphFailure(HttpStatusCode statusCode) {
+      return statusCode == (HttpStatusCode)429 ||
+        statusCode == HttpStatusCode.ServiceUnavailable ||
+        statusCode == HttpStatusCode.GatewayTimeout ||
+        statusCode == HttpStatusCode.InternalServerError;
+    }
+
+    /// <summary>
+    /// Resolves Retry-After or calculates bounded exponential backoff.
+    /// OneNote can return HTTP 429 without Retry-After, therefore the fallback is mandatory.
+    /// </summary>
+    private int GetRetryDelayMilliseconds(HttpResponseMessage response, int retry) {
+      if (response.Headers.RetryAfter != null) {
+        if (response.Headers.RetryAfter.Delta.HasValue) {
+          double milliseconds = response.Headers.RetryAfter.Delta.Value.TotalMilliseconds;
+          return (int)Math.Min(Math.Max(milliseconds, _InitialBackoffMilliseconds), _MaximumBackoffMilliseconds);
+        }
+        if (response.Headers.RetryAfter.Date.HasValue) {
+          double milliseconds = (response.Headers.RetryAfter.Date.Value.UtcDateTime - DateTime.UtcNow).TotalMilliseconds;
+          if (milliseconds > 0) {
+            return (int)Math.Min(Math.Max(milliseconds, _InitialBackoffMilliseconds), _MaximumBackoffMilliseconds);
+          }
+        }
+      }
+
+      long exponential = (long)_InitialBackoffMilliseconds * (1L << Math.Min(retry, 10));
+      return (int)Math.Min(exponential, _MaximumBackoffMilliseconds);
+    }
+
+    /// <summary>
+    /// Invalidates all snapshots after a successful mutation.
+    /// Reads never invalidate caches.
+    /// </summary>
+    private void InvalidateRepositoryCache() {
+      _CachedTree = null;
+      _CachedNotebooks = null;
+      _PageCache.Clear();
+      DevLogger.LogTrace(0, 99999, "OneNote repository caches invalidated after Graph mutation.");
+    }
+
+    /// <summary>
     /// Loads JSON from Graph.
     /// </summary>
     private JObject GetJson(string url) {
@@ -1148,7 +1380,7 @@ namespace KnowledgeManagement.SmartStandards.Providers {
     /// Loads text from Graph.
     /// </summary>
     private string GetString(string url) {
-      using (HttpResponseMessage response = _HttpClient.GetAsync(url).GetAwaiter().GetResult()) {
+      using (HttpResponseMessage response = this.SendGraphRequest(HttpMethod.Get, url, null)) {
         this.EnsureSuccess(response, "Microsoft Graph GET failed.");
         return response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
       }
@@ -1219,6 +1451,7 @@ namespace KnowledgeManagement.SmartStandards.Providers {
       private readonly int _HeadingLevel;
       private readonly ContentLevel _Level;
       private readonly List<AreaNode> _Children;
+      private bool _ChildrenLoaded;
 
       /// <summary>Creates an internal logical area.</summary>
       public AreaNode(NodeKind kind, string path, string name, string nativeId, string pageId, string fingerprint, int headingLevel, ContentLevel level) {
@@ -1233,6 +1466,7 @@ namespace KnowledgeManagement.SmartStandards.Providers {
       public int HeadingLevel { get { return _HeadingLevel; } }
       public ContentLevel Level { get { return _Level; } }
       public List<AreaNode> Children { get { return _Children; } }
+      public bool ChildrenLoaded { get { return _ChildrenLoaded; } set { _ChildrenLoaded = value; } }
     }
 
     private sealed class NotebookInfo {

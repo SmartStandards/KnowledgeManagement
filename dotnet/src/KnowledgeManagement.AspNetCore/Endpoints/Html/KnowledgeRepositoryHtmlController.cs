@@ -27,6 +27,9 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
   [Route("api/knowledge")]
   public class KnowledgeRepositoryHtmlController : ControllerBase {
     private const string _HtmlContentType = "text/html; charset=utf-8";
+    private const string _RouteEscapeMarker = "~";
+    private const string _RouteEscapedTilde = "~7E";
+    private const string _RouteEscapedPercent = "~25";
     private static readonly Regex _KnowledgeResourceReferenceRegex = new Regex(@"knowledge-resource:(?<id>[A-Za-z0-9._~-]+)", RegexOptions.Compiled);
     private static readonly Regex _HeadingRegex = new Regex(@"^ {0,3}(?<level>#{1,6})[ \t]+(?<text>.+?)(?:[ \t]+#+)?[ \t]*$", RegexOptions.Compiled);
     private static readonly Regex _UnorderedListRegex = new Regex(@"^\s*[-*+]\s+(?<text>.+)$", RegexOptions.Compiled);
@@ -179,7 +182,12 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
       using (var sha = SHA256.Create()) { return BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(value))).Replace("-", "").ToLowerInvariant(); }
     }
     private string Name(string area) { return Read("name", area, () => _KnowledgeRepository.GetAreaName(area)); }
-    private string[] Areas(string area, bool recurse) { return Read(recurse ? "descendants" : "children", area, () => _KnowledgeRepository.GetAreas(recurse, area)); }
+    private string[] Areas(string area, bool recurse) {
+      // Interactive navigation always calls this method with recurse=false. The recurse
+      // argument exists only for compatibility with existing internal call sites and must
+      // not be used for normal UI tree navigation.
+      return Read(recurse ? "descendants" : "children", area, () => _KnowledgeRepository.GetAreas(recurse, area));
+    }
     private ContentLevel Level(string area) {
       return Read("level", area, () => {
         _KnowledgeRepository.GetAreaCapabilities(area, out ContentLevel level, out _, out _, out _, out _, out _, out _, out _);
@@ -190,15 +198,66 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
       int i = area.TrimEnd('/').LastIndexOf('/');
       return i <= 0 ? "/" : area.Substring(0, i);
     }
+    /// <summary>
+    /// Converts the public catch-all route value back into the exact provider-neutral area
+    /// path. Percent characters are transported through the HTTP route using a dedicated
+    /// tilde escape so IIS never sees a double-escaped percent sequence.
+    /// </summary>
     private static string ToRepositoryArea(string area) {
-      if (string.IsNullOrWhiteSpace(area))
+      if (string.IsNullOrWhiteSpace(area)) {
         return "/";
-      if (area.Any(c => char.IsControl(c) || c == '\\'))
+      }
+
+      if (area.Any((char character) => char.IsControl(character) || character == '\\')) {
         throw new ArgumentException("Invalid area");
-      var parts = area.Split('/', StringSplitOptions.RemoveEmptyEntries);
-      if (parts.Any(p => p == "." || p == ".."))
+      }
+
+      string[] parts = area.Split('/', StringSplitOptions.RemoveEmptyEntries);
+
+      if (parts.Any((string part) => part == "." || part == "..")) {
         throw new ArgumentException("Invalid area");
+      }
+
+      for (int index = 0; index < parts.Length; index++) {
+        parts[index] = DecodeAreaSegmentFromRoute(parts[index]);
+      }
+
       return "/" + string.Join("/", parts);
+    }
+
+    /// <summary>
+    /// Encodes one complete logical area for transport through an ASP.NET Core catch-all
+    /// route without ever producing an IIS double-escape sequence.
+    /// </summary>
+    private static string EncodeAreaForRoute(string area) {
+      string[] parts = area
+        .TrimStart('/')
+        .Split('/', StringSplitOptions.RemoveEmptyEntries);
+
+      for (int index = 0; index < parts.Length; index++) {
+        parts[index] = EncodeAreaSegmentForRoute(parts[index]);
+      }
+
+      return string.Join("/", parts);
+    }
+
+    /// <summary>
+    /// Encodes characters that would otherwise become a second percent-encoding layer when
+    /// ASP.NET Core generates an URL from an already escaped logical area segment.
+    /// </summary>
+    private static string EncodeAreaSegmentForRoute(string segment) {
+      return segment
+        .Replace(_RouteEscapeMarker, _RouteEscapedTilde, StringComparison.Ordinal)
+        .Replace("%", _RouteEscapedPercent, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Restores one logical area segment from the route-safe transport representation.
+    /// </summary>
+    private static string DecodeAreaSegmentFromRoute(string segment) {
+      return segment
+        .Replace(_RouteEscapedPercent, "%", StringComparison.Ordinal)
+        .Replace(_RouteEscapedTilde, _RouteEscapeMarker, StringComparison.Ordinal);
     }
     private string DocumentRoot(string area) {
       var chain = new List<string>();
@@ -212,9 +271,23 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
     private string Route(string name, object values = null) {
       return Url.RouteUrl(name, values) ?? throw new InvalidOperationException("Knowledge HTTP route not registered: " + name);
     }
+    /// <summary>
+    /// Builds the public HTML route for one logical area without double-escaping provider
+    /// area segments that legitimately contain percent characters.
+    /// </summary>
     private string BuildHtmlAreaRequestPath(string area) {
-      return area == "/" ? Route(KnowledgeRepositoryHttpRouteNames._HtmlRoot)
-        : Route(KnowledgeRepositoryHttpRouteNames._HtmlArea, new { area = area.TrimStart('/') });
+      if (area == "/") {
+        return this.Route(KnowledgeRepositoryHttpRouteNames._HtmlRoot);
+      }
+
+      string routeArea = EncodeAreaForRoute(area);
+
+      return this.Route(
+        KnowledgeRepositoryHttpRouteNames._HtmlArea,
+        new {
+          area = routeArea
+        }
+      );
     }
     private string ResolveKnowledgeResourceReferences(string markdown) {
       return _KnowledgeResourceReferenceRegex.Replace(markdown ?? "", m => Route(KnowledgeRepositoryHttpRouteNames._RawResource, new { resourceId = m.Groups["id"].Value }));
@@ -233,7 +306,16 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
       if (_Memo.TryGetValue(memoKey, out object cached))
         return (DocumentView)cached;
       var view = new DocumentView { Markdown = Read("aggregate", area, () => _KnowledgeRepository.GetAggregatedContent(area)) ?? "" };
-      string[] children = Areas(area, true);
+
+      // A document is the only scope in which the HTML facade deliberately walks deeper
+      // than one navigation level. Even here the traversal is performed iteratively with
+      // GetAreas(false, ...). Nested content containers represent headings inside the
+      // already requested Markdown document and are never exposed as independent
+      // navigation pages.
+      string[] children = this.GetDocumentContentAreas(
+        area
+      );
+
       string[] names = children.Select(p => Plain(RenderInlineMarkdown(Name(p)))).ToArray();
       int cursor = 0;
       var occurrences = new Dictionary<string, int>(StringComparer.Ordinal);
@@ -255,6 +337,65 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
       return view;
     }
     private static string Plain(string html) { return WebUtility.HtmlDecode(Regex.Replace(html, "<[^>]*>", "")).Trim(); }
+
+    /// <summary>
+    /// Returns subordinate content-container areas of one human-visible document in
+    /// deterministic depth-first order without using recursive repository enumeration.
+    /// </summary>
+    private string[] GetDocumentContentAreas(
+      string documentArea
+    ) {
+      List<string> result =
+        new List<string>();
+
+      Stack<string> pending =
+        new Stack<string>();
+
+      string[] directChildren =
+        this.Areas(
+          documentArea,
+          false
+        );
+
+      for (int index = directChildren.Length - 1;
+           index >= 0;
+           index--) {
+        pending.Push(
+          directChildren[index]
+        );
+      }
+
+      while (pending.Count > 0) {
+        string current =
+          pending.Pop();
+
+        if (this.Level(
+              current
+            ) != ContentLevel.ContentContainer) {
+          continue;
+        }
+
+        result.Add(
+          current
+        );
+
+        string[] children =
+          this.Areas(
+            current,
+            false
+          );
+
+        for (int index = children.Length - 1;
+             index >= 0;
+             index--) {
+          pending.Push(
+            children[index]
+          );
+        }
+      }
+
+      return result.ToArray();
+    }
 
     private IActionResult GetAreaInternal(string area) {
       NoStore();
