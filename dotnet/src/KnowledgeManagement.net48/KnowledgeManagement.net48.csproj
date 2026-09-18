@@ -23,7 +23,7 @@
     <DefineConstants>TRACE;DEBUG;NET_FX</DefineConstants>
     <ErrorReport>prompt</ErrorReport>
     <WarningLevel>4</WarningLevel>
-    <DocumentationFile>..\..\dist\net48\KnowledgeManagement.xml</DocumentationFile>
+    <DocumentationFile>..\..\dist\net48\SmartStandards.KnowledgeManagement.xml</DocumentationFile>
     <NoWarn>1591</NoWarn>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
@@ -33,7 +33,7 @@
     <DefineConstants>TRACE;NET46;NET_FX</DefineConstants>
     <ErrorReport>prompt</ErrorReport>
     <WarningLevel>4</WarningLevel>
-    <DocumentationFile>..\..\dist\net48\KnowledgeManagement.xml</DocumentationFile>
+    <DocumentationFile>..\..\dist\net48\SmartStandards.KnowledgeManagement.xml</DocumentationFile>
     <NoWarn>1591</NoWarn>
   </PropertyGroup>
   <ItemGroup>
