@@ -12,6 +12,17 @@ This files contains a version history including all changes relevant for semanti
 
 
 
+## v 0.1.1
+released **2026-09-18**, including:
+ - suchtreffer werden asnyc aufgebaut
+ - Performance-Verbesserungen
+ - Performance-Verbesserung (keine rekursion mehr)
+ - better html-ui
+ - Merge branch 'master' of https://github.com/SmartStandards/KnowledgeManagement
+ - added OneNote provider
+
+
+
 ## v 0.1.0
 released **2026-09-18**, including:
  - fix xmldoc-file
