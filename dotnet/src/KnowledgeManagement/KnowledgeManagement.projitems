@@ -1,0 +1,21 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <MSBuildAllProjects Condition="'$(MSBuildVersion)' == '' Or '$(MSBuildVersion)' &lt; '16.0'">$(MSBuildAllProjects);$(MSBuildThisFileFullPath)</MSBuildAllProjects>
+    <HasSharedItems>true</HasSharedItems>
+    <SharedGUID>cf0a161a-99ba-4f01-af5e-16c6fcbc85ae</SharedGUID>
+  </PropertyGroup>
+  <PropertyGroup Label="Configuration">
+    <Import_RootNamespace>KnowledgeManagement.SmartStandards</Import_RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="$(MSBuildThisFileDirectory)[Contract]\KnowledgeAreaKind.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)[Contract]\ContentLevel.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)[Contract]\KnowledgeResourceInfo.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)[Contract]\KnowledgeResourceIdChange.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)[Contract]\IKnowledgeRepository.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <Folder Include="$(MSBuildThisFileDirectory)[Contract]\" />
+  </ItemGroup>
+</Project>

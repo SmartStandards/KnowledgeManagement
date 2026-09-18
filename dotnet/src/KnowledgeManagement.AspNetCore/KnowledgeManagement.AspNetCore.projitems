@@ -1,0 +1,22 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <MSBuildAllProjects Condition="'$(MSBuildVersion)' == '' Or '$(MSBuildVersion)' &lt; '16.0'">$(MSBuildAllProjects);$(MSBuildThisFileFullPath)</MSBuildAllProjects>
+    <HasSharedItems>true</HasSharedItems>
+    <SharedGUID>cf0a161a-99ba-4f01-af5e-16c6fcbc85ae</SharedGUID>
+  </PropertyGroup>
+  <PropertyGroup Label="Configuration">
+    <Import_RootNamespace>KnowledgeManagement.SmartStandards</Import_RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="$(MSBuildThisFileDirectory)Endpoints\Html\KnowledgeRepositoryHtmlController.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Endpoints\KnowledgeRepositoryHttpRouteNames.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Endpoints\Joplin\IJoplinSyncStateStore.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Endpoints\Joplin\IJoplinWebDavAuthenticationValidator.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Endpoints\Joplin\JoplinKnowledgeRepositoryWebDavExtensions.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Endpoints\Joplin\JoplinKnowledgeRepositoryWebDavHandler.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Endpoints\Joplin\JoplinKnowledgeRepositoryWebDavMiddleware.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Endpoints\Raw\KnowledgeRepositoryRawController.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)KnowledgeManagementSetupExtensions.cs" />
+  </ItemGroup>
+</Project>

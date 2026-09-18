@@ -1,0 +1,127 @@
+﻿<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>SmartStandards.KnowledgeManagement.DemoWebService</AssemblyName>
+    <RootNamespace>KnowledgeManagement.SmartStandards.DemoWebService</RootNamespace>
+    <Deterministic>false</Deterministic>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <ImportedNamespaces></ImportedNamespaces>
+  </PropertyGroup>
+
+  <!-- META DATA -->
+
+  <PropertyGroup>
+    <PackageId>KnowledgeManagement.DemoWebService</PackageId>
+    <Description>KnowledgeManagement.DemoWebService</Description>
+    <Product>KnowledgeManagement</Product>
+    <PackageTags></PackageTags>
+    <Company>(public domain)</Company>
+    <Copyright>SmartStandards</Copyright>
+    <Authors>SmartStandards</Authors>
+    <!-- VERSION -->
+    <Version>0.1.1</Version>
+    <AssemblyVersion>0.1.1</AssemblyVersion>
+    <FileVersion>0.1.1</FileVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- ADDITIONAL ASSEMBLY-ATTRIBUTES -->
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>SourceContext</_Parameter1>
+      <_Parameter2>KnowledgeManagement</_Parameter2>
+    </AssemblyAttribute>
+  </ItemGroup>
+
+  <!-- BUILD -->
+
+  <PropertyGroup>
+    <OutputPath>..\..\dist</OutputPath>
+    <AppendTargetFrameworkToOutputPath>true</AppendTargetFrameworkToOutputPath>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+    <DefineConstants>$(DefineConstants);NET_CORE;NET_8_;NET_10_;NET_10</DefineConstants>
+    <NoWarn>$(NoWarn);1701;1702;1591</NoWarn>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
+    <DefineConstants>$(DefineConstants);TRACE;DEBUG</DefineConstants>
+    <Optimize>False</Optimize>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|AnyCPU'">
+    <DefineConstants>$(DefineConstants);TRACE</DefineConstants>
+    <Optimize>True</Optimize>
+  </PropertyGroup>
+
+  <Target Name="_ResolveCopyLocalNuGetPkgXmls" AfterTargets="ResolveReferences">
+    <ItemGroup>
+      <!-- Copy also XML-Doc files from all PackageReferences to output dir -->
+      <ReferenceCopyLocalPaths Include="@(ReferenceCopyLocalPaths->'%(RootDir)%(Directory)%(Filename).xml')" Condition="'%(ReferenceCopyLocalPaths.NuGetPackageId)'!='' and Exists('%(RootDir)%(Directory)%(Filename).xml')" />
+    </ItemGroup>
+  </Target>
+
+  <!-- REFERENCES -->
+
+  <ItemGroup>
+
+    <!-- any additional MS-near references to get complete access to asp, is provided by this dependency-package: -->
+    <PackageReference Include="SmartStandards.CyclicTriggering.AspNetCore" Version="0.1.1" />
+    <PackageReference Include="SmartStandards.WebApiDependencies.net10.0" Version="10.0.14" />
+
+    <!-- additional packages which are note implicitely provided by 'Microsoft.AspNetCore.App' -->
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.12" />
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.Negotiate" Version="10.0.12" />
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.OpenIdConnect" Version="10.0.12" />
+
+    <!-- intermediate (until we've completely switched to 'Microsoft.AspNetCore.OpenApi' -->
+    <PackageReference Include="Swashbuckle.AspNetCore" Version="10.2.3" />
+    <PackageReference Include="Swashbuckle.AspNetCore.Annotations" Version="10.2.3" />
+
+    <!-- intermediate (until we've completely switched to 'System.Text.Json' -->
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+    <PackageReference Include="UJMW.DynamicClient" Version="5.6.2" />
+
+    <PackageReference Include="UJMW.DynamicController" Version="5.6.2" />
+
+    <PackageReference Include="SmartAmbience" Version="3.0.0" />
+    <PackageReference Include="SmartAmbience.MvcSupport" Version="3.0.0" />
+    <PackageReference Include="SmartStandards.AuthTokenHandling" Version="5.1.1" />
+    <PackageReference Include="SmartStandards.AuthTokenHandling.MvcSupport" Version="5.1.1" />
+    <PackageReference Include="SmartStandards.Logging" Version="3.4.4" />
+    <PackageReference Include="SmartStandards.Logging.AspSupport" Version="3.4.4" />
+    <PackageReference Include="SmartStandards.Logging.Centralized" Version="3.4.4" />
+
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\KnowledgeManagement.AspNetCore.net10.0\KnowledgeManagement.AspNetCore.net10.0.csproj" />
+    <ProjectReference Include="..\KnowledgeManagement.CommonProviders.net10.0\KnowledgeManagement.CommonProviders.net10.0.csproj" />
+    <ProjectReference Include="..\KnowledgeManagement.net10.0\KnowledgeManagement.net10.0.csproj" />
+    <ProjectReference Include="..\KnowledgeManagement.OneNoteProvider.net10.0\KnowledgeManagement.OneNoteProvider.net10.0.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Service Include="{508349b6-6b84-4df5-91f0-309beebad82d}" />
+  </ItemGroup>
+
+  <!-- INCLUDEs and FILEs -->
+
+  <ItemGroup>
+    <Compile Remove="Logs\**" />
+    <Compile Remove="Util\**" />
+    <Content Remove="Logs\**" />
+    <Content Remove="Util\**" />
+    <EmbeddedResource Remove="Logs\**" />
+    <EmbeddedResource Remove="Util\**" />
+    <None Remove="Logs\**" />
+    <None Remove="Util\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Folder Include="wwwroot\" />
+  </ItemGroup>
+
+</Project>

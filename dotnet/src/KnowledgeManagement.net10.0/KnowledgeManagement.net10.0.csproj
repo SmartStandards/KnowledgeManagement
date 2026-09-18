@@ -1,0 +1,100 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>SmartStandards.KnowledgeManagement</AssemblyName>
+    <RootNamespace>KnowledgeManagement.SmartStandards</RootNamespace>
+    <Deterministic>false</Deterministic>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <ImportedNamespaces></ImportedNamespaces>
+  </PropertyGroup>
+
+  <!-- META DATA -->
+
+  <PropertyGroup>
+    <PackageId>KnowledgeManagement</PackageId>
+    <Description>KnowledgeManagement</Description>
+    <Product>KnowledgeManagement</Product>
+    <PackageTags></PackageTags>
+    <Company>(public domain)</Company>
+    <Copyright>SmartStandards</Copyright>
+    <Authors>SmartStandards</Authors>
+    <!-- VERSION -->
+    <Version>0.1.1</Version>
+    <AssemblyVersion>0.1.1</AssemblyVersion>
+    <FileVersion>0.1.1</FileVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--<InternalsVisibleTo Include="KnowledgeManagement.CommonProviders" />
+    <InternalsVisibleTo Include="KnowledgeManagement.CommonProviders.net8.0" />
+    <InternalsVisibleTo Include="KnowledgeManagement.CommonProviders.net10.0" />
+    <InternalsVisibleTo Include="KnowledgeManagement.AspNetCore" />
+    <InternalsVisibleTo Include="KnowledgeManagement.AspNetCore.net10.0" />
+    <InternalsVisibleTo Include="KnowledgeManagement.Tests" />-->
+
+    <InternalsVisibleTo Include="SmartStandards.KnowledgeManagement.CommonProviders" />
+    <InternalsVisibleTo Include="SmartStandards.KnowledgeManagement.CommonProviders.net8.0" />
+    <InternalsVisibleTo Include="SmartStandards.KnowledgeManagement.CommonProviders.net10.0" />
+    <InternalsVisibleTo Include="SmartStandards.KnowledgeManagement.AspNetCore" />
+    <InternalsVisibleTo Include="SmartStandards.KnowledgeManagement.AspNetCore.net10.0" />
+    <InternalsVisibleTo Include="SmartStandards.KnowledgeManagement.Tests" />
+    
+    
+    <!-- ADDITIONAL ASSEMBLY-ATTRIBUTES -->
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>SourceContext</_Parameter1>
+      <_Parameter2>KnowledgeManagement</_Parameter2>
+    </AssemblyAttribute>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="SmartStandards.Logging.tt">
+      <Generator>TextTemplatingFileGenerator</Generator>
+      <LastGenOutput>SmartStandards.Logging.cs</LastGenOutput>
+      <CustomToolNamespace>KnowledgeManagement</CustomToolNamespace>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Service Include="{508349b6-6b84-4df5-91f0-309beebad82d}" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Update="SmartStandards.Logging.cs">
+      <DesignTime>True</DesignTime>
+      <AutoGen>True</AutoGen>
+      <DependentUpon>SmartStandards.Logging.tt</DependentUpon>
+    </Compile>
+  </ItemGroup>
+
+  <!-- BUILD -->
+
+  <PropertyGroup>
+    <OutputPath>..\..\dist</OutputPath>
+    <AppendTargetFrameworkToOutputPath>true</AppendTargetFrameworkToOutputPath>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+    <DefineConstants>$(DefineConstants);NET_CORE;NET_8_;NET_10_;NET_10</DefineConstants>
+    <NoWarn>$(NoWarn);1701;1702;1591</NoWarn>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
+    <DefineConstants>$(DefineConstants);TRACE;DEBUG</DefineConstants>
+    <Optimize>False</Optimize>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|AnyCPU'">
+    <DefineConstants>$(DefineConstants);TRACE</DefineConstants>
+    <Optimize>True</Optimize>
+  </PropertyGroup>
+
+  <!-- REFERENCES -->
+
+  <!-- INCLUDEs and FILEs -->
+
+  <Import Project="..\KnowledgeManagement\KnowledgeManagement.projitems" Label="Shared" />
+
+</Project>

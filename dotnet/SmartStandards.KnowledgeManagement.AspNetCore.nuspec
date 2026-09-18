@@ -1,0 +1,45 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2012/06/nuspec.xsd">
+  <metadata>
+    <id>SmartStandards.KnowledgeManagement.AspNetCore</id>
+    <version>0.1.1</version>
+    <title>SmartStandards.KnowledgeManagement.AspNetCore</title>
+    <authors>SmartStandards</authors>
+    <owners>(public domain)</owners>
+    <copyright>SmartStandards</copyright>
+    <description>KnowledgeManagement.AspNetCore</description>
+    <tags>UShell</tags>
+    <!-- https://spdx.org/licenses/ -->
+    <license type="expression">GPL-3.0-only</license>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <icon>PackageIcon.png</icon>
+    <projectUrl>https://github.com/SmartStandards/AiSupport</projectUrl>
+    <dependencies>
+      <!-- (configuration for the Versioning-Util, which is not part of the xml-schema, because it's a pre-processor)
+      "KVU": { 
+        "versioningTwins":[ /* forced same [version] as our package and never treated as orphaned */
+          "SmartStandards.KnowledgeManagement"
+        ],
+        "dependencySync": {
+          "addMissing":true, "updateExisting":true, "allowDowngrades":true, "removeOrphaned":false,
+          "constraintLevel":"SEM-SAFE",
+          "sources": [         
+            { "origin":"src\\KnowledgeManagement.AspNetCore.net10.0\\KnowledgeManagement.AspNetCore.net10.0.csproj", "targetFramework":"=" }
+          ]
+        }
+      } -->
+      <group targetFramework="net10.0">
+        <dependency id="SmartStandards.KnowledgeManagement" version="[0.1.1]" />
+        <dependency id="UJMW.DynamicController" version="[5.6.0,6.0)" />
+      </group>
+    </dependencies>
+  </metadata>
+  <files>
+    <!-- https://docs.microsoft.com/en-us/nuget/create-packages/creating-a-package#from-a-convention-based-working-directory -->
+    <file src="PackageIcon.png" target="" />
+    <!-- .NET 10.0 -->
+    <file src="dist\net10.0\KnowledgeManagement.AspNetCore.dll" target="lib/net10.0" />
+    <file src="dist\net10.0\KnowledgeManagement.AspNetCore.xml" target="lib/net10.0" />
+    <file src="dist\net10.0\KnowledgeManagement.AspNetCore.pdb" target="lib/net10.0" />
+  </files>
+</package>
