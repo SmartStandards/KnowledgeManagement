@@ -31,7 +31,9 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
   [Route("api/knowledge")]
   public class KnowledgeRepositoryHtmlController : ControllerBase {
     private const int _SearchHeartbeatTimeoutSeconds = 6;
-    private const int _SearchMaximumResults = 100;
+    private const int _SearchMaximumResults = 30;
+    private const int _SearchMaximumAreasPerPoll = 25;
+    private const int _SearchMaximumPollDurationMilliseconds = 350;
 
     private static readonly ConcurrentDictionary<string, SearchSession> _SearchSessions =
       new ConcurrentDictionary<string, SearchSession>(
@@ -108,6 +110,7 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
     [HttpGet("_search", Name = KnowledgeRepositoryHttpRouteNames._HtmlSearch)]
     public IActionResult Search([FromQuery] string q = "") {
       this.NoStore();
+      this.CleanupExpiredSearchSessions();
 
       string query = q;
 
@@ -138,24 +141,16 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
           "N"
         );
 
-      CancellationTokenSource cancellationSource =
-        CancellationTokenSource.CreateLinkedTokenSource(
-          _ApplicationStopping
-        );
-
       SearchSession session =
         new SearchSession(
           searchId,
-          query,
-          cancellationSource
+          query
         );
 
       if (!_SearchSessions.TryAdd(
             searchId,
             session
           )) {
-        cancellationSource.Dispose();
-
         return this.StatusCode(
           StatusCodes.Status500InternalServerError,
           new {
@@ -163,13 +158,6 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
           }
         );
       }
-
-      Task.Run(
-        () => this.ExecuteSearchSession(
-          session
-        ),
-        CancellationToken.None
-      );
 
       return new JsonResult(
         new {
@@ -179,11 +167,27 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
     }
 
     /// <summary>
-    /// Polls one background search and simultaneously renews its browser heartbeat.
+    /// Advances one browser-owned search by a small bounded work slice and returns its
+    /// current state.
+    ///
+    /// Polling is intentionally the search keepalive and the search execution trigger.
+    /// No detached worker exists. If the dialog, tab or browser disappears, no further
+    /// poll arrives and therefore no further repository work is performed.
     /// </summary>
     [HttpGet("_search/{searchId}")]
     public IActionResult PollSearch(string searchId) {
       this.NoStore();
+
+      if (_ApplicationStopping.IsCancellationRequested) {
+        return this.StatusCode(
+          StatusCodes.Status503ServiceUnavailable,
+          new {
+            fault = "Der Dienst wird beendet."
+          }
+        );
+      }
+
+      this.CleanupExpiredSearchSessions();
 
       if (string.IsNullOrWhiteSpace(searchId)) {
         return this.NotFound();
@@ -202,10 +206,11 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
         );
       }
 
-      SearchSessionSnapshot snapshot =
-        session.CreateSnapshotAndHeartbeat();
-
-      if (snapshot.IsCancelled) {
+      if (session.IsHeartbeatExpired(
+            TimeSpan.FromSeconds(
+              _SearchHeartbeatTimeoutSeconds
+            )
+          )) {
         this.RemoveSearchSession(
           searchId,
           session
@@ -219,12 +224,28 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
         );
       }
 
+      SearchSessionSnapshot snapshot;
+
+      lock (session.SyncRoot) {
+        session.RefreshHeartbeat();
+
+        if (!session.IsCompleted) {
+          this.ExecuteSearchSlice(
+            session
+          );
+        }
+
+        snapshot =
+          session.CreateSnapshot();
+      }
+
       if (!snapshot.IsCompleted) {
         return new JsonResult(
           new {
             completed = false,
             processed = snapshot.ProcessedAreas,
-            resultCount = snapshot.Results.Length
+            resultCount = snapshot.Results.Length,
+            results = snapshot.Results
           }
         );
       }
@@ -264,42 +285,48 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
     }
 
     /// <summary>
-    /// Executes one incremental repository search in the background.
+    /// Executes one bounded cooperative search slice on the current ASP.NET request.
     ///
-    /// The implementation deliberately walks the repository one direct level at a time.
-    /// This makes heartbeat cancellation observable between provider calls and ensures that
-    /// no provider receives GetAreas(true, ...).
+    /// The method deliberately does not create a background task. All controller state,
+    /// URL generation and request-scoped repository dependencies remain inside a live
+    /// request lifetime. This prevents disposed HttpContext or disposed scoped-service
+    /// access after the start request has completed.
     /// </summary>
-    private void ExecuteSearchSession(SearchSession session) {
-      try {
-        Stack<string> pending =
-          new Stack<string>();
-
-        string[] rootChildren =
-          _KnowledgeRepository.GetAreas(
-            false,
-            "/"
-          );
-
-        this.ThrowIfSearchNoLongerAlive(
-          session
+    private void ExecuteSearchSlice(SearchSession session) {
+      DateTime deadlineUtc =
+        DateTime.UtcNow.AddMilliseconds(
+          _SearchMaximumPollDurationMilliseconds
         );
 
-        for (int index = rootChildren.Length - 1;
-             index >= 0;
-             index--) {
-          pending.Push(
-            rootChildren[index]
+      int processedInThisPoll =
+        0;
+
+      try {
+        if (!session.IsInitialized) {
+          string[] rootChildren =
+            _KnowledgeRepository.GetAreas(
+              false,
+              "/"
+            );
+
+          session.Initialize(
+            rootChildren
           );
         }
 
-        while (pending.Count > 0) {
-          this.ThrowIfSearchNoLongerAlive(
-            session
-          );
+        while (session.HasPendingAreas &&
+               processedInThisPoll < _SearchMaximumAreasPerPoll &&
+               DateTime.UtcNow < deadlineUtc) {
+          if (_ApplicationStopping.IsCancellationRequested) {
+            session.MarkFaulted(
+              "Der Dienst wird beendet."
+            );
+
+            return;
+          }
 
           string area =
-            pending.Pop();
+            session.PopPendingArea();
 
           bool supportsSubAreas =
             true;
@@ -309,10 +336,6 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
               _KnowledgeRepository.GetAreaName(
                 area
               );
-
-            this.ThrowIfSearchNoLongerAlive(
-              session
-            );
 
             _KnowledgeRepository.GetAreaCapabilities(
               area,
@@ -324,10 +347,6 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
               out bool canAppendContent,
               out bool canTruncate,
               out bool supportsResources
-            );
-
-            this.ThrowIfSearchNoLongerAlive(
-              session
             );
 
             bool nameMatches =
@@ -347,10 +366,6 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
                 _KnowledgeRepository.GetDirectContent(
                   area
                 );
-
-              this.ThrowIfSearchNoLongerAlive(
-                session
-              );
 
               contentMatches =
                 directContent.IndexOf(
@@ -375,9 +390,6 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
               );
             }
           }
-          catch (OperationCanceledException) {
-            throw;
-          }
           catch (Exception ex) {
             DevLogger.LogError(
               ex
@@ -387,6 +399,7 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
           }
 
           session.IncrementProcessedAreas();
+          processedInThisPoll++;
 
           if (supportsSubAreas) {
             try {
@@ -396,20 +409,9 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
                   area
                 );
 
-              this.ThrowIfSearchNoLongerAlive(
-                session
+              session.PushPendingAreas(
+                children
               );
-
-              for (int index = children.Length - 1;
-                   index >= 0;
-                   index--) {
-                pending.Push(
-                  children[index]
-                );
-              }
-            }
-            catch (OperationCanceledException) {
-              throw;
             }
             catch (Exception ex) {
               DevLogger.LogError(
@@ -422,17 +424,19 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
 
           if (session.HasReachedResultLimit) {
             session.MarkMoreResultsAvailable();
-            break;
+            session.MarkCompleted();
+            return;
           }
         }
 
-        session.MarkCompleted();
-      }
-      catch (OperationCanceledException) {
-        session.MarkCancelled();
+        if (!session.HasPendingAreas) {
+          session.MarkCompleted();
+        }
       }
       catch (Exception ex) {
-        DevLogger.LogError(ex);
+        DevLogger.LogError(
+          ex
+        );
 
         session.MarkFaulted(
           "Suche derzeit nicht verfügbar."
@@ -441,18 +445,26 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
     }
 
     /// <summary>
-    /// Stops one search when the application is shutting down or when its browser heartbeat
-    /// has expired.
+    /// Removes abandoned search sessions opportunistically without starting a timer or
+    /// background cleanup worker.
     /// </summary>
-    private void ThrowIfSearchNoLongerAlive(SearchSession session) {
-      session.CancellationToken.ThrowIfCancellationRequested();
+    private void CleanupExpiredSearchSessions() {
+      TimeSpan timeout =
+        TimeSpan.FromSeconds(
+          _SearchHeartbeatTimeoutSeconds
+        );
 
-      TimeSpan heartbeatAge =
-        DateTime.UtcNow - session.LastHeartbeatUtc;
+      foreach (KeyValuePair<string, SearchSession> pair in _SearchSessions) {
+        if (!pair.Value.IsHeartbeatExpired(
+              timeout
+            )) {
+          continue;
+        }
 
-      if (heartbeatAge > TimeSpan.FromSeconds(_SearchHeartbeatTimeoutSeconds)) {
-        session.Cancel();
-        session.CancellationToken.ThrowIfCancellationRequested();
+        this.RemoveSearchSession(
+          pair.Key,
+          pair.Value
+        );
       }
     }
 
@@ -2070,31 +2082,31 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
     }
 
     /// <summary>
-    /// Represents one browser-owned background search session.
+    /// Represents one browser-owned cooperative search session.
     /// </summary>
     private sealed class SearchSession : IDisposable {
 
       private readonly object _SyncRoot;
       private readonly string _SearchId;
       private readonly string _Query;
-      private readonly CancellationTokenSource _CancellationSource;
       private readonly List<SearchResult> _Results;
+      private readonly Stack<string> _PendingAreas;
 
       private DateTime _LastHeartbeatUtc;
       private int _ProcessedAreas;
+      private bool _IsInitialized;
       private bool _IsCompleted;
-      private bool _IsCancelled;
       private bool _More;
       private bool _HadProviderFailures;
       private string _ErrorMessage;
 
       /// <summary>
-      /// Creates one active search session.
+      /// Creates one inactive search session. Repository traversal begins with the first
+      /// heartbeat poll.
       /// </summary>
       public SearchSession(
         string searchId,
-        string query,
-        CancellationTokenSource cancellationSource
+        string query
       ) {
         _SyncRoot =
           new object();
@@ -2105,17 +2117,26 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
         _Query =
           query;
 
-        _CancellationSource =
-          cancellationSource;
-
         _Results =
           new List<SearchResult>();
+
+        _PendingAreas =
+          new Stack<string>();
 
         _LastHeartbeatUtc =
           DateTime.UtcNow;
 
         _ErrorMessage =
           string.Empty;
+      }
+
+      /// <summary>
+      /// Gets the synchronization object used to serialize polls for this session.
+      /// </summary>
+      public object SyncRoot {
+        get {
+          return _SyncRoot;
+        }
       }
 
       /// <summary>
@@ -2128,162 +2149,199 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
       }
 
       /// <summary>
-      /// Gets the linked cancellation token.
+      /// Gets whether traversal has been initialized from the repository root.
       /// </summary>
-      public CancellationToken CancellationToken {
+      public bool IsInitialized {
         get {
-          return _CancellationSource.Token;
+          return _IsInitialized;
         }
       }
 
       /// <summary>
-      /// Gets the most recent browser heartbeat.
+      /// Gets whether the search has completed.
       /// </summary>
-      public DateTime LastHeartbeatUtc {
+      public bool IsCompleted {
         get {
-          lock (_SyncRoot) {
-            return _LastHeartbeatUtc;
-          }
+          return _IsCompleted;
         }
       }
 
       /// <summary>
-      /// Gets whether the configured result limit was reached.
+      /// Gets whether additional logical areas remain to be processed.
+      /// </summary>
+      public bool HasPendingAreas {
+        get {
+          return _PendingAreas.Count > 0;
+        }
+      }
+
+      /// <summary>
+      /// Gets whether the configured result limit has been reached.
       /// </summary>
       public bool HasReachedResultLimit {
         get {
-          lock (_SyncRoot) {
-            return _Results.Count >= _SearchMaximumResults;
-          }
+          return _Results.Count >= _SearchMaximumResults;
         }
       }
 
       /// <summary>
-      /// Adds one detached result.
+      /// Returns whether the browser heartbeat has expired.
+      /// </summary>
+      public bool IsHeartbeatExpired(
+        TimeSpan timeout
+      ) {
+        lock (_SyncRoot) {
+          return DateTime.UtcNow - _LastHeartbeatUtc > timeout;
+        }
+      }
+
+      /// <summary>
+      /// Renews the browser heartbeat.
+      /// </summary>
+      public void RefreshHeartbeat() {
+        _LastHeartbeatUtc =
+          DateTime.UtcNow;
+      }
+
+      /// <summary>
+      /// Initializes traversal with root children while preserving deterministic
+      /// depth-first order.
+      /// </summary>
+      public void Initialize(
+        string[] rootChildren
+      ) {
+        this.PushPendingAreas(
+          rootChildren
+        );
+
+        _IsInitialized =
+          true;
+
+        if (_PendingAreas.Count == 0) {
+          _IsCompleted =
+            true;
+        }
+      }
+
+      /// <summary>
+      /// Pushes direct children onto the traversal stack in reverse order so the original
+      /// provider order is preserved when popping.
+      /// </summary>
+      public void PushPendingAreas(
+        string[] children
+      ) {
+        for (int index = children.Length - 1;
+             index >= 0;
+             index--) {
+          _PendingAreas.Push(
+            children[index]
+          );
+        }
+      }
+
+      /// <summary>
+      /// Removes and returns the next logical area to process.
+      /// </summary>
+      public string PopPendingArea() {
+        return _PendingAreas.Pop();
+      }
+
+      /// <summary>
+      /// Adds one detached search result.
       /// </summary>
       public void AddResult(
         SearchResult result,
         int maximumResults
       ) {
-        lock (_SyncRoot) {
-          if (_Results.Count >= maximumResults) {
-            _More = true;
-            return;
-          }
+        if (_Results.Count >= maximumResults) {
+          _More =
+            true;
 
-          _Results.Add(
-            result
-          );
+          return;
         }
+
+        _Results.Add(
+          result
+        );
       }
 
       /// <summary>
       /// Increments the number of processed logical areas.
       /// </summary>
       public void IncrementProcessedAreas() {
-        lock (_SyncRoot) {
-          _ProcessedAreas++;
-        }
+        _ProcessedAreas++;
       }
 
       /// <summary>
-      /// Marks that at least one provider branch failed while other branches continued.
+      /// Marks that at least one provider branch failed while healthy branches continued.
       /// </summary>
       public void MarkProviderFailure() {
-        lock (_SyncRoot) {
-          _HadProviderFailures =
-            true;
-        }
+        _HadProviderFailures =
+          true;
       }
 
       /// <summary>
       /// Marks that additional results may exist.
       /// </summary>
       public void MarkMoreResultsAvailable() {
-        lock (_SyncRoot) {
-          _More = true;
-        }
+        _More =
+          true;
       }
 
       /// <summary>
       /// Marks the search as successfully completed.
       /// </summary>
       public void MarkCompleted() {
-        lock (_SyncRoot) {
-          _IsCompleted = true;
-        }
-      }
-
-      /// <summary>
-      /// Marks the search as cancelled.
-      /// </summary>
-      public void MarkCancelled() {
-        lock (_SyncRoot) {
-          _IsCancelled = true;
-          _IsCompleted = true;
-        }
+        _IsCompleted =
+          true;
       }
 
       /// <summary>
       /// Marks the search as failed.
       /// </summary>
-      public void MarkFaulted(string errorMessage) {
-        lock (_SyncRoot) {
-          _ErrorMessage = errorMessage;
-          _IsCompleted = true;
-        }
+      public void MarkFaulted(
+        string errorMessage
+      ) {
+        _ErrorMessage =
+          errorMessage;
+
+        _IsCompleted =
+          true;
       }
 
       /// <summary>
-      /// Cancels the linked worker token.
+      /// Creates one immutable browser-visible state snapshot.
       /// </summary>
-      public void Cancel() {
-        if (!_CancellationSource.IsCancellationRequested) {
-          _CancellationSource.Cancel();
-        }
+      public SearchSessionSnapshot CreateSnapshot() {
+        SearchSessionSnapshot snapshot =
+          new SearchSessionSnapshot();
+
+        snapshot.Results =
+          _Results.ToArray();
+
+        snapshot.ProcessedAreas =
+          _ProcessedAreas;
+
+        snapshot.IsCompleted =
+          _IsCompleted;
+
+        snapshot.More =
+          _More;
+
+        snapshot.HadProviderFailures =
+          _HadProviderFailures;
+
+        snapshot.ErrorMessage =
+          _ErrorMessage;
+
+        return snapshot;
       }
 
       /// <summary>
-      /// Updates the browser heartbeat and returns one immutable snapshot.
-      /// </summary>
-      public SearchSessionSnapshot CreateSnapshotAndHeartbeat() {
-        lock (_SyncRoot) {
-          _LastHeartbeatUtc = DateTime.UtcNow;
-
-          SearchSessionSnapshot snapshot =
-            new SearchSessionSnapshot();
-
-          snapshot.Results =
-            _Results.ToArray();
-
-          snapshot.ProcessedAreas =
-            _ProcessedAreas;
-
-          snapshot.IsCompleted =
-            _IsCompleted;
-
-          snapshot.IsCancelled =
-            _IsCancelled;
-
-          snapshot.More =
-            _More;
-
-          snapshot.HadProviderFailures =
-            _HadProviderFailures;
-
-          snapshot.ErrorMessage =
-            _ErrorMessage;
-
-          return snapshot;
-        }
-      }
-
-      /// <summary>
-      /// Cancels and releases the linked cancellation source.
+      /// Releases one search session. No background worker or request-owned resource is
+      /// retained by the session.
       /// </summary>
       public void Dispose() {
-        this.Cancel();
-        _CancellationSource.Dispose();
       }
     }
 
@@ -2295,7 +2353,6 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
       private SearchResult[] _Results;
       private int _ProcessedAreas;
       private bool _IsCompleted;
-      private bool _IsCancelled;
       private bool _More;
       private bool _HadProviderFailures;
       private string _ErrorMessage;
@@ -2340,15 +2397,6 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
         }
         set {
           _IsCompleted = value;
-        }
-      }
-
-      public bool IsCancelled {
-        get {
-          return _IsCancelled;
-        }
-        set {
-          _IsCancelled = value;
         }
       }
 
@@ -2481,42 +2529,86 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
   let activeSearchId = null;
   let activeSearchGeneration = 0;
   let searchPollTimer = null;
+  let renderedSearchResultCount = 0;
 
   const stopSearchHeartbeat = () => {
     activeSearchGeneration++;
     activeSearchId = null;
+    renderedSearchResultCount = 0;
+
     if (searchPollTimer) {
       window.clearTimeout(searchPollTimer);
       searchPollTimer = null;
     }
   };
 
-  const renderSearchResults = (data, query) => {
-    const status = document.getElementById('search-status');
+  const appendSearchResults = data => {
     const results = document.getElementById('search-results');
-    results.replaceChildren();
-    status.textContent = data.results.length + ' Treffer für „' + query + '“' + (data.more ? ' (erste 100)' : '');
-    if (data.warnings && data.warnings.length > 0) {
-      status.textContent += ' · ' + data.warnings.join(' ');
+
+    if (!data.results || data.results.length <= renderedSearchResultCount) {
+      return;
     }
-    data.results.forEach(result => {
+
+    for (let index = renderedSearchResultCount; index < data.results.length; index++) {
+      const result = data.results[index];
       const card = document.createElement('div');
       card.className = 'search-result';
+
       const link = document.createElement('a');
       link.href = result.url;
       link.textContent = result.title;
-      link.addEventListener('click', () => searchDialog.close());
+
+      // Navigation itself is the strongest possible stop signal in the cooperative
+      // heartbeat model: no subsequent poll is scheduled, so no additional repository
+      // work can start for this search.
+      link.addEventListener('click', () => {
+        stopSearchHeartbeat();
+      });
+
       const path = document.createElement('small');
       path.textContent = result.path;
+
       const snippet = document.createElement('p');
       snippet.textContent = result.snippet;
+
       card.append(link, path, snippet);
       results.append(card);
-    });
+    }
+
+    renderedSearchResultCount = data.results.length;
+  };
+
+  const updateSearchStatus = (data, query) => {
+    const status = document.getElementById('search-status');
+
+    if (data.completed) {
+      status.textContent =
+        data.results.length
+        + ' Treffer für „'
+        + query
+        + '“'
+        + (data.more ? ' (Suche bei 30 Treffern beendet)' : '');
+
+      if (data.warnings && data.warnings.length > 0) {
+        status.textContent += ' · ' + data.warnings.join(' ');
+      }
+
+      return;
+    }
+
+    status.textContent =
+      data.resultCount
+      + ' Treffer bisher · '
+      + data.processed
+      + ' Bereiche geprüft';
   };
 
   const pollSearch = (baseUrl, query, searchId, generation) => {
-    if (activeSearchId !== searchId || activeSearchGeneration !== generation || !searchDialog.open) return;
+    if (activeSearchId !== searchId ||
+        activeSearchGeneration !== generation ||
+        !searchDialog.open) {
+      return;
+    }
 
     fetch(baseUrl + '/' + encodeURIComponent(searchId), {
       credentials: 'same-origin',
@@ -2527,32 +2619,51 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
         stopSearchHeartbeat();
         return null;
       }
+
       return response.json().then(data => {
-        if (!response.ok) throw new Error(data.fault || 'Suche derzeit nicht verfügbar.');
+        if (!response.ok) {
+          throw new Error(data.fault || 'Suche derzeit nicht verfügbar.');
+        }
+
         return data;
       });
     }).then(data => {
-      if (!data || activeSearchId !== searchId || activeSearchGeneration !== generation || !searchDialog.open) return;
-
-      const status = document.getElementById('search-status');
-
-      if (data.completed) {
-        stopSearchHeartbeat();
-        renderSearchResults(data, query);
+      if (!data ||
+          activeSearchId !== searchId ||
+          activeSearchGeneration !== generation ||
+          !searchDialog.open) {
         return;
       }
 
-      status.textContent = 'Suche läuft … ' + data.processed + ' Bereiche geprüft, ' + data.resultCount + ' Treffer';
+      appendSearchResults(data);
+      updateSearchStatus(data, query);
+
+      if (data.completed) {
+        activeSearchId = null;
+
+        if (searchPollTimer) {
+          window.clearTimeout(searchPollTimer);
+          searchPollTimer = null;
+        }
+
+        return;
+      }
 
       searchPollTimer =
         window.setTimeout(
           () => pollSearch(baseUrl, query, searchId, generation),
-          1000
+          750
         );
     }).catch(error => {
-      if (activeSearchId !== searchId || activeSearchGeneration !== generation) return;
+      if (activeSearchId !== searchId ||
+          activeSearchGeneration !== generation) {
+        return;
+      }
+
       stopSearchHeartbeat();
-      document.getElementById('search-status').textContent = error.message || 'Suche derzeit nicht verfügbar.';
+
+      document.getElementById('search-status').textContent =
+        error.message || 'Suche derzeit nicht verfügbar.';
     });
   };
 
@@ -2565,7 +2676,9 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
     const form = event.currentTarget;
     const query = form.elements.q.value.trim();
 
-    if (!query) return;
+    if (!query) {
+      return;
+    }
 
     stopSearchHeartbeat();
 
@@ -2573,8 +2686,10 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
     const status = document.getElementById('search-status');
     const results = document.getElementById('search-results');
 
+    renderedSearchResultCount = 0;
     results.replaceChildren();
-    status.textContent = 'Suche wird gestartet …';
+    status.textContent = '0 Treffer bisher · Suche wird gestartet …';
+
     show('search-dialog');
 
     fetch(form.action + '?q=' + encodeURIComponent(query), {
@@ -2582,18 +2697,34 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
       cache: 'no-store',
       headers: {'Accept': 'application/json'}
     }).then(response => response.json().then(data => {
-      if (!response.ok) throw new Error(data.fault || 'Suche derzeit nicht verfügbar.');
+      if (!response.ok) {
+        throw new Error(data.fault || 'Suche derzeit nicht verfügbar.');
+      }
+
       return data;
     })).then(data => {
-      if (!searchDialog.open || activeSearchGeneration !== generation) return;
+      if (!searchDialog.open ||
+          activeSearchGeneration !== generation) {
+        return;
+      }
 
       activeSearchId = data.searchId;
-      pollSearch(form.action, query, data.searchId, generation);
+      pollSearch(
+        form.action,
+        query,
+        data.searchId,
+        generation
+      );
     }).catch(error => {
-      if (!searchDialog.open || activeSearchGeneration !== generation) return;
+      if (!searchDialog.open ||
+          activeSearchGeneration !== generation) {
+        return;
+      }
 
       stopSearchHeartbeat();
-      status.textContent = error.message || 'Suche derzeit nicht verfügbar.';
+
+      status.textContent =
+        error.message || 'Suche derzeit nicht verfügbar.';
     });
   });
   document.querySelectorAll('form[data-mutation]').forEach(form => form.addEventListener('submit', async event => {
