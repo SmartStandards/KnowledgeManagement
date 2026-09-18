@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -7,12 +8,15 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Antiforgery;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Logging.SmartStandards.CopyForKnowledgeManagement;
 
 namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
 
@@ -26,6 +30,14 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
   [ApiExplorerSettings(IgnoreApi = true)]
   [Route("api/knowledge")]
   public class KnowledgeRepositoryHtmlController : ControllerBase {
+    private const int _SearchHeartbeatTimeoutSeconds = 6;
+    private const int _SearchMaximumResults = 100;
+
+    private static readonly ConcurrentDictionary<string, SearchSession> _SearchSessions =
+      new ConcurrentDictionary<string, SearchSession>(
+        StringComparer.Ordinal
+      );
+
     private const string _HtmlContentType = "text/html; charset=utf-8";
     private const string _RouteEscapeMarker = "~";
     private const string _RouteEscapedTilde = "~7E";
@@ -43,16 +55,28 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
     private readonly IAntiforgery _Antiforgery;
     private readonly IDataProtector _Protector;
     private readonly ILogger<KnowledgeRepositoryHtmlController> _Logger;
+    private readonly CancellationToken _ApplicationStopping;
     private readonly Dictionary<string, object> _Memo = new Dictionary<string, object>(StringComparer.Ordinal);
+    private readonly List<string> _UiWarnings = new List<string>();
     private string _CacheEpoch;
 
     public KnowledgeRepositoryHtmlController(IKnowledgeRepository knowledgeRepository,
       KnowledgeRepositoryHtmlOptions options = null, IAntiforgery antiforgery = null,
-      IDataProtectionProvider dataProtection = null, ILogger<KnowledgeRepositoryHtmlController> logger = null) {
+      IDataProtectionProvider dataProtection = null, ILogger<KnowledgeRepositoryHtmlController> logger = null,
+      IHostApplicationLifetime applicationLifetime = null) {
       _KnowledgeRepository = knowledgeRepository ?? throw new ArgumentNullException(nameof(knowledgeRepository));
       _Options = options ?? new KnowledgeRepositoryHtmlOptions();
       _Antiforgery = antiforgery;
       _Logger = logger;
+
+      if (applicationLifetime == null) {
+        _ApplicationStopping =
+          CancellationToken.None;
+      }
+      else {
+        _ApplicationStopping =
+          applicationLifetime.ApplicationStopping;
+      }
       if (!string.IsNullOrWhiteSpace(_Options.CacheDirectory) && !Path.IsPathFullyQualified(_Options.CacheDirectory)) {
         throw new ArgumentException("CacheDirectory must be an absolute private path.");
       }
@@ -72,34 +96,482 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
       catch (ArgumentException) { return BadRequest("Ungültiger Bereich."); }
     }
 
+    /// <summary>
+    /// Starts one browser-owned background search and returns an opaque search identifier
+    /// immediately.
+    ///
+    /// The search remains alive only while the browser polls <see cref="PollSearch(string)"/>.
+    /// Every poll acts as a heartbeat. Closing the dialog, navigating away or closing the
+    /// browser stops the heartbeat and the server-side worker terminates after the short
+    /// grace period.
+    /// </summary>
     [HttpGet("_search", Name = KnowledgeRepositoryHttpRouteNames._HtmlSearch)]
     public IActionResult Search([FromQuery] string q = "") {
-      NoStore();
-      q = (q ?? "").Trim();
-      if (q.Length > 200)
-        return BadRequest(new { fault = "Suchbegriff ist zu lang." });
-      try {
-        var matches = q.Length == 0 ? Array.Empty<string>() : Read("search", q, () => _KnowledgeRepository.GetAreasByKeyword(q, "/"));
-        var results = new List<object>();
-        foreach (string area in matches.Take(100)) {
-          string document = DocumentRoot(area);
-          string url = BuildHtmlAreaRequestPath(document);
-          if (document != area) {
-            var view = Document(document);
-            if (view.Anchors.TryGetValue(area, out string anchor))
-              url += "#" + anchor;
-          }
-          string text = Regex.Replace(Read("direct", area, () => _KnowledgeRepository.GetDirectContent(area)) ?? "", @"\s+", " ");
-          int position = text.IndexOf(q, StringComparison.OrdinalIgnoreCase);
-          int start = Math.Max(0, position - 70);
-          string snippet = (start > 0 ? "…" : "") + text.Substring(start, Math.Min(220, text.Length - start));
-          if (text.Length > start + 220)
-            snippet += "…";
-          results.Add(new { title = Name(area), path = area, url, snippet });
-        }
-        return new JsonResult(new { results, more = matches.Length > 100, warnings = Array.Empty<object>() });
+      this.NoStore();
+
+      string query = q;
+
+      if (query == null) {
+        query = string.Empty;
       }
-      catch (Exception ex) when (IsRepositoryError(ex)) { return RepositoryError(ex); }
+
+      query = query.Trim();
+
+      if (query.Length == 0) {
+        return this.BadRequest(
+          new {
+            fault = "Bitte einen Suchbegriff eingeben."
+          }
+        );
+      }
+
+      if (query.Length > 200) {
+        return this.BadRequest(
+          new {
+            fault = "Suchbegriff ist zu lang."
+          }
+        );
+      }
+
+      string searchId =
+        Guid.NewGuid().ToString(
+          "N"
+        );
+
+      CancellationTokenSource cancellationSource =
+        CancellationTokenSource.CreateLinkedTokenSource(
+          _ApplicationStopping
+        );
+
+      SearchSession session =
+        new SearchSession(
+          searchId,
+          query,
+          cancellationSource
+        );
+
+      if (!_SearchSessions.TryAdd(
+            searchId,
+            session
+          )) {
+        cancellationSource.Dispose();
+
+        return this.StatusCode(
+          StatusCodes.Status500InternalServerError,
+          new {
+            fault = "Die Suche konnte nicht gestartet werden."
+          }
+        );
+      }
+
+      Task.Run(
+        () => this.ExecuteSearchSession(
+          session
+        ),
+        CancellationToken.None
+      );
+
+      return new JsonResult(
+        new {
+          searchId = searchId
+        }
+      );
+    }
+
+    /// <summary>
+    /// Polls one background search and simultaneously renews its browser heartbeat.
+    /// </summary>
+    [HttpGet("_search/{searchId}")]
+    public IActionResult PollSearch(string searchId) {
+      this.NoStore();
+
+      if (string.IsNullOrWhiteSpace(searchId)) {
+        return this.NotFound();
+      }
+
+      SearchSession session;
+
+      if (!_SearchSessions.TryGetValue(
+            searchId,
+            out session
+          )) {
+        return this.NotFound(
+          new {
+            fault = "Die Suche ist nicht mehr aktiv."
+          }
+        );
+      }
+
+      SearchSessionSnapshot snapshot =
+        session.CreateSnapshotAndHeartbeat();
+
+      if (snapshot.IsCancelled) {
+        this.RemoveSearchSession(
+          searchId,
+          session
+        );
+
+        return this.StatusCode(
+          StatusCodes.Status410Gone,
+          new {
+            cancelled = true
+          }
+        );
+      }
+
+      if (!snapshot.IsCompleted) {
+        return new JsonResult(
+          new {
+            completed = false,
+            processed = snapshot.ProcessedAreas,
+            resultCount = snapshot.Results.Length
+          }
+        );
+      }
+
+      this.RemoveSearchSession(
+        searchId,
+        session
+      );
+
+      if (!string.IsNullOrWhiteSpace(snapshot.ErrorMessage)) {
+        return this.StatusCode(
+          StatusCodes.Status503ServiceUnavailable,
+          new {
+            fault = snapshot.ErrorMessage
+          }
+        );
+      }
+
+      string[] warnings =
+        Array.Empty<string>();
+
+      if (snapshot.HadProviderFailures) {
+        warnings =
+          new string[] {
+            "Ein Teil der Wissensquellen war während der Suche nicht verfügbar. Die angezeigten Treffer stammen aus den weiterhin erreichbaren Bereichen."
+          };
+      }
+
+      return new JsonResult(
+        new {
+          completed = true,
+          results = snapshot.Results,
+          more = snapshot.More,
+          warnings = warnings
+        }
+      );
+    }
+
+    /// <summary>
+    /// Executes one incremental repository search in the background.
+    ///
+    /// The implementation deliberately walks the repository one direct level at a time.
+    /// This makes heartbeat cancellation observable between provider calls and ensures that
+    /// no provider receives GetAreas(true, ...).
+    /// </summary>
+    private void ExecuteSearchSession(SearchSession session) {
+      try {
+        Stack<string> pending =
+          new Stack<string>();
+
+        string[] rootChildren =
+          _KnowledgeRepository.GetAreas(
+            false,
+            "/"
+          );
+
+        this.ThrowIfSearchNoLongerAlive(
+          session
+        );
+
+        for (int index = rootChildren.Length - 1;
+             index >= 0;
+             index--) {
+          pending.Push(
+            rootChildren[index]
+          );
+        }
+
+        while (pending.Count > 0) {
+          this.ThrowIfSearchNoLongerAlive(
+            session
+          );
+
+          string area =
+            pending.Pop();
+
+          bool supportsSubAreas =
+            true;
+
+          try {
+            string areaName =
+              _KnowledgeRepository.GetAreaName(
+                area
+              );
+
+            this.ThrowIfSearchNoLongerAlive(
+              session
+            );
+
+            _KnowledgeRepository.GetAreaCapabilities(
+              area,
+              out ContentLevel contentLevel,
+              out supportsSubAreas,
+              out bool canBeRenamed,
+              out bool canBeDeleted,
+              out bool canAddSubAreas,
+              out bool canAppendContent,
+              out bool canTruncate,
+              out bool supportsResources
+            );
+
+            this.ThrowIfSearchNoLongerAlive(
+              session
+            );
+
+            bool nameMatches =
+              areaName.IndexOf(
+                session.Query,
+                StringComparison.OrdinalIgnoreCase
+              ) >= 0;
+
+            string directContent =
+              string.Empty;
+
+            bool contentMatches =
+              false;
+
+            if (contentLevel == ContentLevel.ContentContainer) {
+              directContent =
+                _KnowledgeRepository.GetDirectContent(
+                  area
+                );
+
+              this.ThrowIfSearchNoLongerAlive(
+                session
+              );
+
+              contentMatches =
+                directContent.IndexOf(
+                  session.Query,
+                  StringComparison.OrdinalIgnoreCase
+                ) >= 0;
+            }
+
+            if (nameMatches ||
+                contentMatches) {
+              SearchResult result =
+                this.CreateSearchResult(
+                  session.Query,
+                  area,
+                  areaName,
+                  directContent
+                );
+
+              session.AddResult(
+                result,
+                _SearchMaximumResults
+              );
+            }
+          }
+          catch (OperationCanceledException) {
+            throw;
+          }
+          catch (Exception ex) {
+            DevLogger.LogError(
+              ex
+            );
+
+            session.MarkProviderFailure();
+          }
+
+          session.IncrementProcessedAreas();
+
+          if (supportsSubAreas) {
+            try {
+              string[] children =
+                _KnowledgeRepository.GetAreas(
+                  false,
+                  area
+                );
+
+              this.ThrowIfSearchNoLongerAlive(
+                session
+              );
+
+              for (int index = children.Length - 1;
+                   index >= 0;
+                   index--) {
+                pending.Push(
+                  children[index]
+                );
+              }
+            }
+            catch (OperationCanceledException) {
+              throw;
+            }
+            catch (Exception ex) {
+              DevLogger.LogError(
+                ex
+              );
+
+              session.MarkProviderFailure();
+            }
+          }
+
+          if (session.HasReachedResultLimit) {
+            session.MarkMoreResultsAvailable();
+            break;
+          }
+        }
+
+        session.MarkCompleted();
+      }
+      catch (OperationCanceledException) {
+        session.MarkCancelled();
+      }
+      catch (Exception ex) {
+        DevLogger.LogError(ex);
+
+        session.MarkFaulted(
+          "Suche derzeit nicht verfügbar."
+        );
+      }
+    }
+
+    /// <summary>
+    /// Stops one search when the application is shutting down or when its browser heartbeat
+    /// has expired.
+    /// </summary>
+    private void ThrowIfSearchNoLongerAlive(SearchSession session) {
+      session.CancellationToken.ThrowIfCancellationRequested();
+
+      TimeSpan heartbeatAge =
+        DateTime.UtcNow - session.LastHeartbeatUtc;
+
+      if (heartbeatAge > TimeSpan.FromSeconds(_SearchHeartbeatTimeoutSeconds)) {
+        session.Cancel();
+        session.CancellationToken.ThrowIfCancellationRequested();
+      }
+    }
+
+    /// <summary>
+    /// Creates one detached browser result from an exact logical area.
+    /// </summary>
+    private SearchResult CreateSearchResult(
+      string query,
+      string area,
+      string areaName,
+      string directContent
+    ) {
+      string document =
+        this.DocumentRoot(
+          area
+        );
+
+      string url =
+        this.BuildHtmlAreaRequestPath(
+          document
+        );
+
+      if (document != area) {
+        DocumentView view =
+          this.Document(
+            document
+          );
+
+        string anchor;
+
+        if (view.Anchors.TryGetValue(
+              area,
+              out anchor
+            )) {
+          url += "#" + anchor;
+        }
+      }
+
+      string text =
+        Regex.Replace(
+          directContent,
+          @"\s+",
+          " "
+        );
+
+      int position =
+        text.IndexOf(
+          query,
+          StringComparison.OrdinalIgnoreCase
+        );
+
+      int snippetStart =
+        0;
+
+      if (position >= 0) {
+        snippetStart =
+          Math.Max(
+            0,
+            position - 70
+          );
+      }
+
+      string snippet =
+        string.Empty;
+
+      if (text.Length > 0) {
+        if (snippetStart > 0) {
+          snippet = "…";
+        }
+
+        snippet +=
+          text.Substring(
+            snippetStart,
+            Math.Min(
+              220,
+              text.Length - snippetStart
+            )
+          );
+
+        if (text.Length > snippetStart + 220) {
+          snippet += "…";
+        }
+      }
+
+      SearchResult result =
+        new SearchResult();
+
+      result.Title =
+        areaName;
+
+      result.Path =
+        area;
+
+      result.Url =
+        url;
+
+      result.Snippet =
+        snippet;
+
+      return result;
+    }
+
+    /// <summary>
+    /// Removes and disposes one finished search session.
+    /// </summary>
+    private void RemoveSearchSession(
+      string searchId,
+      SearchSession expectedSession
+    ) {
+      SearchSession removedSession;
+
+      if (!_SearchSessions.TryRemove(
+            searchId,
+            out removedSession
+          )) {
+        return;
+      }
+
+      removedSession.Dispose();
     }
 
     [HttpPost("_refresh", Name = KnowledgeRepositoryHttpRouteNames._HtmlRefresh)]
@@ -181,18 +653,140 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
     private static string Hash(string value) {
       using (var sha = SHA256.Create()) { return BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(value))).Replace("-", "").ToLowerInvariant(); }
     }
-    private string Name(string area) { return Read("name", area, () => _KnowledgeRepository.GetAreaName(area)); }
-    private string[] Areas(string area, bool recurse) {
-      // Interactive navigation always calls this method with recurse=false. The recurse
-      // argument exists only for compatibility with existing internal call sites and must
-      // not be used for normal UI tree navigation.
-      return Read(recurse ? "descendants" : "children", area, () => _KnowledgeRepository.GetAreas(recurse, area));
+    /// <summary>
+    /// Returns one display name without allowing a provider exception to destroy the page.
+    /// </summary>
+    private string Name(string area) {
+      try {
+        return this.Read(
+          "name",
+          area,
+          () => _KnowledgeRepository.GetAreaName(
+            area
+          )
+        );
+      }
+      catch (Exception ex) {
+        this.RegisterUiReadFailure(
+          ex,
+          "GetAreaName",
+          area
+        );
+
+        if (area == "/") {
+          return "Wissen";
+        }
+
+        string normalized =
+          area.TrimEnd('/');
+
+        int separator =
+          normalized.LastIndexOf('/');
+
+        if (separator >= 0 &&
+            separator < normalized.Length - 1) {
+          return normalized.Substring(
+            separator + 1
+          );
+        }
+
+        return normalized;
+      }
     }
+
+    /// <summary>
+    /// Returns areas without allowing one unavailable provider branch to terminate the
+    /// complete HTML response.
+    /// </summary>
+    private string[] Areas(string area, bool recurse) {
+      try {
+        return this.Read(
+          recurse ? "descendants" : "children",
+          area,
+          () => _KnowledgeRepository.GetAreas(
+            recurse,
+            area
+          )
+        );
+      }
+      catch (Exception ex) {
+        this.RegisterUiReadFailure(
+          ex,
+          "GetAreas",
+          area
+        );
+
+        return Array.Empty<string>();
+      }
+    }
+
+    /// <summary>
+    /// Returns one content level and degrades to navigation-only semantics when capability
+    /// discovery fails.
+    /// </summary>
     private ContentLevel Level(string area) {
-      return Read("level", area, () => {
-        _KnowledgeRepository.GetAreaCapabilities(area, out ContentLevel level, out _, out _, out _, out _, out _, out _, out _);
-        return level;
-      });
+      try {
+        return this.Read(
+          "level",
+          area,
+          () => {
+            _KnowledgeRepository.GetAreaCapabilities(
+              area,
+              out ContentLevel level,
+              out bool supportsSubAreas,
+              out bool canBeRenamed,
+              out bool canBeDeleted,
+              out bool canAddSubAreas,
+              out bool canAppendContent,
+              out bool canTruncate,
+              out bool supportsResources
+            );
+
+            return level;
+          }
+        );
+      }
+      catch (Exception ex) {
+        this.RegisterUiReadFailure(
+          ex,
+          "GetAreaCapabilities",
+          area
+        );
+
+        return ContentLevel.BeyondContent;
+      }
+    }
+
+    /// <summary>
+    /// Registers one non-fatal repository read failure for the current HTML page.
+    /// </summary>
+    private void RegisterUiReadFailure(
+      Exception ex,
+      string operation,
+      string area
+    ) {
+      DevLogger.LogError(
+        ex
+      );
+
+      string warning =
+        "Ein Teil der Wissensquelle ist momentan nicht verfügbar. "
+        + "Verfügbare Inhalte werden weiterhin angezeigt.";
+
+      if (!_UiWarnings.Contains(
+            warning
+          )) {
+        _UiWarnings.Add(
+          warning
+        );
+      }
+
+      _Logger?.LogWarning(
+        ex,
+        "Knowledge UI read failed but page rendering continues: {Operation} {Area}",
+        operation,
+        area
+      );
     }
     private static string Parent(string area) {
       int i = area.TrimEnd('/').LastIndexOf('/');
@@ -305,7 +899,36 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
       string memoKey = "view:" + area;
       if (_Memo.TryGetValue(memoKey, out object cached))
         return (DocumentView)cached;
-      var view = new DocumentView { Markdown = Read("aggregate", area, () => _KnowledgeRepository.GetAggregatedContent(area)) ?? "" };
+      string markdown =
+        string.Empty;
+
+      try {
+        markdown =
+          this.Read(
+            "aggregate",
+            area,
+            () => _KnowledgeRepository.GetAggregatedContent(
+              area
+            )
+          );
+
+        if (markdown == null) {
+          markdown =
+            string.Empty;
+        }
+      }
+      catch (Exception ex) {
+        this.RegisterUiReadFailure(
+          ex,
+          "GetAggregatedContent",
+          area
+        );
+      }
+
+      DocumentView view =
+        new DocumentView {
+          Markdown = markdown
+        };
 
       // A document is the only scope in which the HTML facade deliberately walks deeper
       // than one navigation level. Even here the traversal is performed iteratively with
@@ -417,11 +1040,44 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
         Response.Headers["Content-Security-Policy"] = "default-src 'self'; img-src 'self' https: data:; style-src 'nonce-" + nonce + "'; script-src 'nonce-" + nonce + "'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'self'";
         return Content(BuildPage(area, Name(area), children, article, content, canEdit, nonce), _HtmlContentType, Encoding.UTF8);
       }
-      catch (InvalidOperationException ex) {
-        _Logger?.LogWarning(ex, "Knowledge area cannot be resolved");
-        return NotFound("Wissensbereich nicht gefunden oder nicht verfügbar.");
+      catch (Exception ex) when (IsRepositoryError(ex)) {
+        this.RegisterUiReadFailure(
+          ex,
+          "RenderPage",
+          area
+        );
+
+        string nonce =
+          Convert.ToBase64String(
+            RandomNumberGenerator.GetBytes(18)
+          );
+
+        Response.Headers["Content-Security-Policy"] =
+          "default-src 'self'; img-src 'self' https: data:; style-src 'nonce-"
+          + nonce
+          + "'; script-src 'nonce-"
+          + nonce
+          + "'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'self'";
+
+        return Content(
+          this.BuildPage(
+            area,
+            this.Name(
+              area
+            ),
+            Array.Empty<string>(),
+            new DocumentView {
+              Markdown = string.Empty,
+              Html = string.Empty
+            },
+            false,
+            false,
+            nonce
+          ),
+          _HtmlContentType,
+          Encoding.UTF8
+        );
       }
-      catch (Exception ex) when (IsRepositoryError(ex)) { return RepositoryError(ex); }
     }
 
     private string BuildPage(string area, string title, string[] children, DocumentView view, bool content, bool canEdit, string nonce) {
@@ -436,7 +1092,21 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
         b.Append("<form data-mutation action=\"").Append(H(Route(KnowledgeRepositoryHttpRouteNames._HtmlRefresh))).Append("\" method=\"post\">").Append(hidden)
           .Append("<button type=\"submit\" class=\"quiet\" title=\"Quellen neu laden\">Aktualisieren</button></form><button type=\"button\" class=\"quiet\" data-dialog=\"edit-dialog\">Bearbeiten</button>");
       }
-      b.Append("</div></header><nav class=\"breadcrumbs\" aria-label=\"Breadcrumb\"><ol>");
+      b.Append("</div></header>");
+
+      if (_UiWarnings.Count > 0) {
+        b.Append("<div class=\"repository-warning\" role=\"status\">");
+
+        foreach (string warning in _UiWarnings) {
+          b.Append("<div>")
+            .Append(H(warning))
+            .Append("</div>");
+        }
+
+        b.Append("</div>");
+      }
+
+      b.Append("<nav class=\"breadcrumbs\" aria-label=\"Breadcrumb\"><ol>");
       var crumbs = new List<string>();
       for (string p = area; p != "/"; p = Parent(p))
         crumbs.Add(p);
@@ -494,54 +1164,239 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
       public DateTimeOffset Created { get; set; }
       public T Value { get; set; }
     }
-    private T Read<T>(string operation, string argument, Func<T> loader) {
-      string local = JsonSerializer.Serialize(new[] { operation, argument });
-      if (_Memo.TryGetValue(local, out object memory))
+    /// <summary>
+    /// Reads one repository value through the optional HTML cache.
+    ///
+    /// A fresh cache value wins. When a provider read fails, an expired cache value is
+    /// deliberately accepted as a last-known-good fallback so the UI can still render
+    /// whatever knowledge is locally available.
+    /// </summary>
+    private T Read<T>(
+      string operation,
+      string argument,
+      Func<T> loader
+    ) {
+      string local =
+        JsonSerializer.Serialize(
+          new[] {
+            operation,
+            argument
+          }
+        );
+
+      if (_Memo.TryGetValue(
+            local,
+            out object memory
+          )) {
         return (T)memory;
-      if (!DiskCache) { T fresh = loader(); _Memo[local] = fresh; return fresh; }
-      string file;
-      try {
-        Directory.CreateDirectory(CacheRoot);
-        if (_CacheEpoch == null) {
-          string epochFile = Path.Combine(CacheRoot, "epoch");
-          _CacheEpoch = System.IO.File.Exists(epochFile) ? System.IO.File.ReadAllText(epochFile) : "0";
-        }
-        file = Path.Combine(CacheRoot, Hash(_CacheEpoch + "|" + Scope() + "|" + local) + ".cache");
       }
-      catch (Exception ex) when (IsCacheError(ex)) { _Logger?.LogWarning(ex, "Knowledge cache unavailable"); T fresh = loader(); _Memo[local] = fresh; return fresh; }
-      // In-process stampede protection; atomic files also allow several worker processes.
-      lock (_CacheLocks[Convert.ToByte(Path.GetFileName(file).Substring(0, 2), 16)]) {
-        if (TryReadCache(file, out T cached)) { _Memo[local] = cached; return cached; }
-        T value = loader(); // Never persist failures or turn them into empty repository trees.
-        try {
-          var entry = new CacheEntry<T> { Created = DateTimeOffset.UtcNow, Value = value };
-          AtomicWrite(file, _Protector.Protect(JsonSerializer.SerializeToUtf8Bytes(entry)));
-          // Bounded opportunistic cleanup; cache is disposable, never touch sync state.
-          if (RandomNumberGenerator.GetInt32(64) == 0) {
-            foreach (string old in Directory.EnumerateFiles(CacheRoot, "*.cache").Take(256)) {
-              if (System.IO.File.GetLastWriteTimeUtc(old) < DateTime.UtcNow - _Options.CacheLifetime - TimeSpan.FromDays(1))
-                System.IO.File.Delete(old);
-            }
+
+      if (!DiskCache) {
+        T fresh =
+          loader();
+
+        _Memo[local] =
+          fresh;
+
+        return fresh;
+      }
+
+      string file;
+
+      try {
+        Directory.CreateDirectory(
+          CacheRoot
+        );
+
+        if (_CacheEpoch == null) {
+          string epochFile =
+            Path.Combine(
+              CacheRoot,
+              "epoch"
+            );
+
+          if (System.IO.File.Exists(
+                epochFile
+              )) {
+            _CacheEpoch =
+              System.IO.File.ReadAllText(
+                epochFile
+              );
+          }
+          else {
+            _CacheEpoch =
+              "0";
           }
         }
-        catch (Exception ex) when (IsCacheError(ex)) { _Logger?.LogWarning(ex, "Knowledge cache write failed"); }
-        _Memo[local] = value;
-        return value;
+
+        file =
+          Path.Combine(
+            CacheRoot,
+            Hash(
+              _CacheEpoch
+              + "|"
+              + Scope()
+              + "|"
+              + local
+            )
+            + ".cache"
+          );
+      }
+      catch (Exception ex) when (IsCacheError(ex)) {
+        DevLogger.LogError(
+          ex
+        );
+
+        _Logger?.LogWarning(
+          ex,
+          "Knowledge HTML cache unavailable"
+        );
+
+        T fresh =
+          loader();
+
+        _Memo[local] =
+          fresh;
+
+        return fresh;
+      }
+
+      lock (_CacheLocks[Convert.ToByte(Path.GetFileName(file).Substring(0, 2), 16)]) {
+        if (this.TryReadCache(
+              file,
+              false,
+              out T cached
+            )) {
+          _Memo[local] =
+            cached;
+
+          return cached;
+        }
+
+        bool hasStaleValue =
+          this.TryReadCache(
+            file,
+            true,
+            out T staleValue
+          );
+
+        try {
+          T value =
+            loader();
+
+          try {
+            CacheEntry<T> entry =
+              new CacheEntry<T>();
+
+            entry.Created =
+              DateTimeOffset.UtcNow;
+
+            entry.Value =
+              value;
+
+            AtomicWrite(
+              file,
+              _Protector.Protect(
+                JsonSerializer.SerializeToUtf8Bytes(
+                  entry
+                )
+              )
+            );
+
+            if (RandomNumberGenerator.GetInt32(64) == 0) {
+              foreach (string old in Directory.EnumerateFiles(CacheRoot, "*.cache").Take(256)) {
+                if (System.IO.File.GetLastWriteTimeUtc(old) <
+                    DateTime.UtcNow - _Options.CacheLifetime - TimeSpan.FromDays(1)) {
+                  System.IO.File.Delete(
+                    old
+                  );
+                }
+              }
+            }
+          }
+          catch (Exception ex) when (IsCacheError(ex)) {
+            DevLogger.LogError(
+              ex
+            );
+
+            _Logger?.LogWarning(
+              ex,
+              "Knowledge HTML cache write failed"
+            );
+          }
+
+          _Memo[local] =
+            value;
+
+          return value;
+        }
+        catch (Exception ex) {
+          if (!hasStaleValue) {
+            throw;
+          }
+
+          this.RegisterUiReadFailure(
+            ex,
+            operation,
+            argument
+          );
+
+          _Memo[local] =
+            staleValue;
+
+          return staleValue;
+        }
       }
     }
-    private bool TryReadCache<T>(string file, out T value) {
-      value = default;
+
+    /// <summary>
+    /// Reads one HTML cache value. Expired entries can optionally be accepted for
+    /// last-known-good degradation after a provider failure.
+    /// </summary>
+    private bool TryReadCache<T>(
+      string file,
+      bool acceptExpired,
+      out T value
+    ) {
+      value =
+        default(T);
+
       try {
-        if (!System.IO.File.Exists(file))
+        if (!System.IO.File.Exists(
+              file
+            )) {
           return false;
-        var entry = JsonSerializer.Deserialize<CacheEntry<T>>(_Protector.Unprotect(System.IO.File.ReadAllBytes(file)));
-        if (entry == null || entry.Created > DateTimeOffset.UtcNow || DateTimeOffset.UtcNow - entry.Created >= _Options.CacheLifetime)
+        }
+
+        CacheEntry<T> entry =
+          JsonSerializer.Deserialize<CacheEntry<T>>(
+            _Protector.Unprotect(
+              System.IO.File.ReadAllBytes(
+                file
+              )
+            )
+          );
+
+        if (entry == null ||
+            entry.Created > DateTimeOffset.UtcNow) {
           return false;
-        value = entry.Value;
+        }
+
+        if (!acceptExpired &&
+            DateTimeOffset.UtcNow - entry.Created >= _Options.CacheLifetime) {
+          return false;
+        }
+
+        value =
+          entry.Value;
+
         return true;
       }
-      catch (Exception ex) when (IsCacheError(ex)) { return false; }
+      catch (Exception ex) when (IsCacheError(ex)) {
+        return false;
+      }
     }
+
     private static bool IsCacheError(Exception ex) {
       return ex is IOException || ex is UnauthorizedAccessException || ex is CryptographicException || ex is JsonException;
     }
@@ -1214,7 +2069,402 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
              );
     }
 
-    private string GetPageCss() { return @":root{color-scheme:light;--ink:#20372f;--muted:#708079;--line:#e0e7e2;--accent:#216d55}*{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:32px}body{margin:0;background:#fafbf9;color:var(--ink);font:16px/1.65 system-ui,sans-serif}a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}.site-header{display:flex;align-items:center;justify-content:space-between;gap:24px;padding:16px 32px;background:#fff;border-bottom:1px solid var(--line)}.brand{font-weight:700;font-size:22px;letter-spacing:-.03em}.header-actions{display:flex;gap:16px;align-items:center;font-size:12px}.quiet{border:0;background:none;color:var(--muted);padding:4px 0;cursor:pointer;font:inherit;white-space:nowrap}.quiet:hover{color:var(--accent)}#wiki-search{display:flex;gap:8px;align-items:center}#wiki-search input{width:230px;border:1px solid var(--line);background:#fafbf9;padding:7px 11px;font:13px system-ui}.breadcrumbs{max-width:1560px;margin:22px auto 0;padding:0 32px;font-size:12px;color:var(--muted)}.breadcrumbs ol{display:flex;flex-wrap:wrap;gap:0;list-style:none;padding:0;margin:0}.breadcrumbs li+li:before{content:'/';padding:0 10px;color:#a4b0a9}.breadcrumbs a{color:var(--muted)}.layout{max-width:1560px;display:grid;grid-template-columns:240px minmax(0,1fr);gap:32px;margin:20px auto 48px;padding:0 32px}.area-nav,.outline{font-size:13px;align-self:start;position:sticky;top:24px;max-height:calc(100vh - 48px);overflow:auto}.area-nav h2,.outline h2{margin:10px 0 12px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:var(--muted)}.area-nav a,.outline a{display:block;padding:6px 10px;border-radius:5px;color:var(--muted);overflow-wrap:anywhere}.area-nav a[aria-current],.outline a[aria-current]{color:var(--accent);background:#edf3ed}.area-nav a:hover,.outline a:hover{color:var(--accent);text-decoration:none;background:#f0f4f0}.outline nav{border-left:1px solid var(--line)}.outline .outline-level-2{padding-left:18px}.outline .outline-level-3{padding-left:28px}.outline .outline-level-4{padding-left:38px}.outline .outline-level-5,.outline .outline-level-6{padding-left:48px}main{min-width:0;background:white;border:1px solid var(--line);border-radius:8px;padding:32px 40px}h1{font-size:30px;line-height:1.25;margin:0 0 28px;letter-spacing:-.03em}article{overflow-wrap:anywhere}article h1,article h2,article h3,article h4,article h5,article h6{scroll-margin-top:28px}article h1{font-size:26px;margin-top:32px}article h2{font-size:23px;margin-top:30px}article h3{font-size:19px;margin-top:24px}article img{max-width:100%;height:auto}pre{overflow:auto;background:#f2f5f1;padding:16px;border-radius:6px}code{font-size:.9em}table{border-collapse:collapse;display:block;overflow:auto;max-width:100%}td,th{padding:8px 12px;border:1px solid var(--line)}blockquote{border-left:3px solid var(--line);margin-left:0;padding-left:20px;color:var(--muted)}.document-list{list-style:none;margin:0;padding:0}.document-list li{border-top:1px solid var(--line)}.document-list a{display:block;padding:14px 0}.muted{color:var(--muted)}.source-status{font-size:12px;color:var(--muted);margin-bottom:20px}.source-status summary{cursor:pointer}.source-status li{margin:8px 0}dialog{width:min(780px,calc(100vw - 32px));max-height:85vh;overflow:auto;border:1px solid var(--line);border-radius:12px;padding:24px 28px;color:var(--ink);box-shadow:0 24px 90px #18332f33}dialog:not([open]){display:none}dialog::backdrop{background:#102c254d}.dialog-head{display:flex;align-items:center;justify-content:space-between;gap:24px;border-bottom:1px solid var(--line);padding-bottom:12px;margin-bottom:20px}.dialog-head h2{font-size:19px;margin:0}.close-dialog{font-size:26px;padding:0 8px}input,select,textarea{border:1px solid #bdcbc2;border-radius:5px;color:var(--ink)}input,select{padding:8px}textarea{display:block;width:100%;padding:12px;font:14px/1.55 ui-monospace,monospace;resize:vertical}dialog button:not(.quiet){background:var(--accent);color:#fff;border:0;border-radius:5px;padding:9px 13px;cursor:pointer;margin:10px 8px 10px 0}dialog label{display:block;font-size:13px;margin-bottom:6px}.new-area{border-top:1px solid var(--line);padding-top:16px;margin-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}.api-url{display:block;overflow-wrap:anywhere}.notice{background:#eef5ef;padding:10px 14px;border-radius:5px;font-size:14px}.search-result{padding:16px 0;border-bottom:1px solid var(--line)}.search-result>a{font-weight:600;font-size:17px}.search-result small{display:block;color:var(--muted);overflow-wrap:anywhere}.search-result p{margin:6px 0 0;font-size:14px}button:focus-visible,a:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:3px}@media(max-width:1100px){.layout{grid-template-columns:210px minmax(0,1fr);gap:18px;padding:0 20px}main{padding:24px}.site-header{padding:14px 20px}.breadcrumbs{padding:0 20px}}@media(max-width:800px){.site-header{align-items:flex-start;gap:12px}.header-actions{gap:10px;flex-wrap:wrap;justify-content:flex-end}#wiki-search input{width:170px}.layout{grid-template-columns:minmax(0,1fr)}.area-nav{position:static;display:flex;gap:6px;flex-wrap:wrap;max-height:none}.area-nav h2{width:100%;margin:0}.outline{position:static;grid-row:2;max-height:180px}.outline:empty{display:none}main{grid-row:3}.outline h2{margin-top:0}.outline nav{display:flex;gap:4px;flex-wrap:wrap;border:0}.outline nav a{padding:3px 8px}.breadcrumbs{margin-top:14px}h1{font-size:26px}dialog{padding:18px}}@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+    /// <summary>
+    /// Represents one browser-owned background search session.
+    /// </summary>
+    private sealed class SearchSession : IDisposable {
+
+      private readonly object _SyncRoot;
+      private readonly string _SearchId;
+      private readonly string _Query;
+      private readonly CancellationTokenSource _CancellationSource;
+      private readonly List<SearchResult> _Results;
+
+      private DateTime _LastHeartbeatUtc;
+      private int _ProcessedAreas;
+      private bool _IsCompleted;
+      private bool _IsCancelled;
+      private bool _More;
+      private bool _HadProviderFailures;
+      private string _ErrorMessage;
+
+      /// <summary>
+      /// Creates one active search session.
+      /// </summary>
+      public SearchSession(
+        string searchId,
+        string query,
+        CancellationTokenSource cancellationSource
+      ) {
+        _SyncRoot =
+          new object();
+
+        _SearchId =
+          searchId;
+
+        _Query =
+          query;
+
+        _CancellationSource =
+          cancellationSource;
+
+        _Results =
+          new List<SearchResult>();
+
+        _LastHeartbeatUtc =
+          DateTime.UtcNow;
+
+        _ErrorMessage =
+          string.Empty;
+      }
+
+      /// <summary>
+      /// Gets the immutable search query.
+      /// </summary>
+      public string Query {
+        get {
+          return _Query;
+        }
+      }
+
+      /// <summary>
+      /// Gets the linked cancellation token.
+      /// </summary>
+      public CancellationToken CancellationToken {
+        get {
+          return _CancellationSource.Token;
+        }
+      }
+
+      /// <summary>
+      /// Gets the most recent browser heartbeat.
+      /// </summary>
+      public DateTime LastHeartbeatUtc {
+        get {
+          lock (_SyncRoot) {
+            return _LastHeartbeatUtc;
+          }
+        }
+      }
+
+      /// <summary>
+      /// Gets whether the configured result limit was reached.
+      /// </summary>
+      public bool HasReachedResultLimit {
+        get {
+          lock (_SyncRoot) {
+            return _Results.Count >= _SearchMaximumResults;
+          }
+        }
+      }
+
+      /// <summary>
+      /// Adds one detached result.
+      /// </summary>
+      public void AddResult(
+        SearchResult result,
+        int maximumResults
+      ) {
+        lock (_SyncRoot) {
+          if (_Results.Count >= maximumResults) {
+            _More = true;
+            return;
+          }
+
+          _Results.Add(
+            result
+          );
+        }
+      }
+
+      /// <summary>
+      /// Increments the number of processed logical areas.
+      /// </summary>
+      public void IncrementProcessedAreas() {
+        lock (_SyncRoot) {
+          _ProcessedAreas++;
+        }
+      }
+
+      /// <summary>
+      /// Marks that at least one provider branch failed while other branches continued.
+      /// </summary>
+      public void MarkProviderFailure() {
+        lock (_SyncRoot) {
+          _HadProviderFailures =
+            true;
+        }
+      }
+
+      /// <summary>
+      /// Marks that additional results may exist.
+      /// </summary>
+      public void MarkMoreResultsAvailable() {
+        lock (_SyncRoot) {
+          _More = true;
+        }
+      }
+
+      /// <summary>
+      /// Marks the search as successfully completed.
+      /// </summary>
+      public void MarkCompleted() {
+        lock (_SyncRoot) {
+          _IsCompleted = true;
+        }
+      }
+
+      /// <summary>
+      /// Marks the search as cancelled.
+      /// </summary>
+      public void MarkCancelled() {
+        lock (_SyncRoot) {
+          _IsCancelled = true;
+          _IsCompleted = true;
+        }
+      }
+
+      /// <summary>
+      /// Marks the search as failed.
+      /// </summary>
+      public void MarkFaulted(string errorMessage) {
+        lock (_SyncRoot) {
+          _ErrorMessage = errorMessage;
+          _IsCompleted = true;
+        }
+      }
+
+      /// <summary>
+      /// Cancels the linked worker token.
+      /// </summary>
+      public void Cancel() {
+        if (!_CancellationSource.IsCancellationRequested) {
+          _CancellationSource.Cancel();
+        }
+      }
+
+      /// <summary>
+      /// Updates the browser heartbeat and returns one immutable snapshot.
+      /// </summary>
+      public SearchSessionSnapshot CreateSnapshotAndHeartbeat() {
+        lock (_SyncRoot) {
+          _LastHeartbeatUtc = DateTime.UtcNow;
+
+          SearchSessionSnapshot snapshot =
+            new SearchSessionSnapshot();
+
+          snapshot.Results =
+            _Results.ToArray();
+
+          snapshot.ProcessedAreas =
+            _ProcessedAreas;
+
+          snapshot.IsCompleted =
+            _IsCompleted;
+
+          snapshot.IsCancelled =
+            _IsCancelled;
+
+          snapshot.More =
+            _More;
+
+          snapshot.HadProviderFailures =
+            _HadProviderFailures;
+
+          snapshot.ErrorMessage =
+            _ErrorMessage;
+
+          return snapshot;
+        }
+      }
+
+      /// <summary>
+      /// Cancels and releases the linked cancellation source.
+      /// </summary>
+      public void Dispose() {
+        this.Cancel();
+        _CancellationSource.Dispose();
+      }
+    }
+
+    /// <summary>
+    /// Represents one immutable browser-visible search state.
+    /// </summary>
+    private sealed class SearchSessionSnapshot {
+
+      private SearchResult[] _Results;
+      private int _ProcessedAreas;
+      private bool _IsCompleted;
+      private bool _IsCancelled;
+      private bool _More;
+      private bool _HadProviderFailures;
+      private string _ErrorMessage;
+
+      /// <summary>
+      /// Creates one empty snapshot.
+      /// </summary>
+      public SearchSessionSnapshot() {
+        _Results =
+          Array.Empty<SearchResult>();
+
+        _ErrorMessage =
+          string.Empty;
+      }
+
+      public SearchResult[] Results {
+        get {
+          return _Results;
+        }
+        set {
+          if (value == null) {
+            _Results = Array.Empty<SearchResult>();
+          }
+          else {
+            _Results = value;
+          }
+        }
+      }
+
+      public int ProcessedAreas {
+        get {
+          return _ProcessedAreas;
+        }
+        set {
+          _ProcessedAreas = value;
+        }
+      }
+
+      public bool IsCompleted {
+        get {
+          return _IsCompleted;
+        }
+        set {
+          _IsCompleted = value;
+        }
+      }
+
+      public bool IsCancelled {
+        get {
+          return _IsCancelled;
+        }
+        set {
+          _IsCancelled = value;
+        }
+      }
+
+      public bool More {
+        get {
+          return _More;
+        }
+        set {
+          _More = value;
+        }
+      }
+
+      public bool HadProviderFailures {
+        get {
+          return _HadProviderFailures;
+        }
+        set {
+          _HadProviderFailures =
+            value;
+        }
+      }
+
+      public string ErrorMessage {
+        get {
+          return _ErrorMessage;
+        }
+        set {
+          if (value == null) {
+            _ErrorMessage = string.Empty;
+          }
+          else {
+            _ErrorMessage = value;
+          }
+        }
+      }
+    }
+
+    /// <summary>
+    /// Represents one detached search result.
+    /// </summary>
+    private sealed class SearchResult {
+
+      private string _Title;
+      private string _Path;
+      private string _Url;
+      private string _Snippet;
+
+      /// <summary>
+      /// Creates one empty search result.
+      /// </summary>
+      public SearchResult() {
+        _Title = string.Empty;
+        _Path = string.Empty;
+        _Url = string.Empty;
+        _Snippet = string.Empty;
+      }
+
+      public string Title {
+        get {
+          return _Title;
+        }
+        set {
+          if (value == null) {
+            _Title = string.Empty;
+          }
+          else {
+            _Title = value;
+          }
+        }
+      }
+
+      public string Path {
+        get {
+          return _Path;
+        }
+        set {
+          if (value == null) {
+            _Path = string.Empty;
+          }
+          else {
+            _Path = value;
+          }
+        }
+      }
+
+      public string Url {
+        get {
+          return _Url;
+        }
+        set {
+          if (value == null) {
+            _Url = string.Empty;
+          }
+          else {
+            _Url = value;
+          }
+        }
+      }
+
+      public string Snippet {
+        get {
+          return _Snippet;
+        }
+        set {
+          if (value == null) {
+            _Snippet = string.Empty;
+          }
+          else {
+            _Snippet = value;
+          }
+        }
+      }
+    }
+
+    private string GetPageCss() { return @":root{color-scheme:light;--ink:#20372f;--muted:#708079;--line:#e0e7e2;--accent:#216d55}*{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:32px}body{margin:0;background:#fafbf9;color:var(--ink);font:16px/1.65 system-ui,sans-serif}a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}.site-header{display:flex;align-items:center;justify-content:space-between;gap:24px;padding:16px 32px;background:#fff;border-bottom:1px solid var(--line)}.brand{font-weight:700;font-size:22px;letter-spacing:-.03em}.header-actions{display:flex;gap:16px;align-items:center;font-size:12px}.quiet{border:0;background:none;color:var(--muted);padding:4px 0;cursor:pointer;font:inherit;white-space:nowrap}.quiet:hover{color:var(--accent)}#wiki-search{display:flex;gap:8px;align-items:center}#wiki-search input{width:230px;border:1px solid var(--line);background:#fafbf9;padding:7px 11px;font:13px system-ui}.breadcrumbs{max-width:1560px;margin:22px auto 0;padding:0 32px;font-size:12px;color:var(--muted)}.breadcrumbs ol{display:flex;flex-wrap:wrap;gap:0;list-style:none;padding:0;margin:0}.breadcrumbs li+li:before{content:'/';padding:0 10px;color:#a4b0a9}.breadcrumbs a{color:var(--muted)}.layout{max-width:1560px;display:grid;grid-template-columns:240px minmax(0,1fr);gap:32px;margin:20px auto 48px;padding:0 32px}.area-nav,.outline{font-size:13px;align-self:start;position:sticky;top:24px;max-height:calc(100vh - 48px);overflow:auto}.area-nav h2,.outline h2{margin:10px 0 12px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:var(--muted)}.area-nav a,.outline a{display:block;padding:6px 10px;border-radius:5px;color:var(--muted);overflow-wrap:anywhere}.area-nav a[aria-current],.outline a[aria-current]{color:var(--accent);background:#edf3ed}.area-nav a:hover,.outline a:hover{color:var(--accent);text-decoration:none;background:#f0f4f0}.outline nav{border-left:1px solid var(--line)}.outline .outline-level-2{padding-left:18px}.outline .outline-level-3{padding-left:28px}.outline .outline-level-4{padding-left:38px}.outline .outline-level-5,.outline .outline-level-6{padding-left:48px}main{min-width:0;background:white;border:1px solid var(--line);border-radius:8px;padding:32px 40px}h1{font-size:30px;line-height:1.25;margin:0 0 28px;letter-spacing:-.03em}article{overflow-wrap:anywhere}article h1,article h2,article h3,article h4,article h5,article h6{scroll-margin-top:28px}article h1{font-size:26px;margin-top:32px}article h2{font-size:23px;margin-top:30px}article h3{font-size:19px;margin-top:24px}article img{max-width:100%;height:auto}pre{overflow:auto;background:#f2f5f1;padding:16px;border-radius:6px}code{font-size:.9em}table{border-collapse:collapse;display:block;overflow:auto;max-width:100%}td,th{padding:8px 12px;border:1px solid var(--line)}blockquote{border-left:3px solid var(--line);margin-left:0;padding-left:20px;color:var(--muted)}.document-list{list-style:none;margin:0;padding:0}.document-list li{border-top:1px solid var(--line)}.document-list a{display:block;padding:14px 0}.muted{color:var(--muted)}
+.repository-warning{max-width:1100px;margin:12px auto 0;padding:10px 14px;border:1px solid var(--border);border-radius:8px;font-size:.92rem}.source-status{font-size:12px;color:var(--muted);margin-bottom:20px}.source-status summary{cursor:pointer}.source-status li{margin:8px 0}dialog{width:min(780px,calc(100vw - 32px));max-height:85vh;overflow:auto;border:1px solid var(--line);border-radius:12px;padding:24px 28px;color:var(--ink);box-shadow:0 24px 90px #18332f33}dialog:not([open]){display:none}dialog::backdrop{background:#102c254d}.dialog-head{display:flex;align-items:center;justify-content:space-between;gap:24px;border-bottom:1px solid var(--line);padding-bottom:12px;margin-bottom:20px}.dialog-head h2{font-size:19px;margin:0}.close-dialog{font-size:26px;padding:0 8px}input,select,textarea{border:1px solid #bdcbc2;border-radius:5px;color:var(--ink)}input,select{padding:8px}textarea{display:block;width:100%;padding:12px;font:14px/1.55 ui-monospace,monospace;resize:vertical}dialog button:not(.quiet){background:var(--accent);color:#fff;border:0;border-radius:5px;padding:9px 13px;cursor:pointer;margin:10px 8px 10px 0}dialog label{display:block;font-size:13px;margin-bottom:6px}.new-area{border-top:1px solid var(--line);padding-top:16px;margin-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}.api-url{display:block;overflow-wrap:anywhere}.notice{background:#eef5ef;padding:10px 14px;border-radius:5px;font-size:14px}.search-result{padding:16px 0;border-bottom:1px solid var(--line)}.search-result>a{font-weight:600;font-size:17px}.search-result small{display:block;color:var(--muted);overflow-wrap:anywhere}.search-result p{margin:6px 0 0;font-size:14px}button:focus-visible,a:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:3px}@media(max-width:1100px){.layout{grid-template-columns:210px minmax(0,1fr);gap:18px;padding:0 20px}main{padding:24px}.site-header{padding:14px 20px}.breadcrumbs{padding:0 20px}}@media(max-width:800px){.site-header{align-items:flex-start;gap:12px}.header-actions{gap:10px;flex-wrap:wrap;justify-content:flex-end}#wiki-search input{width:170px}.layout{grid-template-columns:minmax(0,1fr)}.area-nav{position:static;display:flex;gap:6px;flex-wrap:wrap;max-height:none}.area-nav h2{width:100%;margin:0}.outline{position:static;grid-row:2;max-height:180px}.outline:empty{display:none}main{grid-row:3}.outline h2{margin-top:0}.outline nav{display:flex;gap:4px;flex-wrap:wrap;border:0}.outline nav a{padding:3px 8px}.breadcrumbs{margin-top:14px}h1{font-size:26px}dialog{padding:18px}}@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
 
 .sidebar{align-self:start;position:sticky;top:24px;max-height:calc(100vh - 48px);overflow:auto}.sidebar .area-nav,.sidebar .outline{position:static;max-height:none;overflow:visible}.sidebar .outline{margin-top:28px;border-top:1px solid var(--line);padding-top:10px}.header-actions form{margin:0}@media(max-width:800px){.sidebar{position:static;max-height:none}.sidebar .outline{max-height:220px;overflow:auto}main{grid-row:auto}}
 "; }
@@ -1227,24 +2477,124 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
     const r = dialog.getBoundingClientRect();
     if (event.clientX < r.left || event.clientX > r.right || event.clientY < r.top || event.clientY > r.bottom) dialog.close();
   }));
-  let controller;
-  document.getElementById('wiki-search').addEventListener('submit', async event => {
-    event.preventDefault(); const form = event.currentTarget; const query = form.elements.q.value.trim(); if (!query) return;
-    if (controller) controller.abort(); const active = new AbortController(); controller = active;
-    const status = document.getElementById('search-status'); const results = document.getElementById('search-results');
-    results.replaceChildren(); status.textContent = 'Suche läuft …'; show('search-dialog');
-    try {
-      const response = await fetch(form.action + '?q=' + encodeURIComponent(query), {credentials: 'same-origin', signal: active.signal, headers: {'Accept': 'application/json'}});
-      const data = await response.json(); if (!response.ok) throw new Error(data.fault || 'Suche derzeit nicht verfügbar.');
-      if (controller !== active) return;
-      status.textContent = data.results.length + ' Treffer für „' + query + '“' + (data.more ? ' (erste 100)' : '');
-      data.results.forEach(result => {
-        const card = document.createElement('div'); card.className = 'search-result'; const link = document.createElement('a');
-        link.href = result.url; link.textContent = result.title; link.addEventListener('click', () => document.getElementById('search-dialog').close());
-        const path = document.createElement('small'); path.textContent = result.path; const snippet = document.createElement('p'); snippet.textContent = result.snippet;
-        card.append(link, path, snippet); results.append(card);
+  const searchDialog = document.getElementById('search-dialog');
+  let activeSearchId = null;
+  let activeSearchGeneration = 0;
+  let searchPollTimer = null;
+
+  const stopSearchHeartbeat = () => {
+    activeSearchGeneration++;
+    activeSearchId = null;
+    if (searchPollTimer) {
+      window.clearTimeout(searchPollTimer);
+      searchPollTimer = null;
+    }
+  };
+
+  const renderSearchResults = (data, query) => {
+    const status = document.getElementById('search-status');
+    const results = document.getElementById('search-results');
+    results.replaceChildren();
+    status.textContent = data.results.length + ' Treffer für „' + query + '“' + (data.more ? ' (erste 100)' : '');
+    if (data.warnings && data.warnings.length > 0) {
+      status.textContent += ' · ' + data.warnings.join(' ');
+    }
+    data.results.forEach(result => {
+      const card = document.createElement('div');
+      card.className = 'search-result';
+      const link = document.createElement('a');
+      link.href = result.url;
+      link.textContent = result.title;
+      link.addEventListener('click', () => searchDialog.close());
+      const path = document.createElement('small');
+      path.textContent = result.path;
+      const snippet = document.createElement('p');
+      snippet.textContent = result.snippet;
+      card.append(link, path, snippet);
+      results.append(card);
+    });
+  };
+
+  const pollSearch = (baseUrl, query, searchId, generation) => {
+    if (activeSearchId !== searchId || activeSearchGeneration !== generation || !searchDialog.open) return;
+
+    fetch(baseUrl + '/' + encodeURIComponent(searchId), {
+      credentials: 'same-origin',
+      cache: 'no-store',
+      headers: {'Accept': 'application/json'}
+    }).then(response => {
+      if (response.status === 404 || response.status === 410) {
+        stopSearchHeartbeat();
+        return null;
+      }
+      return response.json().then(data => {
+        if (!response.ok) throw new Error(data.fault || 'Suche derzeit nicht verfügbar.');
+        return data;
       });
-    } catch (error) { if (error.name !== 'AbortError') status.textContent = error.message || 'Suche derzeit nicht verfügbar.'; }
+    }).then(data => {
+      if (!data || activeSearchId !== searchId || activeSearchGeneration !== generation || !searchDialog.open) return;
+
+      const status = document.getElementById('search-status');
+
+      if (data.completed) {
+        stopSearchHeartbeat();
+        renderSearchResults(data, query);
+        return;
+      }
+
+      status.textContent = 'Suche läuft … ' + data.processed + ' Bereiche geprüft, ' + data.resultCount + ' Treffer';
+
+      searchPollTimer =
+        window.setTimeout(
+          () => pollSearch(baseUrl, query, searchId, generation),
+          1000
+        );
+    }).catch(error => {
+      if (activeSearchId !== searchId || activeSearchGeneration !== generation) return;
+      stopSearchHeartbeat();
+      document.getElementById('search-status').textContent = error.message || 'Suche derzeit nicht verfügbar.';
+    });
+  };
+
+  searchDialog.addEventListener('close', stopSearchHeartbeat);
+  window.addEventListener('pagehide', stopSearchHeartbeat);
+
+  document.getElementById('wiki-search').addEventListener('submit', event => {
+    event.preventDefault();
+
+    const form = event.currentTarget;
+    const query = form.elements.q.value.trim();
+
+    if (!query) return;
+
+    stopSearchHeartbeat();
+
+    const generation = activeSearchGeneration;
+    const status = document.getElementById('search-status');
+    const results = document.getElementById('search-results');
+
+    results.replaceChildren();
+    status.textContent = 'Suche wird gestartet …';
+    show('search-dialog');
+
+    fetch(form.action + '?q=' + encodeURIComponent(query), {
+      credentials: 'same-origin',
+      cache: 'no-store',
+      headers: {'Accept': 'application/json'}
+    }).then(response => response.json().then(data => {
+      if (!response.ok) throw new Error(data.fault || 'Suche derzeit nicht verfügbar.');
+      return data;
+    })).then(data => {
+      if (!searchDialog.open || activeSearchGeneration !== generation) return;
+
+      activeSearchId = data.searchId;
+      pollSearch(form.action, query, data.searchId, generation);
+    }).catch(error => {
+      if (!searchDialog.open || activeSearchGeneration !== generation) return;
+
+      stopSearchHeartbeat();
+      status.textContent = error.message || 'Suche derzeit nicht verfügbar.';
+    });
   });
   document.querySelectorAll('form[data-mutation]').forEach(form => form.addEventListener('submit', async event => {
     event.preventDefault();

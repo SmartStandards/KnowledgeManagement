@@ -45,31 +45,35 @@ namespace KnowledgeManagement.SmartStandards.DemoWebService {
       //////////////////////////////////////////////////////////////////////////////////////////
       //FILESYSTEM
 
-      agg.Add(new FileBasedKnowledgeRepository("C:\\Temp\\_OneNoteExport", false, true));
+      agg.Add(
+        new FileBasedKnowledgeRepository("C:\\Temp\\_OneNoteExport", false, true),
+        "/Local/"
+      );
 
       //////////////////////////////////////////////////////////////////////////////////////////
       //GITHUB
 
-      //agg.Add(
-      //  new GitBasedKnowledgeRepository(
-      //    "https://github.com/SmartStandards/FUSE-fx.RepositoryContract",
-      //    true, "","/doc/"
-      //  ),
-      //  "/FUSE-fx.RepositoryContract/"
-      //);
+      agg.Add(
+        new GitBasedKnowledgeRepository(
+          "https://github.com/SmartStandards/FUSE-fx.RepositoryContract",
+          true, "", "/doc/"
+        ),
+        "/GIT/FUSE-fx.RepositoryContract/"
+      );
 
       //////////////////////////////////////////////////////////////////////////////////////////
       // UJMW-REMOTE (mit cache)
 
-      //IKnowledgeRepository smartStandardsUjmwRemoteSource = DynamicClientFactory.CreateInstance<IKnowledgeRepository>(
-      //  "https://re-define-it.de/wiki/ujmw/IKnowledgeRepository",
-      //);
+      IKnowledgeRepository smartStandardsUjmwRemoteSource = DynamicClientFactory.CreateInstance<IKnowledgeRepository>(
+        "https://re-define-it.de/wiki/ujmw/IKnowledgeRepository",
+        config.GetValue<string>("rdiToken")     
+      );
 
-      //IKnowledgeRepository smartStandardsCached = new KnowledgeRepositoryCacheWrapper(
-      //  smartStandardsUjmwRemoteSource, 5, "C:\\Temp\\_KnowledgeCache\\SmartStandards"
-      //);
+      IKnowledgeRepository smartStandardsCached = new KnowledgeRepositoryCacheWrapper(
+        smartStandardsUjmwRemoteSource, 5, "C:\\Temp\\_KnowledgeCache\\SmartStandards"
+      );
 
-      //agg.Add(smartStandardsCached, "/SmartStandards/" );
+      agg.Add(smartStandardsCached, "/SmartStandards/");
 
       //////////////////////////////////////////////////////////////////////////////////////////
       // OneNote (via AzureGraph

@@ -320,10 +320,25 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
             continue;
           }
 
-          string[] localMatches = mountedRepository.Repository.GetAreasByKeyword(
-            keyword,
-            localSearchStart
-          );
+          string[] localMatches;
+
+          try {
+            localMatches =
+              mountedRepository.Repository.GetAreasByKeyword(
+                keyword,
+                localSearchStart
+              );
+          }
+          catch (Exception ex) {
+            this.LogProviderReadFailure(
+              ex,
+              mountedRepository,
+              "GetAreasByKeyword",
+              localSearchStart
+            );
+
+            continue;
+          }
 
           foreach (string localMatch in localMatches) {
             string globalMatch = this.ToGlobalPath(
@@ -419,17 +434,29 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
           bool providerCanTruncate;
           bool providerSupportsResources;
 
-          contribution.MountedRepository.Repository.GetAreaCapabilities(
-            contribution.LocalArea,
-            out providerContentLevel,
-            out providerSupportsSubAreas,
-            out providerCanBeRenamed,
-            out providerCanBeDeleted,
-            out providerCanAddSubAreas,
-            out providerCanAppendContent,
-            out providerCanTruncate,
-            out providerSupportsResources
-          );
+          try {
+            contribution.MountedRepository.Repository.GetAreaCapabilities(
+              contribution.LocalArea,
+              out providerContentLevel,
+              out providerSupportsSubAreas,
+              out providerCanBeRenamed,
+              out providerCanBeDeleted,
+              out providerCanAddSubAreas,
+              out providerCanAppendContent,
+              out providerCanTruncate,
+              out providerSupportsResources
+            );
+          }
+          catch (Exception ex) {
+            this.LogProviderReadFailure(
+              ex,
+              contribution,
+              "GetAreaCapabilities",
+              contribution.LocalArea
+            );
+
+            continue;
+          }
 
           if (providerSupportsSubAreas) {
             supportsSubAreas = true;
@@ -461,17 +488,29 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         bool uniqueCanTruncate;
         bool uniqueSupportsResources;
 
-        uniqueContribution.MountedRepository.Repository.GetAreaCapabilities(
-          uniqueContribution.LocalArea,
-          out uniqueContentLevel,
-          out uniqueSupportsSubAreas,
-          out uniqueCanBeRenamed,
-          out uniqueCanBeDeleted,
-          out uniqueCanAddSubAreas,
-          out uniqueCanAppendContent,
-          out uniqueCanTruncate,
-          out uniqueSupportsResources
-        );
+        try {
+          uniqueContribution.MountedRepository.Repository.GetAreaCapabilities(
+            uniqueContribution.LocalArea,
+            out uniqueContentLevel,
+            out uniqueSupportsSubAreas,
+            out uniqueCanBeRenamed,
+            out uniqueCanBeDeleted,
+            out uniqueCanAddSubAreas,
+            out uniqueCanAppendContent,
+            out uniqueCanTruncate,
+            out uniqueSupportsResources
+          );
+        }
+        catch (Exception ex) {
+          this.LogProviderReadFailure(
+            ex,
+            uniqueContribution,
+            "GetAreaCapabilities",
+            uniqueContribution.LocalArea
+          );
+
+          return;
+        }
 
         canBeRenamed = uniqueCanBeRenamed;
         canBeDeleted = uniqueCanBeDeleted;
@@ -532,31 +571,41 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
           IKnowledgeRepository repository =
             contribution.MountedRepository.Repository;
 
-          if (!this.RepositorySupportsResources(
-                repository,
+          try {
+            if (!this.RepositorySupportsResources(
+                  repository,
+                  contribution.LocalArea
+                )) {
+              continue;
+            }
+
+            KnowledgeResourceInfo[] providerResources =
+              repository.GetResources(
                 contribution.LocalArea
-              )) {
-            continue;
-          }
-
-          KnowledgeResourceInfo[] providerResources =
-            repository.GetResources(
-              contribution.LocalArea
-            );
-
-          foreach (KnowledgeResourceInfo providerResource in providerResources) {
-            KnowledgeResourceInfo aggregateResource =
-              this.CloneResourceInfo(
-                providerResource
               );
 
-            aggregateResource.ResourceId = this.CreateAggregatedResourceId(
-              contribution.MountedRepository,
-              providerResource.ResourceId
-            );
+            foreach (KnowledgeResourceInfo providerResource in providerResources) {
+              KnowledgeResourceInfo aggregateResource =
+                this.CloneResourceInfo(
+                  providerResource
+                );
 
-            resources.Add(
-              aggregateResource
+              aggregateResource.ResourceId = this.CreateAggregatedResourceId(
+                contribution.MountedRepository,
+                providerResource.ResourceId
+              );
+
+              resources.Add(
+                aggregateResource
+              );
+            }
+          }
+          catch (Exception ex) {
+            this.LogProviderReadFailure(
+              ex,
+              contribution,
+              "GetResources",
+              contribution.LocalArea
             );
           }
         }
@@ -733,10 +782,20 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         AggregatedNode node = this.RequireNode(area);
 
         foreach (AreaContribution contribution in node.Contributions) {
-          if (contribution.MountedRepository.Repository.HasDirectContent(
-                contribution.LocalArea
-              )) {
-            return true;
+          try {
+            if (contribution.MountedRepository.Repository.HasDirectContent(
+                  contribution.LocalArea
+                )) {
+              return true;
+            }
+          }
+          catch (Exception ex) {
+            this.LogProviderReadFailure(
+              ex,
+              contribution,
+              "HasDirectContent",
+              contribution.LocalArea
+            );
           }
         }
 
@@ -763,23 +822,33 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         List<string> blocks = new List<string>();
 
         foreach (AreaContribution contribution in node.Contributions) {
-          string providerContent =
-            contribution.MountedRepository.Repository.GetDirectContent(
-              contribution.LocalArea
-            );
+          try {
+            string providerContent =
+              contribution.MountedRepository.Repository.GetDirectContent(
+                contribution.LocalArea
+              );
 
-          string aggregatedContent =
-            this.TranslateProviderContentToAggregated(
+            string aggregatedContent =
+              this.TranslateProviderContentToAggregated(
+                contribution,
+                providerContent
+              );
+
+            if (!string.IsNullOrWhiteSpace(aggregatedContent)) {
+              blocks.Add(
+                aggregatedContent.Trim(
+                  '\r',
+                  '\n'
+                )
+              );
+            }
+          }
+          catch (Exception ex) {
+            this.LogProviderReadFailure(
+              ex,
               contribution,
-              providerContent
-            );
-
-          if (!string.IsNullOrWhiteSpace(aggregatedContent)) {
-            blocks.Add(
-              aggregatedContent.Trim(
-                '\r',
-                '\n'
-              )
+              "GetDirectContent",
+              contribution.LocalArea
             );
           }
         }
@@ -1604,6 +1673,51 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     }
 
     /// <summary>
+    /// Logs one isolated provider read failure. Read failures are deliberately contained
+    /// at the mounted-provider boundary so healthy contributors and siblings remain
+    /// available through the aggregate repository.
+    /// </summary>
+    private void LogProviderReadFailure(
+      Exception ex,
+      AreaContribution contribution,
+      string operation,
+      string area
+    ) {
+      this.LogProviderReadFailure(
+        ex,
+        contribution.MountedRepository,
+        operation,
+        area
+      );
+    }
+
+    /// <summary>
+    /// Logs one isolated provider read failure for a mounted repository.
+    /// </summary>
+    private void LogProviderReadFailure(
+      Exception ex,
+      MountedRepository mountedRepository,
+      string operation,
+      string area
+    ) {
+      DevLogger.LogError(
+        ex
+      );
+
+      DevLogger.LogTrace(
+        0,
+        99999,
+        "Aggregated knowledge provider read failed and was isolated: operation='"
+        + operation
+        + "' mount='"
+        + mountedRepository.MountPoint
+        + "' area='"
+        + area
+        + "'. Healthy providers remain available."
+      );
+    }
+
+    /// <summary>
     /// Returns one structurally consistent aggregate-tree snapshot for a contiguous burst
     /// of read operations.
     ///
@@ -1739,12 +1853,32 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         return;
       }
 
+      bool hadProviderFailure =
+        false;
+
       foreach (AreaContribution contribution in node.Contributions) {
-        string[] localChildren =
-          contribution.MountedRepository.Repository.GetAreas(
-            false,
+        string[] localChildren;
+
+        try {
+          localChildren =
+            contribution.MountedRepository.Repository.GetAreas(
+              false,
+              contribution.LocalArea
+            );
+        }
+        catch (Exception ex) {
+          hadProviderFailure =
+            true;
+
+          this.LogProviderReadFailure(
+            ex,
+            contribution,
+            "GetAreas",
             contribution.LocalArea
           );
+
+          continue;
+        }
 
         foreach (string localChild in localChildren) {
           string globalChild =
@@ -1766,10 +1900,30 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
             continue;
           }
 
-          string displayName =
-            contribution.MountedRepository.Repository.GetAreaName(
+          string displayName;
+
+          try {
+            displayName =
+              contribution.MountedRepository.Repository.GetAreaName(
+                localChild
+              );
+          }
+          catch (Exception ex) {
+            hadProviderFailure =
+              true;
+
+            this.LogProviderReadFailure(
+              ex,
+              contribution,
+              "GetAreaName",
               localChild
             );
+
+            displayName =
+              this.GetLastAreaSegment(
+                globalChild
+              );
+          }
 
           AggregatedNode globalNode =
             tree.GetOrCreate(
@@ -1786,8 +1940,11 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         }
       }
 
+      // A partial materialization remains usable immediately, but a failed contributor
+      // must be retried on a later read burst instead of permanently marking the node as
+      // complete.
       node.ChildrenMaterialized =
-        true;
+        !hadProviderFailure;
     }
 
     /// <summary>
@@ -1925,36 +2082,39 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     /// Resolves the effective read-oriented content level of a merged global area.
     /// </summary>
     private ContentLevel ResolveCombinedContentLevel(AggregatedNode node) {
-      bool hasAggregation = false;
+      bool hasAggregation =
+        false;
 
       foreach (AreaContribution contribution in node.Contributions) {
-        ContentLevel contentLevel;
-        bool supportsSubAreas;
-        bool canBeRenamed;
-        bool canBeDeleted;
-        bool canAddSubAreas;
-        bool canAppendContent;
-        bool canTruncate;
-        bool supportsResources;
+        try {
+          contribution.MountedRepository.Repository.GetAreaCapabilities(
+            contribution.LocalArea,
+            out ContentLevel contentLevel,
+            out bool supportsSubAreas,
+            out bool canBeRenamed,
+            out bool canBeDeleted,
+            out bool canAddSubAreas,
+            out bool canAppendContent,
+            out bool canTruncate,
+            out bool supportsResources
+          );
 
-        contribution.MountedRepository.Repository.GetAreaCapabilities(
-          contribution.LocalArea,
-          out contentLevel,
-          out supportsSubAreas,
-          out canBeRenamed,
-          out canBeDeleted,
-          out canAddSubAreas,
-          out canAppendContent,
-          out canTruncate,
-          out supportsResources
-        );
+          if (contentLevel == ContentLevel.ContentContainer) {
+            return ContentLevel.ContentContainer;
+          }
 
-        if (contentLevel == ContentLevel.ContentContainer) {
-          return ContentLevel.ContentContainer;
+          if (contentLevel == ContentLevel.ContentAggregation) {
+            hasAggregation =
+              true;
+          }
         }
-
-        if (contentLevel == ContentLevel.ContentAggregation) {
-          hasAggregation = true;
+        catch (Exception ex) {
+          this.LogProviderReadFailure(
+            ex,
+            contribution,
+            "GetAreaCapabilities",
+            contribution.LocalArea
+          );
         }
       }
 
@@ -1962,7 +2122,10 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         return ContentLevel.ContentAggregation;
       }
 
-      if (node.Children.Count > 0 && this.HasContentDescendant(node)) {
+      if (node.Children.Count > 0 &&
+          this.HasContentDescendant(
+            node
+          )) {
         return ContentLevel.ContentAggregation;
       }
 
@@ -1971,39 +2134,58 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
 
     /// <summary>
     /// Determines whether a synthetic or structural area has any content-capable
-    /// descendant.
+    /// descendant without allowing one failing contributor to hide healthy siblings.
     /// </summary>
     private bool HasContentDescendant(AggregatedNode node) {
-      foreach (AggregatedNode child in node.Children) {
-        foreach (AreaContribution contribution in child.Contributions) {
-          ContentLevel contentLevel;
-          bool supportsSubAreas;
-          bool canBeRenamed;
-          bool canBeDeleted;
-          bool canAddSubAreas;
-          bool canAppendContent;
-          bool canTruncate;
-          bool supportsResources;
+      Stack<AggregatedNode> pending =
+        new Stack<AggregatedNode>();
 
-          contribution.MountedRepository.Repository.GetAreaCapabilities(
-            contribution.LocalArea,
-            out contentLevel,
-            out supportsSubAreas,
-            out canBeRenamed,
-            out canBeDeleted,
-            out canAddSubAreas,
-            out canAppendContent,
-            out canTruncate,
-            out supportsResources
-          );
+      for (int index = node.Children.Count - 1;
+           index >= 0;
+           index--) {
+        pending.Push(
+          node.Children[index]
+        );
+      }
 
-          if (contentLevel != ContentLevel.BeyondContent) {
-            return true;
+      while (pending.Count > 0) {
+        AggregatedNode current =
+          pending.Pop();
+
+        foreach (AreaContribution contribution in current.Contributions) {
+          try {
+            contribution.MountedRepository.Repository.GetAreaCapabilities(
+              contribution.LocalArea,
+              out ContentLevel contentLevel,
+              out bool supportsSubAreas,
+              out bool canBeRenamed,
+              out bool canBeDeleted,
+              out bool canAddSubAreas,
+              out bool canAppendContent,
+              out bool canTruncate,
+              out bool supportsResources
+            );
+
+            if (contentLevel != ContentLevel.BeyondContent) {
+              return true;
+            }
+          }
+          catch (Exception ex) {
+            this.LogProviderReadFailure(
+              ex,
+              contribution,
+              "GetAreaCapabilities",
+              contribution.LocalArea
+            );
           }
         }
 
-        if (this.HasContentDescendant(child)) {
-          return true;
+        for (int index = current.Children.Count - 1;
+             index >= 0;
+             index--) {
+          pending.Push(
+            current.Children[index]
+          );
         }
       }
 
@@ -2075,63 +2257,65 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       StringBuilder builder
     ) {
       foreach (AreaContribution contribution in node.Contributions) {
-        ContentLevel contentLevel;
-        bool supportsSubAreas;
-        bool canBeRenamed;
-        bool canBeDeleted;
-        bool canAddSubAreas;
-        bool canAppendContent;
-        bool canTruncate;
-        bool supportsResources;
+        try {
+          contribution.MountedRepository.Repository.GetAreaCapabilities(
+            contribution.LocalArea,
+            out ContentLevel contentLevel,
+            out bool supportsSubAreas,
+            out bool canBeRenamed,
+            out bool canBeDeleted,
+            out bool canAddSubAreas,
+            out bool canAppendContent,
+            out bool canTruncate,
+            out bool supportsResources
+          );
 
-        contribution.MountedRepository.Repository.GetAreaCapabilities(
-          contribution.LocalArea,
-          out contentLevel,
-          out supportsSubAreas,
-          out canBeRenamed,
-          out canBeDeleted,
-          out canAddSubAreas,
-          out canAppendContent,
-          out canTruncate,
-          out supportsResources
-        );
+          if (contentLevel != ContentLevel.ContentAggregation) {
+            continue;
+          }
 
-        if (contentLevel != ContentLevel.ContentAggregation) {
-          continue;
+          string[] providerChildren =
+            contribution.MountedRepository.Repository.GetAreas(
+              false,
+              contribution.LocalArea
+            );
+
+          if (providerChildren.Length > 0) {
+            continue;
+          }
+
+          string providerContent =
+            contribution.MountedRepository.Repository.GetAggregatedContent(
+              contribution.LocalArea
+            );
+
+          string aggregatedContent =
+            this.TranslateProviderContentToAggregated(
+              contribution,
+              providerContent
+            );
+
+          if (string.IsNullOrWhiteSpace(aggregatedContent)) {
+            continue;
+          }
+
+          builder.Append(
+            aggregatedContent.Trim(
+              '\r',
+              '\n'
+            )
+          );
+          builder.Append(Environment.NewLine);
+          builder.Append(Environment.NewLine);
         }
-
-        string[] providerChildren = contribution.MountedRepository.Repository.GetAreas(
-          false,
-          contribution.LocalArea
-        );
-
-        if (providerChildren.Length > 0) {
-          continue;
-        }
-
-        string providerContent =
-          contribution.MountedRepository.Repository.GetAggregatedContent(
+        catch (Exception ex) {
+          this.LogProviderReadFailure(
+            ex,
+            contribution,
+            "GetAggregatedContent",
             contribution.LocalArea
           );
-
-        string aggregatedContent =
-          this.TranslateProviderContentToAggregated(
-            contribution,
-            providerContent
-          );
-
-        if (string.IsNullOrWhiteSpace(aggregatedContent)) {
-          continue;
         }
-
-        builder.Append(
-          aggregatedContent.Trim(
-            '\r',
-            '\n'
-          )
-        );
-        builder.Append(Environment.NewLine);
-        builder.Append(Environment.NewLine);
       }
     }
 

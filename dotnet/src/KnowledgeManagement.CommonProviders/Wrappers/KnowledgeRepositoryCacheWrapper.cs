@@ -25,8 +25,10 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
   /// direct children with <c>GetAreas(false, ...)</c>. The wrapped provider therefore never
   /// receives a recursive area request from this wrapper.
   ///
-  /// Read failures caused by an unavailable backing provider fall back to the most recent
-  /// cached value, even when that value exceeded the configured lifetime. Writes never use
+  /// Read failures from the backing provider fall back to the most recent cached value,
+  /// even when that value exceeded the configured lifetime. This fallback is deliberately
+  /// exception-agnostic on reads: a broken provider must not make already cached knowledge
+  /// unavailable. Writes never use
   /// this fallback: a mutation is executed against the authoritative provider first and the
   /// directly affected cache scopes are refreshed from the provider immediately afterwards.
   /// Refresh failures after a successful mutation are surfaced to the caller.
@@ -120,7 +122,11 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       );
 
       this.DeleteLegacySnapshotCacheArtifacts();
-      this.ValidatePersistentCacheOnStartup();
+
+      // Intentionally disabled: validating every persisted cache entry during application
+      // startup can itself block startup for large or temporarily unavailable repositories.
+      // Cached entries are therefore validated lazily when they are accessed.
+      //this.ValidatePersistentCacheOnStartup();
     }
 
     /// <summary>
@@ -195,10 +201,29 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
             current
           );
 
-          string[] children =
-            this.GetDirectAreasCached(
-              current
+          string[] children;
+
+          try {
+            children =
+              this.GetDirectAreasCached(
+                current
+              );
+          }
+          catch (Exception ex) {
+            DevLogger.LogError(
+              ex
             );
+
+            DevLogger.LogTrace(
+              0,
+              99999,
+              "Knowledge repository cache could not enumerate descendants below '"
+              + current
+              + "'. The already available partial result is returned."
+            );
+
+            continue;
+          }
 
           for (int index = children.Length - 1;
                index >= 0;
@@ -944,7 +969,7 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
 
         return freshValue;
       }
-      catch (Exception ex) when (this.IsReadFallbackException(ex)) {
+      catch (Exception ex) {
         DevLogger.LogError(
           ex
         );
