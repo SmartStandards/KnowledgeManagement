@@ -45,6 +45,7 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
     private const string _RouteEscapedTilde = "~7E";
     private const string _RouteEscapedPercent = "~25";
     private static readonly Regex _KnowledgeResourceReferenceRegex = new Regex(@"knowledge-resource:(?<id>[A-Za-z0-9._~-]+)", RegexOptions.Compiled);
+    private static readonly Regex _KnowledgeAreaReferenceRegex = new Regex("knowledge-area:(?<area>[^\\s\\)\\]\\>\\\"']+)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex _HeadingRegex = new Regex(@"^ {0,3}(?<level>#{1,6})[ \t]+(?<text>.+?)(?:[ \t]+#+)?[ \t]*$", RegexOptions.Compiled);
     private static readonly Regex _UnorderedListRegex = new Regex(@"^\s*[-*+]\s+(?<text>.+)$", RegexOptions.Compiled);
     private static readonly Regex _OrderedListRegex = new Regex(@"^\s*\d+\.\s+(?<text>.+)$", RegexOptions.Compiled);
@@ -60,6 +61,19 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
     private readonly CancellationToken _ApplicationStopping;
     private readonly Dictionary<string, object> _Memo = new Dictionary<string, object>(StringComparer.Ordinal);
     private readonly List<string> _UiWarnings = new List<string>();
+
+    /// <summary>
+    /// Gets whether the current request explicitly enables prefer-existing cache mode.
+    /// </summary>
+    private bool CacheOnlyMode {
+      get {
+        return string.Equals(
+          this.Request.Query["cacheOnly"].ToString(),
+          "1",
+          StringComparison.Ordinal
+        );
+      }
+    }
     private string _CacheEpoch;
 
     public KnowledgeRepositoryHtmlController(IKnowledgeRepository knowledgeRepository,
@@ -90,22 +104,42 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
     }
 
     [HttpGet(Name = KnowledgeRepositoryHttpRouteNames._HtmlRoot)]
-    public IActionResult GetRoot() { return GetAreaInternal("/"); }
+    public IActionResult GetRoot() {
+      return this.ExecuteWithCacheReadMode(
+        () => this.GetAreaInternal(
+          "/"
+        )
+      );
+    }
 
     [HttpGet("{**area}", Name = KnowledgeRepositoryHttpRouteNames._HtmlArea)]
     public IActionResult GetArea(string area) {
-      try { return GetAreaInternal(ToRepositoryArea(area)); }
-      catch (ArgumentException) { return BadRequest("Ungültiger Bereich."); }
+      try {
+        string repositoryArea =
+          ToRepositoryArea(
+            area
+          );
+
+        return this.ExecuteWithCacheReadMode(
+          () => this.GetAreaInternal(
+            repositoryArea
+          )
+        );
+      }
+      catch (ArgumentException) {
+        return this.BadRequest(
+          "Ungültiger Bereich."
+        );
+      }
     }
 
     /// <summary>
-    /// Starts one browser-owned background search and returns an opaque search identifier
-    /// immediately.
+    /// Creates one browser-owned cooperative search session and returns an opaque search
+    /// identifier immediately.
     ///
-    /// The search remains alive only while the browser polls <see cref="PollSearch(string)"/>.
-    /// Every poll acts as a heartbeat. Closing the dialog, navigating away or closing the
-    /// browser stops the heartbeat and the server-side worker terminates after the short
-    /// grace period.
+    /// Repository work is performed only by subsequent <see cref="PollSearch(string)"/>
+    /// requests. Closing the dialog, navigating away or closing the browser stops polling,
+    /// so no additional repository work is started.
     /// </summary>
     [HttpGet("_search", Name = KnowledgeRepositoryHttpRouteNames._HtmlSearch)]
     public IActionResult Search([FromQuery] string q = "") {
@@ -176,6 +210,20 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
     /// </summary>
     [HttpGet("_search/{searchId}")]
     public IActionResult PollSearch(string searchId) {
+      return this.ExecuteWithCacheReadMode(
+        () => this.PollSearchInternal(
+          searchId
+        )
+      );
+    }
+
+    /// <summary>
+    /// Advances one search session inside the cache read policy selected for the current
+    /// request.
+    /// </summary>
+    private IActionResult PollSearchInternal(
+      string searchId
+    ) {
       this.NoStore();
 
       if (_ApplicationStopping.IsCancellationRequested) {
@@ -648,6 +696,92 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
       return null;
     }
 
+    /// <summary>
+    /// Executes one repository read block under prefer-existing cache semantics when the
+    /// current request specifies cacheOnly=1 and the directly consumed repository exposes
+    /// the optional local cache-control capability.
+    /// </summary>
+    private IActionResult ExecuteWithCacheReadMode(
+      Func<IActionResult> action
+    ) {
+      if (!this.CacheOnlyMode) {
+        return action();
+      }
+
+      IKnowledgeRepositoryCacheControl cacheControl =
+        _KnowledgeRepository as IKnowledgeRepositoryCacheControl;
+
+      if (cacheControl == null) {
+        return action();
+      }
+
+      using (IDisposable scope = cacheControl.BeginPreferExistingScope()) {
+        return action();
+      }
+    }
+
+    /// <summary>
+    /// Returns whether one navigation target is already available from the directly
+    /// consumed repository cache.
+    ///
+    /// Repositories that do not expose local cache inspection are treated as normal and
+    /// therefore never rendered as cache misses.
+    /// </summary>
+    private bool IsNavigationTargetCached(
+      string area
+    ) {
+      if (!this.CacheOnlyMode) {
+        return true;
+      }
+
+      IKnowledgeRepositoryCacheControl cacheControl =
+        _KnowledgeRepository as IKnowledgeRepositoryCacheControl;
+
+      if (cacheControl == null) {
+        return true;
+      }
+
+      try {
+        return cacheControl.IsAreaCached(
+          area
+        );
+      }
+      catch (Exception ex) {
+        DevLogger.LogError(
+          ex
+        );
+
+        return true;
+      }
+    }
+
+    /// <summary>
+    /// Appends cacheOnly=1 to one generated local HTML route when the current request is in
+    /// prefer-existing cache mode.
+    /// </summary>
+    private string PreserveCacheOnlyMode(
+      string url
+    ) {
+      if (!this.CacheOnlyMode) {
+        return url;
+      }
+
+      string separator =
+        "?";
+
+      if (url.Contains(
+            "?",
+            StringComparison.Ordinal
+          )) {
+        separator =
+          "&";
+      }
+
+      return url
+        + separator
+        + "cacheOnly=1";
+    }
+
     private void NoStore() {
       Response.Headers["Cache-Control"] = "no-store";
       Response.Headers["X-Content-Type-Options"] = "nosniff";
@@ -882,21 +1016,146 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
     /// area segments that legitimately contain percent characters.
     /// </summary>
     private string BuildHtmlAreaRequestPath(string area) {
+      string result;
+
       if (area == "/") {
-        return this.Route(KnowledgeRepositoryHttpRouteNames._HtmlRoot);
+        result =
+          this.Route(
+            KnowledgeRepositoryHttpRouteNames._HtmlRoot
+          );
+      }
+      else {
+        string routeArea =
+          EncodeAreaForRoute(
+            area
+          );
+
+        result =
+          this.Route(
+            KnowledgeRepositoryHttpRouteNames._HtmlArea,
+            new {
+              area = routeArea
+            }
+          );
       }
 
-      string routeArea = EncodeAreaForRoute(area);
-
-      return this.Route(
-        KnowledgeRepositoryHttpRouteNames._HtmlArea,
-        new {
-          area = routeArea
-        }
+      return this.PreserveCacheOnlyMode(
+        result
       );
     }
-    private string ResolveKnowledgeResourceReferences(string markdown) {
-      return _KnowledgeResourceReferenceRegex.Replace(markdown ?? "", m => Route(KnowledgeRepositoryHttpRouteNames._RawResource, new { resourceId = m.Groups["id"].Value }));
+    /// <summary>
+    /// Resolves provider-neutral knowledge references before Markdown is rendered to HTML.
+    ///
+    /// Resource references keep their existing RAW-resource behavior. Area references are
+    /// translated through <see cref="BuildHtmlAreaRequestPath(string)"/> so all normal HTML
+    /// route rules, including cacheOnly propagation and route-safe area encoding, remain
+    /// centralized in one place.
+    /// </summary>
+    private string ResolveKnowledgeReferences(
+      string markdown
+    ) {
+      string resolvedMarkdown =
+        markdown;
+
+      if (resolvedMarkdown == null) {
+        resolvedMarkdown =
+          string.Empty;
+      }
+
+      resolvedMarkdown =
+        _KnowledgeResourceReferenceRegex.Replace(
+          resolvedMarkdown,
+          (Match match) => this.Route(
+            KnowledgeRepositoryHttpRouteNames._RawResource,
+            new {
+              resourceId = match.Groups["id"].Value
+            }
+          )
+        );
+
+      resolvedMarkdown =
+        _KnowledgeAreaReferenceRegex.Replace(
+          resolvedMarkdown,
+          (Match match) => {
+            string encodedArea =
+              match.Groups["area"].Value;
+
+            string logicalArea =
+              this.DecodeKnowledgeAreaReference(
+                encodedArea
+              );
+
+            return this.BuildHtmlAreaRequestPath(
+              logicalArea
+            );
+          }
+        );
+
+      return resolvedMarkdown;
+    }
+
+    /// <summary>
+    /// Decodes one provider-neutral knowledge-area URI value exactly once.
+    ///
+    /// Providers may percent-encode URI characters such as spaces. The decoded logical
+    /// repository area is passed to BuildHtmlAreaRequestPath afterwards, which performs
+    /// the HTTP transport encoding exactly once. This prevents sequences such as %20 from
+    /// becoming %2520 while remaining fully provider-neutral.
+    /// </summary>
+    private string DecodeKnowledgeAreaReference(
+      string encodedArea
+    ) {
+      if (string.IsNullOrWhiteSpace(
+            encodedArea
+          ) ||
+          string.Equals(
+            encodedArea,
+            "/",
+            StringComparison.Ordinal
+          )) {
+        return "/";
+      }
+
+      string decodedArea;
+
+      try {
+        decodedArea =
+          Uri.UnescapeDataString(
+            encodedArea
+          );
+      }
+      catch (UriFormatException ex) {
+        DevLogger.LogError(
+          ex
+        );
+
+        // Keep malformed percent sequences literal. BuildHtmlAreaRequestPath will still
+        // transport them safely without introducing provider-specific interpretation.
+        decodedArea =
+          encodedArea;
+      }
+
+      if (string.IsNullOrWhiteSpace(
+            decodedArea
+          ) ||
+          string.Equals(
+            decodedArea,
+            "/",
+            StringComparison.Ordinal
+          )) {
+        return "/";
+      }
+
+      if (!decodedArea.StartsWith(
+            "/",
+            StringComparison.Ordinal
+          )) {
+        decodedArea =
+          "/"
+          + decodedArea;
+      }
+
+      return decodedArea;
     }
 
     private sealed class Heading {
@@ -954,7 +1213,7 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
       string[] names = children.Select(p => Plain(RenderInlineMarkdown(Name(p)))).ToArray();
       int cursor = 0;
       var occurrences = new Dictionary<string, int>(StringComparer.Ordinal);
-      view.Html = Regex.Replace(RenderMarkdown(ResolveKnowledgeResourceReferences(view.Markdown)), @"<h([1-6])>(.*?)</h\1>", match => {
+      view.Html = Regex.Replace(RenderMarkdown(this.ResolveKnowledgeReferences(view.Markdown)), @"<h([1-6])>(.*?)</h\1>", match => {
         string label = Plain(match.Groups[2].Value);
         string logical = null;
         for (int i = cursor; i < children.Length; i++) {
@@ -1096,7 +1355,13 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
       var b = new StringBuilder();
       b.Append("<!doctype html><html lang=\"de\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>")
         .Append(H(title)).Append(" · Wissen</title><style nonce=\"").Append(H(nonce)).Append("\">").Append(GetPageCss()).Append("</style></head><body>");
-      b.Append("<header class=\"site-header\"><a class=\"brand\" href=\"").Append(H(BuildHtmlAreaRequestPath("/"))).Append("\">Wissen</a><div class=\"header-actions\">");
+      b.Append("<header class=\"site-header\"><a class=\"brand\" href=\"").Append(H(BuildHtmlAreaRequestPath("/"))).Append("\">Wissen</a>");
+
+      if (this.CacheOnlyMode) {
+        b.Append("<span class=\"cache-mode-badge\" title=\"Vorhandene lokale Cachewerte werden bevorzugt und nicht automatisch aktualisiert.\">Cache</span>");
+      }
+
+      b.Append("<div class=\"header-actions\">");
       b.Append("<form id=\"wiki-search\" role=\"search\" action=\"").Append(H(Route(KnowledgeRepositoryHttpRouteNames._HtmlSearch))).Append("\"><input type=\"search\" name=\"q\" maxlength=\"200\" aria-label=\"Wissen durchsuchen\" placeholder=\"Wissen durchsuchen …\" required><button type=\"submit\" class=\"quiet\">Suchen</button></form>");
       AntiforgeryTokenSet tokens = canEdit ? _Antiforgery.GetAndStoreTokens(HttpContext) : null;
       string hidden = canEdit ? "<input type=\"hidden\" name=\"" + H(tokens.FormFieldName) + "\" value=\"" + H(tokens.RequestToken) + "\"><input type=\"hidden\" name=\"area\" value=\"" + H(area) + "\">" : "";
@@ -1129,8 +1394,35 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
         b.Append("<li>").Append(crumb == area ? "<span aria-current=\"page\">" + H(label) + "</span>" : "<a href=\"" + H(BuildHtmlAreaRequestPath(crumb)) + "\">" + H(label) + "</a>").Append("</li>");
       }
       b.Append("</ol></nav><div class=\"layout\"><div class=\"sidebar\"><nav class=\"area-nav\" aria-label=\"Wissensbereiche\"><h2>Bereiche</h2>");
-      foreach (string child in children)
-        b.Append("<a").Append(child == area ? " aria-current=\"page\"" : "").Append(" href=\"").Append(H(BuildHtmlAreaRequestPath(child))).Append("\">").Append(H(Name(child))).Append("</a>");
+
+      foreach (string child in children) {
+        bool childCached =
+          this.IsNavigationTargetCached(
+            child
+          );
+
+        string childName =
+          this.Name(
+            child
+          );
+
+        b.Append("<a");
+
+        if (child == area) {
+          b.Append(" aria-current=\"page\"");
+        }
+
+        if (!childCached) {
+          b.Append(" class=\"cache-miss\" title=\"Noch nicht im lokalen Cache; wird beim Öffnen geladen.\"");
+        }
+
+        b.Append(" href=\"")
+          .Append(H(this.BuildHtmlAreaRequestPath(child)))
+          .Append("\">")
+          .Append(H(childName))
+          .Append("</a>");
+      }
+
       b.Append("</nav><aside class=\"outline\" aria-label=\"Dokumentgliederung\">");
       if (view.Outline.Count > 0) {
         b.Append("<h2>Auf dieser Seite</h2><nav>");
@@ -1143,8 +1435,31 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
         b.Append("<article id=\"document-content\">").Append(view.Html).Append("</article>");
       else {
         b.Append("<ul class=\"document-list\">");
-        foreach (string child in children)
-          b.Append("<li><a href=\"").Append(H(BuildHtmlAreaRequestPath(child))).Append("\">").Append(H(Name(child))).Append("</a></li>");
+
+        foreach (string child in children) {
+          bool childCached =
+            this.IsNavigationTargetCached(
+              child
+            );
+
+          string childName =
+            this.Name(
+              child
+            );
+
+          b.Append("<li><a");
+
+          if (!childCached) {
+            b.Append(" class=\"cache-miss\" title=\"Noch nicht im lokalen Cache; wird beim Öffnen geladen.\"");
+          }
+
+          b.Append(" href=\"")
+            .Append(H(this.BuildHtmlAreaRequestPath(child)))
+            .Append("\">")
+            .Append(H(childName))
+            .Append("</a></li>");
+        }
+
         b.Append("</ul>");
         if (children.Length == 0)
           b.Append("<p class=\"muted\">Hier sind noch keine Inhalte vorhanden.</p>");
@@ -1201,6 +1516,21 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
             out object memory
           )) {
         return (T)memory;
+      }
+
+      // In cacheOnly mode the repository cache wrapper is the authoritative cache layer.
+      // Bypassing the separate HTML disk cache guarantees that clicking a gray navigation
+      // target really populates the wrapper cache and therefore makes that target appear
+      // normally on the next render.
+      if (this.CacheOnlyMode &&
+          _KnowledgeRepository is IKnowledgeRepositoryCacheControl) {
+        T repositoryValue =
+          loader();
+
+        _Memo[local] =
+          repositoryValue;
+
+        return repositoryValue;
       }
 
       if (!DiskCache) {
@@ -1962,11 +2292,73 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
       string url,
       bool image
     ) {
-      string trimmed = url.Trim();
-      if (trimmed.Any(c => char.IsControl(c) || c == '\\'))
+      string trimmed =
+        url.Trim();
+
+      // Resolve provider-neutral knowledge references before the generic scheme filter.
+      // Otherwise custom schemes such as knowledge-area: would deliberately fall through
+      // to "#" and therefore appear to navigate to the current page.
+      if (trimmed.StartsWith(
+            "knowledge-resource:",
+            StringComparison.OrdinalIgnoreCase
+          )) {
+        string resourceId =
+          trimmed.Substring(
+            "knowledge-resource:".Length
+          );
+
+        if (string.IsNullOrWhiteSpace(
+              resourceId
+            )) {
+          return "#";
+        }
+
+        return this.Route(
+          KnowledgeRepositoryHttpRouteNames._RawResource,
+          new {
+            resourceId = resourceId
+          }
+        );
+      }
+
+      if (trimmed.StartsWith(
+            "knowledge-area:",
+            StringComparison.OrdinalIgnoreCase
+          )) {
+        string encodedArea =
+          trimmed.Substring(
+            "knowledge-area:".Length
+          );
+
+        string logicalArea =
+          this.DecodeKnowledgeAreaReference(
+            encodedArea
+          );
+
+        return this.BuildHtmlAreaRequestPath(
+          logicalArea
+        );
+      }
+
+      if (trimmed.Any(
+            (char character) => char.IsControl(character) || character == '\\'
+          )) {
         return "#";
-      if (Regex.IsMatch(trimmed, @"^[^/?#]*:") && !Regex.IsMatch(trimmed, image ? @"^https?:" : @"^(https?:|mailto:)", RegexOptions.IgnoreCase))
+      }
+
+      if (Regex.IsMatch(
+            trimmed,
+            @"^[^/?#]*:"
+          ) &&
+          !Regex.IsMatch(
+            trimmed,
+            image
+              ? @"^https?:"
+              : @"^(https?:|mailto:)",
+            RegexOptions.IgnoreCase
+          )) {
         return "#";
+      }
 
       if (trimmed.StartsWith(
             "/",
@@ -1979,10 +2371,12 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
         return trimmed;
       }
 
+      Uri absoluteUri;
+
       if (!Uri.TryCreate(
             trimmed,
             UriKind.Absolute,
-            out Uri absoluteUri
+            out absoluteUri
           )) {
         return trimmed;
       }
@@ -2512,7 +2906,19 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
     }
 
     private string GetPageCss() { return @":root{color-scheme:light;--ink:#20372f;--muted:#708079;--line:#e0e7e2;--accent:#216d55}*{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:32px}body{margin:0;background:#fafbf9;color:var(--ink);font:16px/1.65 system-ui,sans-serif}a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}.site-header{display:flex;align-items:center;justify-content:space-between;gap:24px;padding:16px 32px;background:#fff;border-bottom:1px solid var(--line)}.brand{font-weight:700;font-size:22px;letter-spacing:-.03em}.header-actions{display:flex;gap:16px;align-items:center;font-size:12px}.quiet{border:0;background:none;color:var(--muted);padding:4px 0;cursor:pointer;font:inherit;white-space:nowrap}.quiet:hover{color:var(--accent)}#wiki-search{display:flex;gap:8px;align-items:center}#wiki-search input{width:230px;border:1px solid var(--line);background:#fafbf9;padding:7px 11px;font:13px system-ui}.breadcrumbs{max-width:1560px;margin:22px auto 0;padding:0 32px;font-size:12px;color:var(--muted)}.breadcrumbs ol{display:flex;flex-wrap:wrap;gap:0;list-style:none;padding:0;margin:0}.breadcrumbs li+li:before{content:'/';padding:0 10px;color:#a4b0a9}.breadcrumbs a{color:var(--muted)}.layout{max-width:1560px;display:grid;grid-template-columns:240px minmax(0,1fr);gap:32px;margin:20px auto 48px;padding:0 32px}.area-nav,.outline{font-size:13px;align-self:start;position:sticky;top:24px;max-height:calc(100vh - 48px);overflow:auto}.area-nav h2,.outline h2{margin:10px 0 12px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:var(--muted)}.area-nav a,.outline a{display:block;padding:6px 10px;border-radius:5px;color:var(--muted);overflow-wrap:anywhere}.area-nav a[aria-current],.outline a[aria-current]{color:var(--accent);background:#edf3ed}.area-nav a:hover,.outline a:hover{color:var(--accent);text-decoration:none;background:#f0f4f0}.outline nav{border-left:1px solid var(--line)}.outline .outline-level-2{padding-left:18px}.outline .outline-level-3{padding-left:28px}.outline .outline-level-4{padding-left:38px}.outline .outline-level-5,.outline .outline-level-6{padding-left:48px}main{min-width:0;background:white;border:1px solid var(--line);border-radius:8px;padding:32px 40px}h1{font-size:30px;line-height:1.25;margin:0 0 28px;letter-spacing:-.03em}article{overflow-wrap:anywhere}article h1,article h2,article h3,article h4,article h5,article h6{scroll-margin-top:28px}article h1{font-size:26px;margin-top:32px}article h2{font-size:23px;margin-top:30px}article h3{font-size:19px;margin-top:24px}article img{max-width:100%;height:auto}pre{overflow:auto;background:#f2f5f1;padding:16px;border-radius:6px}code{font-size:.9em}table{border-collapse:collapse;display:block;overflow:auto;max-width:100%}td,th{padding:8px 12px;border:1px solid var(--line)}blockquote{border-left:3px solid var(--line);margin-left:0;padding-left:20px;color:var(--muted)}.document-list{list-style:none;margin:0;padding:0}.document-list li{border-top:1px solid var(--line)}.document-list a{display:block;padding:14px 0}.muted{color:var(--muted)}
-.repository-warning{max-width:1100px;margin:12px auto 0;padding:10px 14px;border:1px solid var(--border);border-radius:8px;font-size:.92rem}.source-status{font-size:12px;color:var(--muted);margin-bottom:20px}.source-status summary{cursor:pointer}.source-status li{margin:8px 0}dialog{width:min(780px,calc(100vw - 32px));max-height:85vh;overflow:auto;border:1px solid var(--line);border-radius:12px;padding:24px 28px;color:var(--ink);box-shadow:0 24px 90px #18332f33}dialog:not([open]){display:none}dialog::backdrop{background:#102c254d}.dialog-head{display:flex;align-items:center;justify-content:space-between;gap:24px;border-bottom:1px solid var(--line);padding-bottom:12px;margin-bottom:20px}.dialog-head h2{font-size:19px;margin:0}.close-dialog{font-size:26px;padding:0 8px}input,select,textarea{border:1px solid #bdcbc2;border-radius:5px;color:var(--ink)}input,select{padding:8px}textarea{display:block;width:100%;padding:12px;font:14px/1.55 ui-monospace,monospace;resize:vertical}dialog button:not(.quiet){background:var(--accent);color:#fff;border:0;border-radius:5px;padding:9px 13px;cursor:pointer;margin:10px 8px 10px 0}dialog label{display:block;font-size:13px;margin-bottom:6px}.new-area{border-top:1px solid var(--line);padding-top:16px;margin-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}.api-url{display:block;overflow-wrap:anywhere}.notice{background:#eef5ef;padding:10px 14px;border-radius:5px;font-size:14px}.search-result{padding:16px 0;border-bottom:1px solid var(--line)}.search-result>a{font-weight:600;font-size:17px}.search-result small{display:block;color:var(--muted);overflow-wrap:anywhere}.search-result p{margin:6px 0 0;font-size:14px}button:focus-visible,a:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:3px}@media(max-width:1100px){.layout{grid-template-columns:210px minmax(0,1fr);gap:18px;padding:0 20px}main{padding:24px}.site-header{padding:14px 20px}.breadcrumbs{padding:0 20px}}@media(max-width:800px){.site-header{align-items:flex-start;gap:12px}.header-actions{gap:10px;flex-wrap:wrap;justify-content:flex-end}#wiki-search input{width:170px}.layout{grid-template-columns:minmax(0,1fr)}.area-nav{position:static;display:flex;gap:6px;flex-wrap:wrap;max-height:none}.area-nav h2{width:100%;margin:0}.outline{position:static;grid-row:2;max-height:180px}.outline:empty{display:none}main{grid-row:3}.outline h2{margin-top:0}.outline nav{display:flex;gap:4px;flex-wrap:wrap;border:0}.outline nav a{padding:3px 8px}.breadcrumbs{margin-top:14px}h1{font-size:26px}dialog{padding:18px}}@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+.repository-warning{max-width:1100px;margin:12px auto 0;padding:10px 14px;border:1px solid var(--border);border-radius:8px;font-size:.92rem}
+.area-nav a.cache-miss,
+.document-list a.cache-miss{color:#9aa0a6!important}
+
+.area-nav a.cache-miss:visited,
+.document-list a.cache-miss:visited{color:#9aa0a6!important}
+
+.area-nav a.cache-miss:hover,
+.area-nav a.cache-miss:focus,
+.document-list a.cache-miss:hover,
+.document-list a.cache-miss:focus{color:#7f868d!important}
+
+.cache-mode-badge{font-size:.78rem;line-height:1;padding:.28rem .48rem;border:1px solid var(--border);border-radius:999px;color:var(--muted);margin-left:.5rem;white-space:nowrap}.source-status{font-size:12px;color:var(--muted);margin-bottom:20px}.source-status summary{cursor:pointer}.source-status li{margin:8px 0}dialog{width:min(780px,calc(100vw - 32px));max-height:85vh;overflow:auto;border:1px solid var(--line);border-radius:12px;padding:24px 28px;color:var(--ink);box-shadow:0 24px 90px #18332f33}dialog:not([open]){display:none}dialog::backdrop{background:#102c254d}.dialog-head{display:flex;align-items:center;justify-content:space-between;gap:24px;border-bottom:1px solid var(--line);padding-bottom:12px;margin-bottom:20px}.dialog-head h2{font-size:19px;margin:0}.close-dialog{font-size:26px;padding:0 8px}input,select,textarea{border:1px solid #bdcbc2;border-radius:5px;color:var(--ink)}input,select{padding:8px}textarea{display:block;width:100%;padding:12px;font:14px/1.55 ui-monospace,monospace;resize:vertical}dialog button:not(.quiet){background:var(--accent);color:#fff;border:0;border-radius:5px;padding:9px 13px;cursor:pointer;margin:10px 8px 10px 0}dialog label{display:block;font-size:13px;margin-bottom:6px}.new-area{border-top:1px solid var(--line);padding-top:16px;margin-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}.api-url{display:block;overflow-wrap:anywhere}.notice{background:#eef5ef;padding:10px 14px;border-radius:5px;font-size:14px}.search-result{padding:16px 0;border-bottom:1px solid var(--line)}.search-result>a{font-weight:600;font-size:17px}.search-result small{display:block;color:var(--muted);overflow-wrap:anywhere}.search-result p{margin:6px 0 0;font-size:14px}button:focus-visible,a:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:3px}@media(max-width:1100px){.layout{grid-template-columns:210px minmax(0,1fr);gap:18px;padding:0 20px}main{padding:24px}.site-header{padding:14px 20px}.breadcrumbs{padding:0 20px}}@media(max-width:800px){.site-header{align-items:flex-start;gap:12px}.header-actions{gap:10px;flex-wrap:wrap;justify-content:flex-end}#wiki-search input{width:170px}.layout{grid-template-columns:minmax(0,1fr)}.area-nav{position:static;display:flex;gap:6px;flex-wrap:wrap;max-height:none}.area-nav h2{width:100%;margin:0}.outline{position:static;grid-row:2;max-height:180px}.outline:empty{display:none}main{grid-row:3}.outline h2{margin-top:0}.outline nav{display:flex;gap:4px;flex-wrap:wrap;border:0}.outline nav a{padding:3px 8px}.breadcrumbs{margin-top:14px}h1{font-size:26px}dialog{padding:18px}}@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
 
 .sidebar{align-self:start;position:sticky;top:24px;max-height:calc(100vh - 48px);overflow:auto}.sidebar .area-nav,.sidebar .outline{position:static;max-height:none;overflow:visible}.sidebar .outline{margin-top:28px;border-top:1px solid var(--line);padding-top:10px}.header-actions form{margin:0}@media(max-width:800px){.sidebar{position:static;max-height:none}.sidebar .outline{max-height:220px;overflow:auto}main{grid-row:auto}}
 "; }
@@ -2610,7 +3016,13 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
       return;
     }
 
-    fetch(baseUrl + '/' + encodeURIComponent(searchId), {
+    const pollUrl =
+      baseUrl
+      + '/'
+      + encodeURIComponent(searchId)
+      + (new URLSearchParams(window.location.search).get('cacheOnly') === '1' ? '?cacheOnly=1' : '');
+
+    fetch(pollUrl, {
       credentials: 'same-origin',
       cache: 'no-store',
       headers: {'Accept': 'application/json'}
@@ -2692,7 +3104,13 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
 
     show('search-dialog');
 
-    fetch(form.action + '?q=' + encodeURIComponent(query), {
+    const startUrl =
+      form.action
+      + '?q='
+      + encodeURIComponent(query)
+      + (new URLSearchParams(window.location.search).get('cacheOnly') === '1' ? '&cacheOnly=1' : '');
+
+    fetch(startUrl, {
       credentials: 'same-origin',
       cache: 'no-store',
       headers: {'Accept': 'application/json'}

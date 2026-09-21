@@ -1,4 +1,5 @@
-﻿using Logging.SmartStandards;
+﻿using KnowledgeManagement.SmartStandards;
+using Logging.SmartStandards;
 using Logging.SmartStandards.CopyForKnowledgeManagement;
 using System;
 using System.Collections.Generic;
@@ -43,10 +44,11 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
   /// requires atomic mutations and arbitrary repository implementations cannot provide a
   /// shared distributed transaction.
   /// </summary>
-  public class AggregatedKnowledgeRepository : IKnowledgeRepository {
+  public class AggregatedKnowledgeRepository : IKnowledgeRepository, IKnowledgeRepositoryCacheControl {
 
     private const string _RootArea = "/";
     private const string _KnowledgeResourceReferencePrefix = "knowledge-resource:";
+    private const string _KnowledgeAreaReferencePrefix = "knowledge-area:";
 
     private static readonly TimeSpan _TreeReadBurstWindow =
       TimeSpan.FromMilliseconds(500);
@@ -56,6 +58,10 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       RegexOptions.Compiled | RegexOptions.CultureInvariant
     );
 
+    private static readonly Regex _KnowledgeAreaReferenceRegex = new Regex(
+      "knowledge-area:(?<area>[^\\s\\)\\]\\>\\\"']+)",
+      RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase
+    );
 
     private readonly object _SyncRoot;
     private readonly List<MountedRepository> _Repositories;
@@ -70,6 +76,205 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       _Repositories = new List<MountedRepository>();
       _CachedTree = null;
       _CachedTreeLastAccessUtc = DateTime.MinValue;
+    }
+
+    /// <summary>
+    /// Returns whether the requested aggregated area is already available from at least one
+    /// directly contributing local cache without accessing any mounted source repository.
+    ///
+    /// This method is intentionally passive. It never materializes the aggregate tree,
+    /// enumerates provider children or calls any normal repository read operation.
+    ///
+    /// Synthetic mount ancestors are considered locally available because their structure
+    /// is fully known from the aggregator's mount registrations. When no contributing
+    /// repository exposes cache inspection at all, the area is also treated as available so
+    /// consumers do not incorrectly render remote or non-cache repositories as cache misses.
+    /// </summary>
+    public bool IsAreaCached(
+      string area
+    ) {
+      string normalizedArea =
+        this.NormalizeAreaPath(
+          area
+        );
+
+      MountedRepository[] mountedRepositories;
+
+      lock (_SyncRoot) {
+        mountedRepositories =
+          _Repositories.ToArray();
+      }
+
+      bool hasExactContribution =
+        false;
+
+      bool hasCacheInspector =
+        false;
+
+      bool hasSuccessfulInspectorResult =
+        false;
+
+      bool hasSyntheticMountDescendant =
+        false;
+
+      foreach (MountedRepository mountedRepository in mountedRepositories) {
+        if (!string.Equals(
+              normalizedArea,
+              mountedRepository.MountPoint,
+              StringComparison.Ordinal
+            ) &&
+            this.IsSameOrDescendant(
+              mountedRepository.MountPoint,
+              normalizedArea
+            )) {
+          hasSyntheticMountDescendant =
+            true;
+        }
+
+        string localArea;
+
+        if (!this.TryTranslateGlobalAreaToMountedLocalArea(
+              mountedRepository,
+              normalizedArea,
+              out localArea
+            )) {
+          continue;
+        }
+
+        hasExactContribution =
+          true;
+
+        IKnowledgeRepositoryCacheControl cacheControl =
+          mountedRepository.Repository as IKnowledgeRepositoryCacheControl;
+
+        if (cacheControl == null) {
+          continue;
+        }
+
+        hasCacheInspector =
+          true;
+
+        try {
+          bool isCached =
+            cacheControl.IsAreaCached(
+              localArea
+            );
+
+          hasSuccessfulInspectorResult =
+            true;
+
+          if (isCached) {
+            return true;
+          }
+        }
+        catch (Exception ex) {
+          DevLogger.LogError(
+            ex
+          );
+
+          DevLogger.LogTrace(
+            0,
+            99999,
+            "Aggregated knowledge cache inspection failed for mount '"
+            + mountedRepository.MountPoint
+            + "' and local area '"
+            + localArea
+            + "'. The cache state is treated as unknown."
+          );
+        }
+      }
+
+      if (!hasExactContribution &&
+          hasSyntheticMountDescendant) {
+        return true;
+      }
+
+      if (!hasCacheInspector) {
+        return true;
+      }
+
+      if (!hasSuccessfulInspectorResult) {
+        return true;
+      }
+
+      return false;
+    }
+
+    /// <summary>
+    /// Opens a prefer-existing cache scope on every unique mounted repository that exposes
+    /// the optional local cache-control capability.
+    ///
+    /// The aggregator itself does not cache repository content. It only propagates the
+    /// consumer's local cache policy through aggregation layers. Nested aggregated
+    /// repositories therefore propagate the scope recursively without introducing any
+    /// transport-level cache contract.
+    /// </summary>
+    public IDisposable BeginPreferExistingScope() {
+      MountedRepository[] mountedRepositories;
+
+      lock (_SyncRoot) {
+        mountedRepositories =
+          _Repositories.ToArray();
+      }
+
+      List<IDisposable> openedScopes =
+        new List<IDisposable>();
+
+      List<IKnowledgeRepository> scopedRepositories =
+        new List<IKnowledgeRepository>();
+
+      foreach (MountedRepository mountedRepository in mountedRepositories) {
+        bool alreadyScoped =
+          scopedRepositories.Any(
+            (IKnowledgeRepository repository) => object.ReferenceEquals(
+              repository,
+              mountedRepository.Repository
+            )
+          );
+
+        if (alreadyScoped) {
+          continue;
+        }
+
+        scopedRepositories.Add(
+          mountedRepository.Repository
+        );
+
+        IKnowledgeRepositoryCacheControl cacheControl =
+          mountedRepository.Repository as IKnowledgeRepositoryCacheControl;
+
+        if (cacheControl == null) {
+          continue;
+        }
+
+        try {
+          IDisposable childScope =
+            cacheControl.BeginPreferExistingScope();
+
+          if (childScope != null) {
+            openedScopes.Add(
+              childScope
+            );
+          }
+        }
+        catch (Exception ex) {
+          DevLogger.LogError(
+            ex
+          );
+
+          DevLogger.LogTrace(
+            0,
+            99999,
+            "Aggregated knowledge cache scope could not be opened for mount '"
+            + mountedRepository.MountPoint
+            + "'. Other cache-capable repositories remain active."
+          );
+        }
+      }
+
+      return new CompositeCacheReadScope(
+        openedScopes.ToArray()
+      );
     }
 
     /// <summary>
@@ -1253,16 +1458,44 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       AreaContribution contribution,
       string providerContent
     ) {
-      if (string.IsNullOrEmpty(providerContent)) {
+      if (string.IsNullOrEmpty(
+            providerContent
+          )) {
         return providerContent;
       }
 
-      MatchCollection matches = _KnowledgeResourceReferenceRegex.Matches(
-        providerContent
-      );
+      string translatedContent =
+        _KnowledgeAreaReferenceRegex.Replace(
+          providerContent,
+          (Match match) => {
+            string encodedLocalArea =
+              match.Groups["area"].Value;
+
+            string localArea =
+              this.DecodeKnowledgeAreaReferenceTarget(
+                encodedLocalArea
+              );
+
+            string globalArea =
+              this.ToGlobalPath(
+                contribution.MountedRepository,
+                localArea
+              );
+
+            return _KnowledgeAreaReferencePrefix
+              + this.EncodeKnowledgeAreaReferenceTarget(
+                globalArea
+              );
+          }
+        );
+
+      MatchCollection matches =
+        _KnowledgeResourceReferenceRegex.Matches(
+          translatedContent
+        );
 
       if (matches.Count == 0) {
-        return providerContent;
+        return translatedContent;
       }
 
       IKnowledgeRepository repository =
@@ -1272,12 +1505,13 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
             repository,
             contribution.LocalArea
           )) {
-        return providerContent;
+        return translatedContent;
       }
 
-      KnowledgeResourceInfo[] resources = repository.GetResources(
-        contribution.LocalArea
-      );
+      KnowledgeResourceInfo[] resources =
+        repository.GetResources(
+          contribution.LocalArea
+        );
 
       Dictionary<string, string> mappings =
         new Dictionary<string, string>(
@@ -1285,7 +1519,9 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         );
 
       foreach (KnowledgeResourceInfo resource in resources) {
-        if (string.IsNullOrWhiteSpace(resource.ResourceId)) {
+        if (string.IsNullOrWhiteSpace(
+              resource.ResourceId
+            )) {
           continue;
         }
 
@@ -1297,11 +1533,14 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       }
 
       return _KnowledgeResourceReferenceRegex.Replace(
-        providerContent,
+        translatedContent,
         (Match match) => {
-          string childResourceId = match.Groups["id"].Value;
+          string childResourceId =
+            match.Groups["id"].Value;
 
-          if (!mappings.ContainsKey(childResourceId)) {
+          if (!mappings.ContainsKey(
+                childResourceId
+              )) {
             return match.Value;
           }
 
@@ -1323,14 +1562,46 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       AreaContribution contribution,
       string aggregatedContent
     ) {
-      if (string.IsNullOrEmpty(aggregatedContent)) {
+      if (string.IsNullOrEmpty(
+            aggregatedContent
+          )) {
         return aggregatedContent;
       }
 
+      string translatedContent =
+        _KnowledgeAreaReferenceRegex.Replace(
+          aggregatedContent,
+          (Match match) => {
+            string encodedGlobalArea =
+              match.Groups["area"].Value;
+
+            string globalArea =
+              this.DecodeKnowledgeAreaReferenceTarget(
+                encodedGlobalArea
+              );
+
+            string localArea;
+
+            if (!this.TryTranslateGlobalAreaToMountedLocalArea(
+                  contribution.MountedRepository,
+                  globalArea,
+                  out localArea
+                )) {
+              return match.Value;
+            }
+
+            return _KnowledgeAreaReferencePrefix
+              + this.EncodeKnowledgeAreaReferenceTarget(
+                localArea
+              );
+          }
+        );
+
       return _KnowledgeResourceReferenceRegex.Replace(
-        aggregatedContent,
+        translatedContent,
         (Match match) => {
-          string aggregatedResourceId = match.Groups["id"].Value;
+          string aggregatedResourceId =
+            match.Groups["id"].Value;
 
           MountedRepository mountedRepository;
           string childResourceId;
@@ -1354,6 +1625,86 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
             + childResourceId;
         }
       );
+    }
+
+    /// <summary>
+    /// Decodes one provider-neutral knowledge-area URI target exactly once into the
+    /// repository-local logical area representation.
+    /// </summary>
+    private string DecodeKnowledgeAreaReferenceTarget(
+      string encodedArea
+    ) {
+      if (string.IsNullOrWhiteSpace(
+            encodedArea
+          ) ||
+          string.Equals(
+            encodedArea,
+            _RootArea,
+            StringComparison.Ordinal
+          )) {
+        return _RootArea;
+      }
+
+      string decodedArea;
+
+      try {
+        decodedArea =
+          Uri.UnescapeDataString(
+            encodedArea
+          );
+      }
+      catch (UriFormatException ex) {
+        DevLogger.LogError(
+          ex
+        );
+
+        decodedArea =
+          encodedArea;
+      }
+
+      return this.NormalizeAreaPath(
+        decodedArea
+      );
+    }
+
+    /// <summary>
+    /// Encodes one logical repository area as a provider-neutral knowledge-area URI target
+    /// while preserving slash separators as hierarchy delimiters.
+    /// </summary>
+    private string EncodeKnowledgeAreaReferenceTarget(
+      string area
+    ) {
+      string normalizedArea =
+        this.NormalizeAreaPath(
+          area
+        );
+
+      if (normalizedArea == _RootArea) {
+        return _RootArea;
+      }
+
+      string[] segments =
+        normalizedArea.Split(
+          '/',
+          StringSplitOptions.RemoveEmptyEntries
+        );
+
+      StringBuilder builder =
+        new StringBuilder();
+
+      foreach (string segment in segments) {
+        builder.Append(
+          '/'
+        );
+
+        builder.Append(
+          Uri.EscapeDataString(
+            segment
+          )
+        );
+      }
+
+      return builder.ToString();
     }
 
     /// <summary>
@@ -2427,6 +2778,73 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     }
 
     /// <summary>
+    /// Maps one exact global aggregated area to the corresponding local area of a mounted
+    /// repository without performing any provider read.
+    ///
+    /// Global ancestors above a mount point intentionally do not map to the provider root;
+    /// those nodes are synthetic aggregator structure rather than concrete provider areas.
+    /// </summary>
+    private bool TryTranslateGlobalAreaToMountedLocalArea(
+      MountedRepository mountedRepository,
+      string globalArea,
+      out string localArea
+    ) {
+      string normalizedGlobalArea =
+        this.NormalizeAreaPath(
+          globalArea
+        );
+
+      if (mountedRepository.MountPoint == _RootArea) {
+        localArea =
+          normalizedGlobalArea;
+
+        return true;
+      }
+
+      if (string.Equals(
+            normalizedGlobalArea,
+            mountedRepository.MountPoint,
+            StringComparison.Ordinal
+          )) {
+        localArea =
+          _RootArea;
+
+        return true;
+      }
+
+      if (!this.IsSameOrDescendant(
+            normalizedGlobalArea,
+            mountedRepository.MountPoint
+          )) {
+        localArea =
+          _RootArea;
+
+        return false;
+      }
+
+      string suffix =
+        normalizedGlobalArea.Substring(
+          mountedRepository.MountPoint.Length
+        );
+
+      if (string.IsNullOrEmpty(
+            suffix
+          )) {
+        localArea =
+          _RootArea;
+
+        return true;
+      }
+
+      localArea =
+        this.NormalizeAreaPath(
+          suffix
+        );
+
+      return true;
+    }
+
+    /// <summary>
     /// Determines whether a requested global search scope intersects a mounted repository
     /// and maps that scope to the corresponding local provider path.
     /// </summary>
@@ -2573,6 +2991,65 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       AddSubArea = 2,
       AppendContent = 3,
       Truncate = 4
+    }
+
+    /// <summary>
+    /// Owns all child cache-policy scopes opened for one aggregated consumer request.
+    /// </summary>
+    private sealed class CompositeCacheReadScope : IDisposable {
+
+      private readonly IDisposable[] _Scopes;
+      private bool _Disposed;
+
+      /// <summary>
+      /// Creates one composite scope from already opened child scopes.
+      /// </summary>
+      public CompositeCacheReadScope(
+        IDisposable[] scopes
+      ) {
+        if (scopes == null) {
+          _Scopes =
+            Array.Empty<IDisposable>();
+        }
+        else {
+          _Scopes =
+            scopes;
+        }
+      }
+
+      /// <summary>
+      /// Closes all child scopes in reverse opening order.
+      ///
+      /// A failure in one arbitrary child implementation is isolated so the remaining
+      /// child scopes are still restored.
+      /// </summary>
+      public void Dispose() {
+        if (_Disposed) {
+          return;
+        }
+
+        _Disposed =
+          true;
+
+        for (int index = _Scopes.Length - 1;
+             index >= 0;
+             index--) {
+          try {
+            _Scopes[index].Dispose();
+          }
+          catch (Exception ex) {
+            DevLogger.LogError(
+              ex
+            );
+
+            DevLogger.LogTrace(
+              0,
+              99999,
+              "Aggregated knowledge cache child scope disposal failed. Remaining child scopes continue to be disposed."
+            );
+          }
+        }
+      }
     }
 
     /// <summary>

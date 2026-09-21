@@ -8,6 +8,7 @@ using System.Linq;
 using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
 
 namespace KnowledgeManagement.SmartStandards.Wrappers {
 
@@ -33,12 +34,12 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
   /// directly affected cache scopes are refreshed from the provider immediately afterwards.
   /// Refresh failures after a successful mutation are surfaced to the caller.
   ///
-  /// Persistent cache entries are validated individually during construction. Invalid or
-  /// no-longer-existing entries are removed without recursively enumerating the repository.
-  /// Connectivity failures during startup validation preserve the existing cache so offline
-  /// reads remain possible.
+  /// Persistent cache entries are intentionally not validated during construction. Startup
+  /// validation previously caused unacceptable startup stalls for large or temporarily
+  /// unavailable repositories. Entries are therefore validated lazily through normal reads,
+  /// while last-known-good values remain available as resilience fallbacks.
   /// </summary>
-  public class KnowledgeRepositoryCacheWrapper : FileBasedKnowledgeRepository {
+  public class KnowledgeRepositoryCacheWrapper : FileBasedKnowledgeRepository, IKnowledgeRepositoryCacheControl {
 
     private const int _CacheFormatVersion = 2;
     private const string _CacheDirectoryName = ".knowledge-cache";
@@ -55,6 +56,7 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     private readonly string _CacheDirectory;
 
     private readonly Dictionary<string, MemoryCacheEntry> _MemoryCache;
+    private readonly AsyncLocal<int> _PreferExistingScopeDepth;
 
     /// <summary>
     /// Creates one persistent demand-driven cache around an arbitrary knowledge repository.
@@ -117,6 +119,9 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
           StringComparer.Ordinal
         );
 
+      _PreferExistingScopeDepth =
+        new AsyncLocal<int>();
+
       Directory.CreateDirectory(
         _CacheDirectory
       );
@@ -155,6 +160,82 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         return _Lifetime;
       }
     }
+
+    /// <summary>
+    /// Returns whether one logical area currently has enough local cache information to
+    /// serve the normal area read path without requiring a refresh from the wrapped source.
+    ///
+    /// The check is intentionally passive and accepts expired entries because
+    /// <see cref="BeginPreferExistingScope"/> also accepts them.
+    /// </summary>
+    public bool IsAreaCached(
+      string area
+    ) {
+      if (string.IsNullOrWhiteSpace(
+            area
+          )) {
+        return false;
+      }
+
+      lock (_CacheSyncRoot) {
+        CachedCapabilities capabilities;
+
+        if (!this.TryReadCachedOnly(
+              "capabilities",
+              area,
+              out capabilities
+            )) {
+          return false;
+        }
+
+        if (capabilities.ContentLevel == ContentLevel.ContentContainer) {
+          string aggregatedContent;
+
+          return this.TryReadCachedOnly(
+            "aggregated-content",
+            area,
+            out aggregatedContent
+          );
+        }
+
+        string[] children;
+
+        return this.TryReadCachedOnly(
+          "children",
+          area,
+          out children
+        );
+      }
+    }
+
+    /// <summary>
+    /// Opens one execution-context-local read scope in which any existing cache entry is
+    /// preferred over refreshing it from the wrapped source.
+    ///
+    /// Missing entries are still loaded from the source and written to the cache.
+    /// </summary>
+    public IDisposable BeginPreferExistingScope() {
+      int previousDepth =
+        _PreferExistingScopeDepth.Value;
+
+      _PreferExistingScopeDepth.Value =
+        previousDepth + 1;
+
+      return new PreferExistingScope(
+        this,
+        previousDepth
+      );
+    }
+
+    /// <summary>
+    /// Gets whether the current execution context is inside a prefer-existing cache scope.
+    /// </summary>
+    private bool PreferExistingCache {
+      get {
+        return _PreferExistingScopeDepth.Value > 0;
+      }
+    }
+
 
     /// <summary>
     /// Returns logical area paths below one area.
@@ -925,12 +1006,14 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       if (_MemoryCache.TryGetValue(
             cacheKey,
             out memoryEntry
-          ) &&
-          this.IsFresh(
-            memoryEntry.CreatedUtc,
-            utcNow
           )) {
-        return (T)memoryEntry.Value;
+        if (this.PreferExistingCache ||
+            this.IsFresh(
+              memoryEntry.CreatedUtc,
+              utcNow
+            )) {
+          return (T)memoryEntry.Value;
+        }
       }
 
       PersistentCacheEntry persistentEntry;
@@ -944,10 +1027,11 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         );
 
       if (hasPersistentValue &&
-          this.IsFresh(
-            persistentEntry.CreatedUtc,
-            utcNow
-          )) {
+          (this.PreferExistingCache ||
+           this.IsFresh(
+             persistentEntry.CreatedUtc,
+             utcNow
+           ))) {
         this.StoreMemoryValue(
           cacheKey,
           persistentEntry.CreatedUtc,
@@ -994,6 +1078,62 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
 
         throw;
       }
+    }
+
+    /// <summary>
+    /// Tries to read one cached value without accessing the wrapped source.
+    ///
+    /// Expiration is deliberately ignored because this method is used only to inspect
+    /// whether a value is locally available for prefer-existing cache mode.
+    /// </summary>
+    private bool TryReadCachedOnly<T>(
+      string operation,
+      string argument,
+      out T value
+    ) {
+      string cacheKey =
+        this.CreateCacheKey(
+          operation,
+          argument
+        );
+
+      MemoryCacheEntry memoryEntry;
+
+      if (_MemoryCache.TryGetValue(
+            cacheKey,
+            out memoryEntry
+          )) {
+        value =
+          (T)memoryEntry.Value;
+
+        return true;
+      }
+
+      PersistentCacheEntry persistentEntry;
+      T persistentValue;
+
+      if (!this.TryReadPersistentValue(
+            operation,
+            argument,
+            out persistentEntry,
+            out persistentValue
+          )) {
+        value =
+          default(T);
+
+        return false;
+      }
+
+      this.StoreMemoryValue(
+        cacheKey,
+        persistentEntry.CreatedUtc,
+        persistentValue
+      );
+
+      value =
+        persistentValue;
+
+      return true;
     }
 
     /// <summary>
@@ -2111,6 +2251,45 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
               value;
           }
         }
+      }
+    }
+
+    /// <summary>
+    /// Restores the previous prefer-existing cache scope depth when disposed.
+    /// </summary>
+    private sealed class PreferExistingScope : IDisposable {
+
+      private readonly KnowledgeRepositoryCacheWrapper _Owner;
+      private readonly int _PreviousDepth;
+      private bool _Disposed;
+
+      /// <summary>
+      /// Creates one cache read scope.
+      /// </summary>
+      public PreferExistingScope(
+        KnowledgeRepositoryCacheWrapper owner,
+        int previousDepth
+      ) {
+        _Owner =
+          owner;
+
+        _PreviousDepth =
+          previousDepth;
+      }
+
+      /// <summary>
+      /// Restores the previous execution-context-local cache policy.
+      /// </summary>
+      public void Dispose() {
+        if (_Disposed) {
+          return;
+        }
+
+        _Disposed =
+          true;
+
+        _Owner._PreferExistingScopeDepth.Value =
+          _PreviousDepth;
       }
     }
 

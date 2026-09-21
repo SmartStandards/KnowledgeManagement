@@ -6,6 +6,7 @@ using KnowledgeManagement.SmartStandards.Wrappers;
 using Logging.SmartStandards;
 using Logging.SmartStandards.AspSupport;
 using Microsoft.AspNetCore;
+using ReverseMarkdown;
 using System.Reflection;
 using System.Web.UJMW;
 
@@ -101,18 +102,11 @@ namespace KnowledgeManagement.SmartStandards.DemoWebService {
         new string[] { "https://graph.microsoft.com/.default" }
       );
 
-      IKnowledgeRepository oneNoteUjmwRemoteSource = new OneNoteKnowledgeRepositoryProxy(
-        oneNoteOrSiteUrl: config.GetValue<string>("oneNoteOrSiteUrl"),
-        authenticationProvider: authenticationProvider,
-        readOnly: true         ,notebookName: "1 x 1 der Programmierung"
-      );
 
-      IKnowledgeRepository oneNoteCached = new KnowledgeRepositoryCacheWrapper(
-        oneNoteUjmwRemoteSource, 60 * 4, "C:\\Temp\\_KnowledgeCache\\OneNote"
-      );
-
-      agg.Add(oneNoteCached, "/OneNote/1 x 1 der Programmierung");
-      //agg.Add(oneNoteUjmwRemoteSource, "/OneNote/");
+      AddOneNoteSource(agg, authenticationProvider, config, "Organisation");
+      AddOneNoteSource(agg, authenticationProvider, config, "BCGer");
+      AddOneNoteSource(agg, authenticationProvider, config, "KI-Themen");
+      AddOneNoteSource(agg, authenticationProvider, config, "1 x 1 der Programmierung");
 
       //////////////////////////////////////////////////////////////////////////////////////////
 
@@ -147,6 +141,24 @@ namespace KnowledgeManagement.SmartStandards.DemoWebService {
       int tid = Thread.CurrentThread.ManagedThreadId;
       DevLogger.LogDebug($"  [#{tid}]  OnConfigureServices COMPLETED!");
     }
+
+    private static void AddOneNoteSource(
+      AggregatedKnowledgeRepository agg, IOneNoteGraphAuthenticationProvider authenticationProvider,
+       IConfiguration config, string notebookName
+    ) {
+
+      IKnowledgeRepository oneNoteUjmwRemoteSource = new OneNoteKnowledgeRepositoryProxy(
+        oneNoteOrSiteUrl: config.GetValue<string>("oneNoteOrSiteUrl"),
+        authenticationProvider: authenticationProvider,
+        readOnly: true, notebookName: notebookName 
+      );
+      IKnowledgeRepository oneNoteCached = new KnowledgeRepositoryCacheWrapper(
+        oneNoteUjmwRemoteSource, 60 * 4, "C:\\Temp\\_KnowledgeCache\\OneNote\\" + notebookName
+      );
+
+      agg.Add(oneNoteCached, "/OneNote/" + notebookName);
+    }
+
 
     static partial void OnRunApplication(
       WebApplication app, IConfiguration config, IServiceProvider services,

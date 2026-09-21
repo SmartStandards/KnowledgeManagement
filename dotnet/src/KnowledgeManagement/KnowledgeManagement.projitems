@@ -9,13 +9,11 @@
     <Import_RootNamespace>KnowledgeManagement.SmartStandards</Import_RootNamespace>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="$(MSBuildThisFileDirectory)[Contract]\IKnowledgeRepositoryCacheControl.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)[Contract]\KnowledgeAreaKind.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)[Contract]\ContentLevel.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)[Contract]\KnowledgeResourceInfo.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)[Contract]\KnowledgeResourceIdChange.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)[Contract]\IKnowledgeRepository.cs" />
-  </ItemGroup>
-  <ItemGroup>
-    <Folder Include="$(MSBuildThisFileDirectory)[Contract]\" />
   </ItemGroup>
 </Project>

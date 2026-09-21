@@ -20,8 +20,8 @@ namespace KnowledgeManagement.SmartStandards.Providers {
 
   /// <summary>
   /// Projects SharePoint-hosted OneNote content into IKnowledgeRepository.
-  /// Notebooks, section groups and sections are aggregations; pages are aggregations;
-  /// H1-H6 elements are hierarchical content containers.
+  /// Notebooks, section groups and sections are aggregations; pages and H1-H6 elements
+  /// are hierarchical content containers.
   /// Existing pages are changed by targeted Graph PATCH operations rather than by
   /// destructive whole-page Markdown roundtrips.
   /// </summary>
@@ -29,6 +29,7 @@ namespace KnowledgeManagement.SmartStandards.Providers {
 
     private const string _GraphBaseUrl = "https://graph.microsoft.com/v1.0";
     private const string _ResourcePrefix = "knowledge-resource:";
+    private const string _AreaPrefix = "knowledge-area:";
     private const int _MaximumGraphRetryCount = 6;
     private const int _MinimumGraphRequestIntervalMilliseconds = 550;
     private const int _InitialBackoffMilliseconds = 2000;
@@ -321,11 +322,14 @@ namespace KnowledgeManagement.SmartStandards.Providers {
       if (node.Level == ContentLevel.BeyondContent) {
         throw new InvalidOperationException("Direct content is not applicable to this area.");
       }
-      return !string.IsNullOrWhiteSpace(this.GetHeadingDirectMarkdown(node));
+      return !string.IsNullOrWhiteSpace(this.GetDirectMarkdown(node));
     }
 
     /// <summary>
-    /// Returns direct content of a heading; aggregations return an empty string.
+    /// Returns direct content of a concrete OneNote content container.
+    /// For a page this is the preamble before the first heading; for a heading it is the
+    /// content following that heading before the first subordinate or sibling heading.
+    /// Aggregation areas return an empty string.
     /// </summary>
     public string GetDirectContent(string area) {
       AreaNode node = this.ResolveArea(this.BuildTree(), area);
@@ -335,7 +339,7 @@ namespace KnowledgeManagement.SmartStandards.Providers {
       if (node.Level == ContentLevel.BeyondContent) {
         throw new InvalidOperationException("Direct content is not applicable to this area.");
       }
-      return this.GetHeadingDirectMarkdown(node);
+      return this.GetDirectMarkdown(node);
     }
 
     /// <summary>
@@ -661,8 +665,18 @@ namespace KnowledgeManagement.SmartStandards.Providers {
     /// </summary>
     private void LoadSectionChildren(AreaNode section) {
       foreach (JObject page in this.GetValues(this.GetJson(this.SiteOneNoteUrl("/sections/" + Uri.EscapeDataString(section.NativeId) + "/pages")))) {
+        string pageTitle = this.Display(page, "title", "Untitled");
+
+        // OneNote can expose empty companion artifacts using the legacy "_onefiles"
+        // suffix. These are resource containers rather than logical knowledge pages and
+        // must therefore not become Knowledge-Areas.
+        if (pageTitle.EndsWith("_onefiles", StringComparison.OrdinalIgnoreCase)) {
+          DevLogger.LogTrace(0, 99999, "Ignoring OneNote _onefiles companion page: " + pageTitle);
+          continue;
+        }
+
         string pageId = this.Required(page, "id");
-        this.AddChild(section, NodeKind.Page, this.Display(page, "title", "Untitled"), pageId, pageId, string.Empty, 0, ContentLevel.ContentAggregation);
+        this.AddChild(section, NodeKind.Page, pageTitle, pageId, pageId, string.Empty, 0, ContentLevel.ContentContainer);
       }
     }
 
@@ -702,6 +716,41 @@ namespace KnowledgeManagement.SmartStandards.Providers {
     }
 
     /// <summary>
+    /// Returns the direct Markdown content owned by a concrete OneNote content container.
+    /// </summary>
+    private string GetDirectMarkdown(AreaNode node) {
+      if (node.Kind == NodeKind.Page) {
+        return this.GetPageDirectMarkdown(node);
+      }
+      if (node.Kind == NodeKind.Heading) {
+        return this.GetHeadingDirectMarkdown(node);
+      }
+      return string.Empty;
+    }
+
+    /// <summary>
+    /// Returns the OneNote page preamble before its first projected H1-H6 heading.
+    /// The page itself is a content container, analogous to a Markdown document.
+    /// </summary>
+    private string GetPageDirectMarkdown(AreaNode node) {
+      HtmlDocument document = this.LoadPage(node.PageId);
+      HtmlNode body = document.DocumentNode.SelectSingleNode("//body");
+      if (body == null) {
+        return string.Empty;
+      }
+
+      StringBuilder html = new StringBuilder();
+      foreach (HtmlNode child in body.ChildNodes) {
+        if (this.IsHeading(child)) {
+          break;
+        }
+        html.Append(child.OuterHtml);
+      }
+
+      return this.HtmlToKnowledgeMarkdown(node.PageId, html.ToString());
+    }
+
+    /// <summary>
     /// Returns only nodes directly belonging to a heading before its first child heading.
     /// </summary>
     private string GetHeadingDirectMarkdown(AreaNode node) {
@@ -725,6 +774,12 @@ namespace KnowledgeManagement.SmartStandards.Providers {
     private string HtmlToKnowledgeMarkdown(string pageId, string html) {
       HtmlDocument document = new HtmlDocument();
       document.LoadHtml(html);
+
+      // OneNote frequently emits presentation/layout HTML that is technically valid, but
+      // produces extremely noisy Markdown. Normalize provider-specific markup before the
+      // generic HTML-to-Markdown conversion. The authoritative page HTML remains untouched.
+      this.NormalizeOneNoteHtmlForMarkdown(document);
+
       Dictionary<string, string> replacements = new Dictionary<string, string>();
       HtmlNodeCollection resources = document.DocumentNode.SelectNodes("//img|//object");
       if (resources != null) {
@@ -745,14 +800,355 @@ namespace KnowledgeManagement.SmartStandards.Providers {
       foreach (KeyValuePair<string, string> replacement in replacements) {
         markdown = markdown.Replace(replacement.Key, replacement.Value, StringComparison.Ordinal);
       }
+
+      // ReverseMarkdown can preserve BR elements in some OneNote fragments, especially
+      // when they originate from nested layout markup. At this point the semantic HTML
+      // conversion is complete, so replacing only residual BR tags is safe and cannot
+      // alter the source DOM or remove surrounding content.
+      // ReverseMarkdown deliberately emits HTML BR elements inside Markdown table cells
+      // because a physical line break would terminate the current table row. Any BR that
+      // survives the DOM normalization therefore has to remain inside the current cell.
+      markdown = Regex.Replace(
+        markdown,
+        @"<br\s*/?>",
+        " ",
+        RegexOptions.IgnoreCase
+      );
+
       return markdown.Trim();
+    }
+
+    /// <summary>
+    /// Normalizes OneNote-specific presentation HTML before it is projected to Markdown.
+    /// This method operates only on the temporary read projection and never modifies the
+    /// authoritative OneNote page DOM used for targeted mutations.
+    /// </summary>
+    private void NormalizeOneNoteHtmlForMarkdown(HtmlDocument document) {
+      if (document == null) {
+        throw new ArgumentNullException(nameof(document));
+      }
+
+      this.RemoveOneNoteProjectionAttributes(document);
+      this.UnwrapSingleCellLayoutTables(document);
+      this.NormalizeOneNoteLinks(document);
+      this.NormalizeHtmlLists(document);
+      this.NormalizeHtmlBreaks(document);
+      this.RemoveEmptyPresentationNodes(document);
+    }
+
+
+    /// <summary>
+    /// Converts OneNote hyperlinks into normal Markdown links and translates links to already
+    /// known repository pages or headings into provider-neutral knowledge-area references.
+    /// Resolution is deliberately cache-only: rendering content must never trigger repository-wide
+    /// Graph discovery merely because a page contains cross references.
+    /// </summary>
+    private void NormalizeOneNoteLinks(HtmlDocument document) {
+      HtmlNodeCollection links = document.DocumentNode.SelectNodes("//a");
+      if (links == null) {
+        return;
+      }
+
+      foreach (HtmlNode link in links.ToArray()) {
+        string href = WebUtility.HtmlDecode(link.GetAttributeValue("href", string.Empty)).Trim();
+        string label = WebUtility.HtmlDecode(link.InnerText).Trim();
+        if (string.IsNullOrWhiteSpace(label)) {
+          label = href;
+        }
+
+        string target = href;
+        if (href.StartsWith("onenote:", StringComparison.OrdinalIgnoreCase)) {
+          string resolvedArea = this.TryResolveOneNoteLinkToKnownArea(href);
+          if (!string.IsNullOrWhiteSpace(resolvedArea)) {
+            target = _AreaPrefix + resolvedArea;
+          }
+        }
+
+        string markdown = "[" + this.EscapeMarkdownLinkText(label) + "](" + this.EscapeMarkdownLinkTarget(target) + ")";
+        HtmlNode replacement = document.CreateTextNode(markdown);
+        link.ParentNode.ReplaceChild(replacement, link);
+      }
+    }
+
+    /// <summary>
+    /// Resolves a native OneNote URL against the repository tree that is already materialized.
+    /// No Graph request is issued from this method. Page-id is authoritative; object-id is used
+    /// as an optional refinement when the target page headings are already known.
+    /// </summary>
+    private string TryResolveOneNoteLinkToKnownArea(string oneNoteUrl) {
+      string pageId = this.ExtractOneNoteQueryIdentifier(oneNoteUrl, "page-id");
+      if (string.IsNullOrWhiteSpace(pageId)) {
+        return string.Empty;
+      }
+
+      AreaNode page = this.FindLoadedNodeByPageId(this.BuildTree(), pageId);
+      if (page == null) {
+        return string.Empty;
+      }
+
+      string objectId = this.ExtractOneNoteQueryIdentifier(oneNoteUrl, "object-id");
+      if (!string.IsNullOrWhiteSpace(objectId) && page.ChildrenLoaded) {
+        AreaNode heading = this.FindLoadedHeadingByObjectId(page, objectId);
+        if (heading != null) {
+          return heading.Path;
+        }
+      }
+
+      return page.Path;
+    }
+
+    /// <summary>
+    /// Extracts a OneNote identifier from the URL fragment/query payload.
+    /// </summary>
+    private string ExtractOneNoteQueryIdentifier(string oneNoteUrl, string parameterName) {
+      Match match = Regex.Match(
+        oneNoteUrl,
+        "(?:[?&#]|^)" + Regex.Escape(parameterName) + "=\\{?(?<value>[A-Fa-f0-9-]+)\\}?",
+        RegexOptions.IgnoreCase
+      );
+      if (!match.Success) {
+        return string.Empty;
+      }
+      return match.Groups["value"].Value.Trim();
+    }
+
+    /// <summary>
+    /// Searches only nodes whose children have already been materialized. This preserves the
+    /// lazy-loading guarantee and prevents link conversion from turning into a Graph crawler.
+    /// </summary>
+    private AreaNode FindLoadedNodeByPageId(AreaNode node, string pageId) {
+      if (node.Kind == NodeKind.Page && node.PageId.Equals(pageId, StringComparison.OrdinalIgnoreCase)) {
+        return node;
+      }
+      if (!node.ChildrenLoaded) {
+        return null;
+      }
+      foreach (AreaNode child in node.Children) {
+        AreaNode match = this.FindLoadedNodeByPageId(child, pageId);
+        if (match != null) {
+          return match;
+        }
+      }
+      return null;
+    }
+
+    /// <summary>
+    /// Searches already projected headings for a OneNote object identifier.
+    /// </summary>
+    private AreaNode FindLoadedHeadingByObjectId(AreaNode node, string objectId) {
+      foreach (AreaNode child in node.Children) {
+        if (child.Kind == NodeKind.Heading && child.NativeId.IndexOf(objectId, StringComparison.OrdinalIgnoreCase) >= 0) {
+          return child;
+        }
+        if (child.ChildrenLoaded) {
+          AreaNode match = this.FindLoadedHeadingByObjectId(child, objectId);
+          if (match != null) {
+            return match;
+          }
+        }
+      }
+      return null;
+    }
+
+    /// <summary>
+    /// Converts UL and OL elements to explicit Markdown list text before ReverseMarkdown sees
+    /// them. This avoids raw HTML leakage from OneNote list fragments embedded in layout nodes.
+    /// </summary>
+    private void NormalizeHtmlLists(HtmlDocument document) {
+      HtmlNodeCollection lists = document.DocumentNode.SelectNodes("//ul|//ol");
+      if (lists == null) {
+        return;
+      }
+
+      HtmlNode[] orderedLists = lists.ToArray().OrderByDescending((node) => this.GetHtmlDepth(node)).ToArray();
+      foreach (HtmlNode list in orderedLists) {
+        if (list.ParentNode == null) {
+          continue;
+        }
+
+        bool numbered = list.Name.Equals("ol", StringComparison.OrdinalIgnoreCase);
+        StringBuilder markdown = new StringBuilder();
+        HtmlNodeCollection items = list.SelectNodes("./li");
+        if (items != null) {
+          int number = 1;
+          foreach (HtmlNode item in items) {
+            string text = WebUtility.HtmlDecode(item.InnerText).Trim();
+            if (string.IsNullOrWhiteSpace(text)) {
+              continue;
+            }
+            if (numbered) {
+              markdown.Append(number.ToString()).Append(". ");
+              number++;
+            }
+            else {
+              markdown.Append("- ");
+            }
+            markdown.AppendLine(text);
+          }
+        }
+
+        list.ParentNode.ReplaceChild(document.CreateTextNode("\n" + markdown.ToString() + "\n"), list);
+      }
+    }
+
+    /// <summary>
+    /// Converts HTML BR elements to textual line breaks before generic conversion.
+    /// </summary>
+    private void NormalizeHtmlBreaks(HtmlDocument document) {
+      HtmlNodeCollection breaks = document.DocumentNode.SelectNodes("//br");
+      if (breaks == null) {
+        return;
+      }
+      foreach (HtmlNode lineBreak in breaks.ToArray()) {
+        if (lineBreak.ParentNode != null) {
+          lineBreak.ParentNode.ReplaceChild(document.CreateTextNode("\n"), lineBreak);
+        }
+      }
+    }
+
+    /// <summary>
+    /// Returns the DOM depth of a node so nested lists can be normalized inside-out.
+    /// </summary>
+    private int GetHtmlDepth(HtmlNode node) {
+      int depth = 0;
+      HtmlNode current = node.ParentNode;
+      while (current != null) {
+        depth++;
+        current = current.ParentNode;
+      }
+      return depth;
+    }
+
+    /// <summary>
+    /// Escapes Markdown-significant characters inside a link label.
+    /// </summary>
+    private string EscapeMarkdownLinkText(string value) {
+      return value.Replace("\\", "\\\\").Replace("[", "\\[").Replace("]", "\\]");
+    }
+
+    /// <summary>
+    /// Escapes a Markdown link target without changing provider-neutral URI schemes.
+    /// </summary>
+    private string EscapeMarkdownLinkTarget(string value) {
+      return value.Replace(" ", "%20").Replace("(", "%28").Replace(")", "%29");
+    }
+
+    /// <summary>
+    /// Removes OneNote-generated identifiers and presentation metadata that have no meaning
+    /// in the provider-neutral Markdown representation. Semantic attributes such as href,
+    /// src, alt, title and attachment metadata are deliberately preserved.
+    /// </summary>
+    private void RemoveOneNoteProjectionAttributes(HtmlDocument document) {
+      HtmlNodeCollection nodes = document.DocumentNode.SelectNodes("//*");
+      if (nodes == null) {
+        return;
+      }
+
+      foreach (HtmlNode node in nodes.ToArray()) {
+        string[] removableAttributes = node.Attributes
+          .Where((attribute) => this.IsProjectionOnlyAttribute(attribute.Name))
+          .Select((attribute) => attribute.Name)
+          .ToArray();
+
+        foreach (string attributeName in removableAttributes) {
+          node.Attributes.Remove(attributeName);
+        }
+      }
+    }
+
+    /// <summary>
+    /// Determines whether an HTML attribute belongs only to OneNote's visual/editor
+    /// representation and can therefore be discarded from the Markdown projection.
+    /// </summary>
+    private bool IsProjectionOnlyAttribute(string attributeName) {
+      if (string.IsNullOrWhiteSpace(attributeName)) {
+        return false;
+      }
+
+      if (string.Equals(attributeName, "id", StringComparison.OrdinalIgnoreCase)) {
+        return true;
+      }
+      if (string.Equals(attributeName, "style", StringComparison.OrdinalIgnoreCase)) {
+        return true;
+      }
+      if (string.Equals(attributeName, "class", StringComparison.OrdinalIgnoreCase)) {
+        return true;
+      }
+      if (attributeName.StartsWith("data-tag", StringComparison.OrdinalIgnoreCase)) {
+        return true;
+      }
+
+      return false;
+    }
+
+    /// <summary>
+    /// Unwraps tables that contain exactly one logical cell. OneNote commonly uses such
+    /// tables as layout containers. Exposing them as Markdown tables creates artificial
+    /// pipe syntax and can force lists contained in the cell to remain as raw HTML.
+    /// Genuine multi-cell tables are preserved for normal Markdown table conversion.
+    /// </summary>
+    private void UnwrapSingleCellLayoutTables(HtmlDocument document) {
+      HtmlNodeCollection tables = document.DocumentNode.SelectNodes("//table");
+      if (tables == null) {
+        return;
+      }
+
+      foreach (HtmlNode table in tables.ToArray()) {
+        HtmlNodeCollection cells = table.SelectNodes(".//td|.//th");
+        if (cells == null || cells.Count != 1) {
+          continue;
+        }
+
+        HtmlNode cell = cells[0];
+        HtmlNode parent = table.ParentNode;
+        if (parent == null) {
+          continue;
+        }
+
+        foreach (HtmlNode child in cell.ChildNodes.ToArray()) {
+          parent.InsertBefore(child, table);
+        }
+        parent.RemoveChild(table);
+      }
+    }
+
+    /// <summary>
+    /// Removes empty presentation-only elements that otherwise create superfluous Markdown
+    /// whitespace after OneNote layout containers have been normalized.
+    /// </summary>
+    private void RemoveEmptyPresentationNodes(HtmlDocument document) {
+      HtmlNodeCollection nodes = document.DocumentNode.SelectNodes("//span|//div|//p");
+      if (nodes == null) {
+        return;
+      }
+
+      foreach (HtmlNode node in nodes.ToArray().Reverse()) {
+        if (node.ParentNode == null) {
+          continue;
+        }
+        if (node.ChildNodes.Any((child) => child.NodeType == HtmlNodeType.Element)) {
+          continue;
+        }
+        if (!string.IsNullOrWhiteSpace(WebUtility.HtmlDecode(node.InnerText))) {
+          continue;
+        }
+
+        node.ParentNode.RemoveChild(node);
+      }
     }
 
     /// <summary>
     /// Appends a complete hierarchical Markdown representation.
     /// </summary>
     private void AppendAggregated(AreaNode node, StringBuilder result) {
-      if (node.Kind == NodeKind.Heading) {
+      if (node.Kind == NodeKind.Page) {
+        string direct = this.GetPageDirectMarkdown(node);
+        if (!string.IsNullOrWhiteSpace(direct)) {
+          result.AppendLine(direct);
+          result.AppendLine();
+        }
+      }
+      else if (node.Kind == NodeKind.Heading) {
         result.Append(new string('#', node.HeadingLevel));
         result.Append(' ');
         result.AppendLine(node.Name);
