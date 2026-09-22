@@ -453,6 +453,23 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
             DevLogger.LogTrace(0, 99999, "Background knowledge cache fetch completed: operation='" + workItem.Operation + "', argument='" + workItem.Argument + "', reason='" + workItem.Reason + "'.");
             return true;
           }
+          catch (InvalidOperationException ex) when (this.IsMissingAggregatedKnowledgeAreaException(ex, workItem.Argument)) {
+            lock (_SyncRoot) {
+              this.HealOrphanedArea(workItem.Argument);
+            }
+
+            DevLogger.LogTrace(
+              0,
+              99999,
+              "Background knowledge cache completed orphan cleanup instead of fetch: operation='"
+              + workItem.Operation
+              + "', argument='"
+              + workItem.Argument
+              + "', reason='authoritative aggregated repository no longer exposes the cached area'."
+            );
+
+            return true;
+          }
           catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.TooManyRequests) {
             DevLogger.LogTrace(
               0,
@@ -1108,6 +1125,242 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       }
 
       return result.ToArray();
+    }
+
+    /// <summary>
+    /// Determines whether an exception reports that an area which was previously visible
+    /// through an aggregated repository no longer exists.
+    ///
+    /// The recognition is intentionally narrow so unrelated InvalidOperationException
+    /// instances remain visible and cannot silently corrupt the cache.
+    /// </summary>
+    private bool IsMissingAggregatedKnowledgeAreaException(
+      InvalidOperationException exception,
+      string area
+    ) {
+      if (exception == null || string.IsNullOrWhiteSpace(area)) {
+        return false;
+      }
+
+      string expectedMessage =
+        "The aggregated knowledge area does not exist: "
+        + area;
+
+      return string.Equals(
+        exception.Message,
+        expectedMessage,
+        StringComparison.Ordinal
+      );
+    }
+
+    /// <summary>
+    /// Removes a knowledge area which is still represented by stale cache entries although
+    /// the authoritative aggregated repository no longer exposes it.
+    ///
+    /// All cached values belonging to the orphaned subtree are removed. Cached child arrays
+    /// which still reference the orphan are rewritten immediately so UI navigation stops
+    /// exposing the stale item without waiting for a complete repository refresh. Every
+    /// affected parent enumeration is then queued for an authoritative background refresh.
+    /// </summary>
+    private void HealOrphanedArea(string area) {
+      if (string.IsNullOrWhiteSpace(area) || string.Equals(area, "/", StringComparison.Ordinal)) {
+        return;
+      }
+
+      PersistentCacheEntry[] entries = this.ReadAllPersistentEntries();
+      HashSet<string> parentsToRefresh = new HashSet<string>(StringComparer.Ordinal);
+      int removedEntryCount = 0;
+      int rewrittenChildrenEntryCount = 0;
+
+      foreach (PersistentCacheEntry entry in entries) {
+        if (string.Equals(entry.Operation, "children", StringComparison.Ordinal)) {
+          string[] children;
+
+          try {
+            children = JsonConvert.DeserializeObject<string[]>(entry.PayloadJson);
+          }
+          catch (JsonException ex) {
+            DevLogger.LogError(ex);
+            continue;
+          }
+
+          if (children == null) {
+            continue;
+          }
+
+          string[] filteredChildren = children
+            .Where((string child) => !this.IsAreaOrDescendant(child, area))
+            .ToArray();
+
+          if (filteredChildren.Length == children.Length) {
+            continue;
+          }
+
+          this.WriteCacheValue(
+            "children",
+            entry.Argument,
+            filteredChildren
+          );
+
+          parentsToRefresh.Add(entry.Argument);
+          rewrittenChildrenEntryCount++;
+
+          DevLogger.LogTrace(
+            0,
+            99999,
+            "Background knowledge cache removed orphaned child reference: area='"
+            + area
+            + "', parent='"
+            + entry.Argument
+            + "', reason='aggregated repository no longer exposes the cached area'."
+          );
+        }
+      }
+
+      foreach (PersistentCacheEntry entry in entries) {
+        if (!this.CacheEntryBelongsToArea(entry, area)) {
+          continue;
+        }
+
+        if (string.Equals(entry.Operation, "children", StringComparison.Ordinal) &&
+            parentsToRefresh.Contains(entry.Argument)) {
+          continue;
+        }
+
+        this.RemoveCacheEntry(
+          entry.Operation,
+          entry.Argument
+        );
+
+        removedEntryCount++;
+      }
+
+      this.RemoveQueuedWorkForArea(area);
+
+      foreach (string parent in parentsToRefresh) {
+        this.EnqueuePriorityWork(
+          "children",
+          parent,
+          "orphaned cached child was removed"
+        );
+      }
+
+      DevLogger.LogTrace(
+        0,
+        99999,
+        "Background knowledge cache removed orphaned area: area='"
+        + area
+        + "', removedEntryCount="
+        + removedEntryCount.ToString()
+        + ", rewrittenChildrenEntryCount="
+        + rewrittenChildrenEntryCount.ToString()
+        + ", parentRefreshCount="
+        + parentsToRefresh.Count.ToString()
+        + ", reason='aggregated repository no longer exposes the cached area'."
+      );
+    }
+
+    /// <summary>
+    /// Returns whether a logical area equals the orphaned area or belongs to its subtree.
+    /// </summary>
+    private bool IsAreaOrDescendant(string candidateArea, string area) {
+      if (string.IsNullOrWhiteSpace(candidateArea)) {
+        return false;
+      }
+
+      if (string.Equals(candidateArea, area, StringComparison.Ordinal)) {
+        return true;
+      }
+
+      string descendantPrefix = area;
+
+      if (!descendantPrefix.EndsWith("/", StringComparison.Ordinal)) {
+        descendantPrefix += "/";
+      }
+
+      return candidateArea.StartsWith(
+        descendantPrefix,
+        StringComparison.Ordinal
+      );
+    }
+
+    /// <summary>
+    /// Determines whether a cache entry is scoped to an orphaned area or one of its
+    /// descendants. Resource-content entries are intentionally excluded because their opaque
+    /// identifiers do not encode area ownership and may still be referenced elsewhere.
+    /// </summary>
+    private bool CacheEntryBelongsToArea(PersistentCacheEntry entry, string area) {
+      if (entry == null) {
+        return false;
+      }
+
+      if (string.Equals(entry.Operation, "resource-content", StringComparison.Ordinal)) {
+        return false;
+      }
+
+      if (string.Equals(entry.Operation, "search", StringComparison.Ordinal)) {
+        return false;
+      }
+
+      return this.IsAreaOrDescendant(
+        entry.Argument,
+        area
+      );
+    }
+
+    /// <summary>
+    /// Removes one operation/argument pair from both the process-local and persistent cache.
+    /// </summary>
+    private void RemoveCacheEntry(string operation, string argument) {
+      string cacheKey = this.CreateCacheKey(operation, argument);
+      _MemoryCache.Remove(cacheKey);
+
+      string file = this.GetCacheFilePath(cacheKey);
+      this.TryDeleteFile(file);
+    }
+
+    /// <summary>
+    /// Removes queued background work for an orphaned area and its descendants.
+    /// </summary>
+    private void RemoveQueuedWorkForArea(string area) {
+      if (_PriorityQueue.Count == 0) {
+        return;
+      }
+
+      Queue<FetchWorkItem> retainedItems = new Queue<FetchWorkItem>();
+      _QueuedWorkKeys.Clear();
+
+      while (_PriorityQueue.Count > 0) {
+        FetchWorkItem item = _PriorityQueue.Dequeue();
+
+        if (this.IsAreaScopedOperation(item.Operation) &&
+            this.IsAreaOrDescendant(item.Argument, area)) {
+          continue;
+        }
+
+        retainedItems.Enqueue(item);
+        _QueuedWorkKeys.Add(item.Key);
+      }
+
+      while (retainedItems.Count > 0) {
+        _PriorityQueue.Enqueue(
+          retainedItems.Dequeue()
+        );
+      }
+    }
+
+    /// <summary>
+    /// Returns whether a cached operation uses its argument as a logical knowledge area.
+    /// </summary>
+    private bool IsAreaScopedOperation(string operation) {
+      return
+        string.Equals(operation, "children", StringComparison.Ordinal) ||
+        string.Equals(operation, "name", StringComparison.Ordinal) ||
+        string.Equals(operation, "capabilities", StringComparison.Ordinal) ||
+        string.Equals(operation, "has-direct-content", StringComparison.Ordinal) ||
+        string.Equals(operation, "direct-content", StringComparison.Ordinal) ||
+        string.Equals(operation, "aggregated-content", StringComparison.Ordinal) ||
+        string.Equals(operation, "resources", StringComparison.Ordinal);
     }
 
     /// <summary>

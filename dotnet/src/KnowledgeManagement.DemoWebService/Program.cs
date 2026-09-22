@@ -41,25 +41,41 @@ namespace KnowledgeManagement.SmartStandards.DemoWebService {
         }
       );
 
-      AggregatedKnowledgeRepository agg = new AggregatedKnowledgeRepository();
+
+
+
+      const int goTriggerSec = 3;
+
+
+
+      AggregatedKnowledgeRepository root = new AggregatedKnowledgeRepository();
+
+      AggregatedKnowledgeRepository slowAccessableSources = new AggregatedKnowledgeRepository();
+
+      BackgroundFetchingKnowledgeRepositoryCacheWrapper passiveCahcedSlowAccessableSources = new BackgroundFetchingKnowledgeRepositoryCacheWrapper(
+        slowAccessableSources, 60 * 4, "C:\\Temp\\_KnowledgeCache\\EXTRNAL"
+      );
+
+      root.Add( passiveCahcedSlowAccessableSources);
 
       //////////////////////////////////////////////////////////////////////////////////////////
       //FILESYSTEM
 
-      agg.Add(
+      root.Add(
         new FileBasedKnowledgeRepository("C:\\Temp\\_OneNoteExport", false, true),
-        "/Local/"
+        "/AI-Promptlib/"
       );
+
 
       //////////////////////////////////////////////////////////////////////////////////////////
       //GITHUB
 
-      agg.Add(
+      slowAccessableSources.Add(
         new GitBasedKnowledgeRepository(
           "https://github.com/SmartStandards/FUSE-fx.RepositoryContract",
           true, "", "/doc/"
         ),
-        "/GIT/FUSE-fx.RepositoryContract/"
+        "/_GIT_Repo_Docs/FUSE-fx.RepositoryContract/"
       );
 
       //////////////////////////////////////////////////////////////////////////////////////////
@@ -70,15 +86,15 @@ namespace KnowledgeManagement.SmartStandards.DemoWebService {
         config.GetValue<string>("rdiToken")     
       );
 
-      BackgroundFetchingKnowledgeRepositoryCacheWrapper smartStandardsCached = new BackgroundFetchingKnowledgeRepositoryCacheWrapper(
-        smartStandardsUjmwRemoteSource, 60 * 4, "C:\\Temp\\_KnowledgeCache\\SmartStandards"
-      );
+      //BackgroundFetchingKnowledgeRepositoryCacheWrapper smartStandardsCached = new BackgroundFetchingKnowledgeRepositoryCacheWrapper(
+      //  smartStandardsUjmwRemoteSource, 60 * 4, "C:\\Temp\\_KnowledgeCache\\SmartStandards"
+      //);
 ;
       //IKnowledgeRepository smartStandardsCached = new KnowledgeRepositoryCacheWrapper(
       //  smartStandardsUjmwRemoteSource, 60 * 4, "C:\\Temp\\_KnowledgeCache\\SmartStandards"
       //);
-
-      agg.Add(smartStandardsCached, "/SmartStandards/");
+      slowAccessableSources.Add(smartStandardsUjmwRemoteSource, "/SmartStandards/");
+      //root.Add(smartStandardsCached, "/SmartStandards/");
 
       //////////////////////////////////////////////////////////////////////////////////////////
       // OneNote (via AzureGraph
@@ -107,14 +123,14 @@ namespace KnowledgeManagement.SmartStandards.DemoWebService {
       );
 
 
-      //AddOneNoteSource(agg, authenticationProvider, config, "Organisation");
-      //AddOneNoteSource(agg, authenticationProvider, config, "BCGer");
-      //AddOneNoteSource(agg, authenticationProvider, config, "KI-Themen");
-      //AddOneNoteSource(agg, authenticationProvider, config, "1 x 1 der Programmierung");
+      AddOneNoteSource(slowAccessableSources, authenticationProvider, config, "Organisation");
+      AddOneNoteSource(slowAccessableSources, authenticationProvider, config, "BCGer");
+      AddOneNoteSource(slowAccessableSources, authenticationProvider, config, "KI-Themen");
+      AddOneNoteSource(slowAccessableSources, authenticationProvider, config, "1 x 1 der Programmierung");
 
       //////////////////////////////////////////////////////////////////////////////////////////
 
-      services.AddSingleton<IKnowledgeRepository>(agg);
+      services.AddSingleton<IKnowledgeRepository>(root);
 
       services.AddSingleton<IJoplinWebDavAuthenticationValidator>(
         new DelegateBasedJoplinWebDavAuthenticationValidator((userName, password, syncId, context) => {
@@ -126,10 +142,10 @@ namespace KnowledgeManagement.SmartStandards.DemoWebService {
       );
 
       services.AddCyclicTriggering((ct) => {
-      ct.AddTriggerTarget((c) => smartStandardsCached.PrefetchNext(c), 15);
+      ct.AddTriggerTarget((c) => passiveCahcedSlowAccessableSources.PrefetchNext(c), goTriggerSec);
         //ct.EnableInternalSelftrigger();
         ct.EnableTriggeringEndpoint();
-        ct.EnableLoopbackSelftrigger(10,"http://localhost:55202/.well-known/cyclic-trigger/go");
+        ct.EnableLoopbackSelftrigger(goTriggerSec, "http://localhost:55202/.well-known/cyclic-trigger/go");
       });
 
       //services.AddSingleton<IJoplinSyncStateStore>(
@@ -163,11 +179,14 @@ namespace KnowledgeManagement.SmartStandards.DemoWebService {
         authenticationProvider: authenticationProvider,
         readOnly: true, notebookName: notebookName 
       );
-      IKnowledgeRepository oneNoteCached = new KnowledgeRepositoryCacheWrapper(
-        oneNoteUjmwRemoteSource, 60 * 4, "C:\\Temp\\_KnowledgeCache\\OneNote\\" + notebookName
-      );
 
-      agg.Add(oneNoteCached, "/OneNote/" + notebookName);
+      agg.Add(oneNoteUjmwRemoteSource, "/OneNote/" + notebookName);
+
+      //IKnowledgeRepository oneNoteCached = new KnowledgeRepositoryCacheWrapper(
+      //  oneNoteUjmwRemoteSource, 60 * 4, "C:\\Temp\\_KnowledgeCache\\OneNote\\" + notebookName
+      //);
+
+      //agg.Add(oneNoteCached, "/OneNote/" + notebookName);
     }
 
 
