@@ -70,9 +70,13 @@ namespace KnowledgeManagement.SmartStandards.DemoWebService {
         config.GetValue<string>("rdiToken")     
       );
 
-      IKnowledgeRepository smartStandardsCached = new KnowledgeRepositoryCacheWrapper(
-        smartStandardsUjmwRemoteSource, 5, "C:\\Temp\\_KnowledgeCache\\SmartStandards"
+      BackgroundFetchingKnowledgeRepositoryCacheWrapper smartStandardsCached = new BackgroundFetchingKnowledgeRepositoryCacheWrapper(
+        smartStandardsUjmwRemoteSource, 60 * 4, "C:\\Temp\\_KnowledgeCache\\SmartStandards"
       );
+;
+      //IKnowledgeRepository smartStandardsCached = new KnowledgeRepositoryCacheWrapper(
+      //  smartStandardsUjmwRemoteSource, 60 * 4, "C:\\Temp\\_KnowledgeCache\\SmartStandards"
+      //);
 
       agg.Add(smartStandardsCached, "/SmartStandards/");
 
@@ -103,10 +107,10 @@ namespace KnowledgeManagement.SmartStandards.DemoWebService {
       );
 
 
-      AddOneNoteSource(agg, authenticationProvider, config, "Organisation");
-      AddOneNoteSource(agg, authenticationProvider, config, "BCGer");
-      AddOneNoteSource(agg, authenticationProvider, config, "KI-Themen");
-      AddOneNoteSource(agg, authenticationProvider, config, "1 x 1 der Programmierung");
+      //AddOneNoteSource(agg, authenticationProvider, config, "Organisation");
+      //AddOneNoteSource(agg, authenticationProvider, config, "BCGer");
+      //AddOneNoteSource(agg, authenticationProvider, config, "KI-Themen");
+      //AddOneNoteSource(agg, authenticationProvider, config, "1 x 1 der Programmierung");
 
       //////////////////////////////////////////////////////////////////////////////////////////
 
@@ -120,6 +124,13 @@ namespace KnowledgeManagement.SmartStandards.DemoWebService {
           return true;
         })
       );
+
+      services.AddCyclicTriggering((ct) => {
+      ct.AddTriggerTarget((c) => smartStandardsCached.PrefetchNext(c), 15);
+        //ct.EnableInternalSelftrigger();
+        ct.EnableTriggeringEndpoint();
+        ct.EnableLoopbackSelftrigger(10,"http://localhost:55202/.well-known/cyclic-trigger/go");
+      });
 
       //services.AddSingleton<IJoplinSyncStateStore>(
       //  new FileBasedJoplinSyncStateStore("C:\\Temp\\Joplin")

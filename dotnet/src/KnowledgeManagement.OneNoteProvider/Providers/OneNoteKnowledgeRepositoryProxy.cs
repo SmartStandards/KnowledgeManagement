@@ -665,18 +665,8 @@ namespace KnowledgeManagement.SmartStandards.Providers {
     /// </summary>
     private void LoadSectionChildren(AreaNode section) {
       foreach (JObject page in this.GetValues(this.GetJson(this.SiteOneNoteUrl("/sections/" + Uri.EscapeDataString(section.NativeId) + "/pages")))) {
-        string pageTitle = this.Display(page, "title", "Untitled");
-
-        // OneNote can expose empty companion artifacts using the legacy "_onefiles"
-        // suffix. These are resource containers rather than logical knowledge pages and
-        // must therefore not become Knowledge-Areas.
-        if (pageTitle.EndsWith("_onefiles", StringComparison.OrdinalIgnoreCase)) {
-          DevLogger.LogTrace(0, 99999, "Ignoring OneNote _onefiles companion page: " + pageTitle);
-          continue;
-        }
-
         string pageId = this.Required(page, "id");
-        this.AddChild(section, NodeKind.Page, pageTitle, pageId, pageId, string.Empty, 0, ContentLevel.ContentContainer);
+        this.AddChild(section, NodeKind.Page, this.Display(page, "title", "Untitled"), pageId, pageId, string.Empty, 0, ContentLevel.ContentContainer);
       }
     }
 
@@ -1688,6 +1678,15 @@ namespace KnowledgeManagement.SmartStandards.Providers {
             DevLogger.LogTrace(0, 99999, "OneNote Graph request: " + method.Method + " " + url);
             _LastGraphRequestUtc = DateTime.UtcNow;
             HttpResponseMessage response = _HttpClient.SendAsync(request).GetAwaiter().GetResult();
+
+            // HTTP 429 is deliberately never retried inside the provider. A caller such as
+            // BackgroundFetchingKnowledgeRepositoryCacheWrapper can apply a repository-wide
+            // throttle without keeping the Graph provider itself blocked.
+            if (response.StatusCode == (HttpStatusCode)429) {
+              DevLogger.LogTrace(0, 99999, "OneNote Graph returned HTTP 429 Too Many Requests. The provider returns the throttling response without an internal retry.");
+              return response;
+            }
+
             if (!this.IsTransientGraphFailure(response.StatusCode) || retry >= _MaximumGraphRetryCount) {
               if (response.IsSuccessStatusCode && method != HttpMethod.Get && method != HttpMethod.Head) {
                 this.InvalidateRepositoryCache();
@@ -1726,15 +1725,14 @@ namespace KnowledgeManagement.SmartStandards.Providers {
     /// Returns whether Graph may recover from the response when retried later.
     /// </summary>
     private bool IsTransientGraphFailure(HttpStatusCode statusCode) {
-      return statusCode == (HttpStatusCode)429 ||
-        statusCode == HttpStatusCode.ServiceUnavailable ||
+      return statusCode == HttpStatusCode.ServiceUnavailable ||
         statusCode == HttpStatusCode.GatewayTimeout ||
         statusCode == HttpStatusCode.InternalServerError;
     }
 
     /// <summary>
-    /// Resolves Retry-After or calculates bounded exponential backoff.
-    /// OneNote can return HTTP 429 without Retry-After, therefore the fallback is mandatory.
+    /// Resolves Retry-After or calculates bounded exponential backoff for retryable server failures.
+    /// HTTP 429 is intentionally returned to the caller and is not handled by this retry path.
     /// </summary>
     private int GetRetryDelayMilliseconds(HttpResponseMessage response, int retry) {
       if (response.Headers.RetryAfter != null) {
@@ -1823,7 +1821,11 @@ namespace KnowledgeManagement.SmartStandards.Providers {
         return;
       }
       string body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-      throw new HttpRequestException(message + " HTTP " + (int)response.StatusCode + " " + response.ReasonPhrase + ". " + body);
+      throw new HttpRequestException(
+        message + " HTTP " + (int)response.StatusCode + " " + response.ReasonPhrase + ". " + body,
+        null,
+        response.StatusCode
+      );
     }
 
     /// <summary>

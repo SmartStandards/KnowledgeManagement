@@ -52,6 +52,7 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
     private const int _JoplinFolderType = 2;
     private const int _JoplinResourceType = 4;
     private const string _KnowledgeResourceReferencePrefix = "knowledge-resource:";
+    private const string _KnowledgeAreaReferencePrefix = "knowledge-area:";
 
     private static readonly Regex _JoplinResourceReferenceRegex = new Regex(
       @":/(?<id>[0-9a-fA-F]{32})",
@@ -61,6 +62,11 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
     private static readonly Regex _KnowledgeResourceReferenceRegex = new Regex(
       @"knowledge-resource:(?<id>[A-Za-z0-9._~-]+)",
       RegexOptions.Compiled | RegexOptions.CultureInvariant
+    );
+
+    private static readonly Regex _KnowledgeAreaReferenceRegex = new Regex(
+      @"knowledge-area:(?<area>[^\s\)\]\>""']+)",
+      RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase
     );
 
     private readonly object _SyncRoot;
@@ -984,7 +990,7 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
       string existingArea
     ) {
       if (item.Type == _JoplinNoteType) {
-        if (!this.CanResolveJoplinResourceDependencies(
+        if (!this.CanResolveJoplinReferenceDependencies(
               item.Body,
               projection.State
             )) {
@@ -1038,7 +1044,8 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
 
       this.SynchronizeProjectionRecordAfterJoplinWrite(
         record,
-        item
+        item,
+        projection.State
       );
 
       projection.State.Records.Add(
@@ -1297,77 +1304,109 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
 
     /// <summary>
     /// Returns whether every Joplin-internal <c>:/&lt;id&gt;</c> reference in one note can
-    /// currently be classified safely.
+    /// currently be classified and translated safely.
     ///
-    /// Joplin uses the same URL syntax for note links and resource links. The adapter MUST
-    /// therefore inspect the referenced sync item before treating an ID as a resource.
-    /// Unknown referenced items keep the note pending until their metadata arrives. Known
-    /// note/folder links are considered resolved but remain unchanged in the textual body.
-    /// Resource links additionally require the corresponding binary blob.
+    /// Joplin uses the same URL syntax for note links and resource links. The adapter must
+    /// therefore inspect projection state before deciding whether one ID represents a
+    /// provider-neutral knowledge area or resource.
+    ///
+    /// Resource references require either an existing resource projection mapping or the
+    /// complete Joplin resource metadata/blob pair. Note and folder references require an
+    /// existing knowledge projection record because their provider-neutral target is the
+    /// mapped logical area. Unknown dependencies remain pending instead of leaking Joplin-
+    /// specific <c>:/...</c> references into repository Markdown.
     /// </summary>
-    private bool CanResolveJoplinResourceDependencies(
+    private bool CanResolveJoplinReferenceDependencies(
       string body,
       JoplinProjectionState state
     ) {
-      string sourceBody = body;
+      string sourceBody =
+        body;
 
       if (sourceBody == null) {
-        sourceBody = string.Empty;
+        sourceBody =
+          string.Empty;
       }
 
-      MatchCollection matches = _JoplinResourceReferenceRegex.Matches(
-        sourceBody
-      );
+      MatchCollection matches =
+        _JoplinResourceReferenceRegex.Matches(
+          sourceBody
+        );
 
       foreach (Match match in matches) {
-        string joplinId = match.Groups["id"].Value.ToLowerInvariant();
+        string joplinId =
+          match.Groups["id"].Value.ToLowerInvariant();
 
-        JoplinResourceProjectionRecord resourceRecord = state.Resources
-          .FirstOrDefault((JoplinResourceProjectionRecord candidate) =>
-            string.Equals(
-              candidate.JoplinId,
-              joplinId,
-              StringComparison.OrdinalIgnoreCase
-            ));
+        JoplinResourceProjectionRecord resourceRecord =
+          state.Resources.FirstOrDefault(
+            (JoplinResourceProjectionRecord candidate) =>
+              string.Equals(
+                candidate.JoplinId,
+                joplinId,
+                StringComparison.OrdinalIgnoreCase
+              )
+          );
 
         if (resourceRecord != null) {
           continue;
         }
 
-        JoplinProjectionRecord knowledgeRecord = state.Records
-          .FirstOrDefault((JoplinProjectionRecord candidate) =>
-            string.Equals(
-              candidate.Id,
-              joplinId,
-              StringComparison.OrdinalIgnoreCase
-            ));
+        JoplinProjectionRecord knowledgeRecord =
+          state.Records.FirstOrDefault(
+            (JoplinProjectionRecord candidate) =>
+              string.Equals(
+                candidate.Id,
+                joplinId,
+                StringComparison.OrdinalIgnoreCase
+              )
+          );
 
         if (knowledgeRecord != null) {
           continue;
         }
 
-        string metadataPath = "/" + joplinId + _MarkdownExtension;
+        string metadataPath =
+          "/"
+          + joplinId
+          + _MarkdownExtension;
 
-        if (!_SyncStateStore.FileExists(metadataPath)) {
+        if (!_SyncStateStore.FileExists(
+              metadataPath
+            )) {
           return false;
         }
 
-        JoplinSerializedItem referencedItem = this.ParseJoplinItem(
-          Encoding.UTF8.GetString(
-            _SyncStateStore.ReadFile(metadataPath)
-          )
-        );
+        JoplinSerializedItem referencedItem =
+          this.ParseJoplinItem(
+            Encoding.UTF8.GetString(
+              _SyncStateStore.ReadFile(
+                metadataPath
+              )
+            )
+          );
 
         if (referencedItem == null) {
           return false;
         }
 
         if (referencedItem.Type == _JoplinResourceType) {
-          string blobPath = _ResourceCollection + "/" + joplinId;
+          string blobPath =
+            _ResourceCollection
+            + "/"
+            + joplinId;
 
-          if (!_SyncStateStore.FileExists(blobPath)) {
+          if (!_SyncStateStore.FileExists(
+                blobPath
+              )) {
             return false;
           }
+
+          continue;
+        }
+
+        if (referencedItem.Type == _JoplinNoteType ||
+            referencedItem.Type == _JoplinFolderType) {
+          return false;
         }
       }
 
@@ -1375,12 +1414,17 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
     }
 
     /// <summary>
-    /// Translates Joplin resource references in one note body to stable provider-neutral
-    /// <c>knowledge-resource:&lt;ResourceId&gt;</c> references.
+    /// Translates Joplin-internal references in one note body to provider-neutral knowledge
+    /// references.
     ///
-    /// Joplin note links use the same <c>:/&lt;id&gt;</c> syntax and are therefore explicitly
-    /// left untouched. Only IDs whose referenced sync item is a Joplin resource are mapped
-    /// through the repository resource contract.
+    /// Joplin resources become <c>knowledge-resource:&lt;ResourceId&gt;</c>. Joplin notes and
+    /// folders that are backed by projection records become
+    /// <c>knowledge-area:&lt;logical area&gt;</c>. The logical area is copied exactly from the
+    /// repository projection and is not URI-decoded or reinterpreted.
+    ///
+    /// Unknown note/folder references are rejected as pending dependencies rather than being
+    /// persisted as Joplin-specific <c>:/...</c> syntax in provider-neutral repository
+    /// content.
     /// </summary>
     private bool TryTranslateJoplinBodyToKnowledge(
       string area,
@@ -1388,78 +1432,130 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
       JoplinProjectionState state,
       out string translatedBody
     ) {
-      translatedBody = joplinBody;
+      translatedBody =
+        joplinBody;
 
       if (translatedBody == null) {
-        translatedBody = string.Empty;
+        translatedBody =
+          string.Empty;
       }
 
-      MatchCollection matches = _JoplinResourceReferenceRegex.Matches(
-        translatedBody
-      );
+      MatchCollection matches =
+        _JoplinResourceReferenceRegex.Matches(
+          translatedBody
+        );
 
       if (matches.Count == 0) {
         return true;
       }
 
-      Dictionary<string, string> mappings =
-        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+      Dictionary<string, string> resourceMappings =
+        new Dictionary<string, string>(
+          StringComparer.OrdinalIgnoreCase
+        );
+
+      Dictionary<string, string> areaMappings =
+        new Dictionary<string, string>(
+          StringComparer.OrdinalIgnoreCase
+        );
 
       foreach (Match match in matches) {
-        string joplinId = match.Groups["id"].Value.ToLowerInvariant();
+        string joplinId =
+          match.Groups["id"].Value.ToLowerInvariant();
 
-        if (mappings.ContainsKey(joplinId)) {
+        if (resourceMappings.ContainsKey(
+              joplinId
+            ) ||
+            areaMappings.ContainsKey(
+              joplinId
+            )) {
           continue;
         }
 
-        JoplinResourceProjectionRecord record = state.Resources
-          .FirstOrDefault((JoplinResourceProjectionRecord candidate) =>
-            string.Equals(
-              candidate.JoplinId,
-              joplinId,
-              StringComparison.OrdinalIgnoreCase
-            ));
+        JoplinResourceProjectionRecord resourceRecord =
+          state.Resources.FirstOrDefault(
+            (JoplinResourceProjectionRecord candidate) =>
+              string.Equals(
+                candidate.JoplinId,
+                joplinId,
+                StringComparison.OrdinalIgnoreCase
+              )
+          );
 
-        if (record != null) {
-          if (!this.KnowledgeAreaSupportsResources(area)) {
+        if (resourceRecord != null) {
+          if (!this.KnowledgeAreaSupportsResources(
+                area
+              )) {
             return false;
           }
 
-          if (string.IsNullOrWhiteSpace(record.ResourceId)) {
+          if (string.IsNullOrWhiteSpace(
+                resourceRecord.ResourceId
+              )) {
             return false;
           }
 
-          record.IsSuppressed = false;
-          record.AreaHint = area;
-          mappings[joplinId] = record.ResourceId;
+          resourceRecord.IsSuppressed =
+            false;
+
+          resourceRecord.AreaHint =
+            area;
+
+          resourceMappings[joplinId] =
+            resourceRecord.ResourceId;
+
           continue;
         }
 
-        JoplinProjectionRecord knowledgeRecord = state.Records
-          .FirstOrDefault((JoplinProjectionRecord candidate) =>
-            string.Equals(
-              candidate.Id,
-              joplinId,
-              StringComparison.OrdinalIgnoreCase
-            ));
+        JoplinProjectionRecord knowledgeRecord =
+          state.Records.FirstOrDefault(
+            (JoplinProjectionRecord candidate) =>
+              string.Equals(
+                candidate.Id,
+                joplinId,
+                StringComparison.OrdinalIgnoreCase
+              )
+          );
 
         if (knowledgeRecord != null) {
+          if (string.IsNullOrWhiteSpace(
+                knowledgeRecord.Area
+              )) {
+            return false;
+          }
+
+          areaMappings[joplinId] =
+            knowledgeRecord.Area;
+
           continue;
         }
 
-        string metadataPath = "/" + joplinId + _MarkdownExtension;
+        string metadataPath =
+          "/"
+          + joplinId
+          + _MarkdownExtension;
 
-        if (!_SyncStateStore.FileExists(metadataPath)) {
+        if (!_SyncStateStore.FileExists(
+              metadataPath
+            )) {
           return false;
         }
 
-        JoplinSerializedItem referencedItem = this.ParseJoplinItem(
-          Encoding.UTF8.GetString(
-            _SyncStateStore.ReadFile(metadataPath)
-          )
-        );
+        JoplinSerializedItem referencedItem =
+          this.ParseJoplinItem(
+            Encoding.UTF8.GetString(
+              _SyncStateStore.ReadFile(
+                metadataPath
+              )
+            )
+          );
 
         if (referencedItem == null) {
+          return false;
+        }
+
+        if (referencedItem.Type == _JoplinNoteType ||
+            referencedItem.Type == _JoplinFolderType) {
           return false;
         }
 
@@ -1467,101 +1563,162 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
           continue;
         }
 
-        if (!this.KnowledgeAreaSupportsResources(area)) {
+        if (!this.KnowledgeAreaSupportsResources(
+              area
+            )) {
           return false;
         }
 
-        string blobPath = _ResourceCollection + "/" + joplinId;
+        string blobPath =
+          _ResourceCollection
+          + "/"
+          + joplinId;
 
-        if (!_SyncStateStore.FileExists(blobPath)) {
+        if (!_SyncStateStore.FileExists(
+              blobPath
+            )) {
           return false;
         }
 
-        byte[] resourceContent = _SyncStateStore.ReadFile(
-          blobPath
-        );
+        byte[] resourceContent =
+          _SyncStateStore.ReadFile(
+            blobPath
+          );
 
-        string preferredFileName = this.GetPreferredJoplinResourceFileName(
-          referencedItem
-        );
+        string preferredFileName =
+          this.GetPreferredJoplinResourceFileName(
+            referencedItem
+          );
 
         string resourceId;
 
-        bool added = _KnowledgeRepository.TryAddResource(
-          area,
-          preferredFileName,
-          referencedItem.Mime,
-          resourceContent,
-          out resourceId
-        );
+        bool added =
+          _KnowledgeRepository.TryAddResource(
+            area,
+            preferredFileName,
+            referencedItem.Mime,
+            resourceContent,
+            out resourceId
+          );
 
         if (!added) {
           return false;
         }
 
-        record = new JoplinResourceProjectionRecord();
-        record.JoplinId = joplinId;
-        record.ResourceId = resourceId;
-        record.AreaHint = area;
+        resourceRecord =
+          new JoplinResourceProjectionRecord();
+
+        resourceRecord.JoplinId =
+          joplinId;
+
+        resourceRecord.ResourceId =
+          resourceId;
+
+        resourceRecord.AreaHint =
+          area;
 
         if (referencedItem.CreatedUtc == DateTime.MinValue) {
-          record.CreatedUtc = DateTime.UtcNow;
+          resourceRecord.CreatedUtc =
+            DateTime.UtcNow;
         }
         else {
-          record.CreatedUtc = referencedItem.CreatedUtc;
+          resourceRecord.CreatedUtc =
+            referencedItem.CreatedUtc;
         }
 
         if (referencedItem.ModifiedUtc == DateTime.MinValue) {
-          record.ModifiedUtc = DateTime.UtcNow;
+          resourceRecord.ModifiedUtc =
+            DateTime.UtcNow;
         }
         else {
-          record.ModifiedUtc = referencedItem.ModifiedUtc;
+          resourceRecord.ModifiedUtc =
+            referencedItem.ModifiedUtc;
         }
 
-        record.FileExtension = this.ResolveJoplinResourceExtension(
-          referencedItem
-        );
-        record.ContentType = referencedItem.Mime;
-        record.Title = referencedItem.Title;
-        record.FileName = referencedItem.FileName;
-        record.LastContentHash = this.ComputeHash(resourceContent);
-        record.IsSuppressed = false;
-        state.Resources.Add(record);
+        resourceRecord.FileExtension =
+          this.ResolveJoplinResourceExtension(
+            referencedItem
+          );
 
-        mappings[joplinId] = resourceId;
+        resourceRecord.ContentType =
+          referencedItem.Mime;
+
+        resourceRecord.Title =
+          referencedItem.Title;
+
+        resourceRecord.FileName =
+          referencedItem.FileName;
+
+        resourceRecord.LastContentHash =
+          this.ComputeHash(
+            resourceContent
+          );
+
+        resourceRecord.IsSuppressed =
+          false;
+
+        state.Resources.Add(
+          resourceRecord
+        );
+
+        resourceMappings[joplinId] =
+          resourceId;
       }
 
-      translatedBody = _JoplinResourceReferenceRegex.Replace(
-        translatedBody,
-        (Match match) => {
-          string joplinId = match.Groups["id"].Value.ToLowerInvariant();
+      translatedBody =
+        _JoplinResourceReferenceRegex.Replace(
+          translatedBody,
+          (Match match) => {
+            string joplinId =
+              match.Groups["id"].Value.ToLowerInvariant();
 
-          if (!mappings.ContainsKey(joplinId)) {
+            if (resourceMappings.ContainsKey(
+                  joplinId
+                )) {
+              return _KnowledgeResourceReferencePrefix
+                + resourceMappings[joplinId];
+            }
+
+            if (areaMappings.ContainsKey(
+                  joplinId
+                )) {
+              return _KnowledgeAreaReferencePrefix
+                + areaMappings[joplinId];
+            }
+
             return match.Value;
           }
-
-          return _KnowledgeResourceReferencePrefix
-            + mappings[joplinId];
-        }
-      );
+        );
 
       return true;
     }
 
     /// <summary>
-    /// Translates provider-neutral knowledge-resource references to Joplin resource IDs and
-    /// refreshes the corresponding Joplin metadata/blob cache in the sync-state store.
+    /// Translates provider-neutral knowledge references into Joplin-internal references.
+    ///
+    /// <c>knowledge-resource:</c> references are projected to stable Joplin resource IDs and
+    /// refresh the corresponding metadata/blob cache. <c>knowledge-area:</c> references are
+    /// projected to the stable Joplin item ID of the exact logical area when that area is
+    /// represented by a non-suppressed Joplin note or folder.
     /// </summary>
     private string TranslateKnowledgeBodyToJoplin(
       string area,
       string knowledgeBody,
       JoplinProjectionState state
     ) {
-      string body = knowledgeBody;
+      string body =
+        knowledgeBody;
 
       if (body == null) {
-        body = string.Empty;
+        body =
+          string.Empty;
       }
+
+      body =
+        this.TranslateKnowledgeAreaReferencesToJoplin(
+          body,
+          state
+        );
 
       MatchCollection matches = _KnowledgeResourceReferenceRegex.Matches(
         body
@@ -1691,6 +1848,56 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
           }
 
           return ":/" + mappings[resourceId];
+        }
+      );
+    }
+
+    /// <summary>
+    /// Translates provider-neutral knowledge-area references to stable Joplin item links
+    /// whenever the exact logical target is currently projected as a note or folder.
+    ///
+    /// The area payload is already the canonical logical repository path. It is therefore
+    /// compared exactly and is never URI-decoded, URI-encoded or interpreted as a physical
+    /// provider path.
+    /// </summary>
+    private string TranslateKnowledgeAreaReferencesToJoplin(
+      string body,
+      JoplinProjectionState state
+    ) {
+      if (string.IsNullOrEmpty(
+            body
+          )) {
+        return body;
+      }
+
+      return _KnowledgeAreaReferenceRegex.Replace(
+        body,
+        (Match match) => {
+          string targetArea =
+            match.Groups["area"].Value;
+
+          JoplinProjectionRecord record =
+            state.Records.FirstOrDefault(
+              (JoplinProjectionRecord candidate) =>
+                !candidate.IsSuppressed &&
+                (candidate.Type == _JoplinNoteType ||
+                 candidate.Type == _JoplinFolderType) &&
+                string.Equals(
+                  candidate.Area,
+                  targetArea,
+                  StringComparison.Ordinal
+                )
+            );
+
+          if (record == null ||
+              string.IsNullOrWhiteSpace(
+                record.Id
+              )) {
+            return match.Value;
+          }
+
+          return ":/"
+            + record.Id;
         }
       );
     }
@@ -1956,7 +2163,7 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
       }
 
       if (item.Type == _JoplinNoteType &&
-          !this.CanResolveJoplinResourceDependencies(
+          !this.CanResolveJoplinReferenceDependencies(
             item.Body,
             projection.State
           )) {
@@ -2104,7 +2311,8 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
 
       this.SynchronizeProjectionRecordAfterJoplinWrite(
         record,
-        item
+        item,
+        projection.State
       );
 
       projection.State.Records.Add(record);
@@ -2249,7 +2457,7 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
       JoplinProjection projection
     ) {
       if (item.Type == _JoplinNoteType &&
-          !this.CanResolveJoplinResourceDependencies(
+          !this.CanResolveJoplinReferenceDependencies(
             item.Body,
             projection.State
           )) {
@@ -2385,7 +2593,8 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
 
       this.SynchronizeProjectionRecordAfterJoplinWrite(
         record,
-        item
+        item,
+        projection.State
       );
 
       return MaterializationResult.Success;
@@ -2988,7 +3197,8 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
     /// </summary>
     private void SynchronizeProjectionRecordAfterJoplinWrite(
       JoplinProjectionRecord record,
-      JoplinSerializedItem item
+      JoplinSerializedItem item,
+      JoplinProjectionState state
     ) {
       if (item.CreatedUtc != DateTime.MinValue) {
         record.CreatedUtc = item.CreatedUtc;
@@ -3014,9 +3224,17 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
       projectedItem.ParentId = item.ParentId;
 
       if (record.Type == _JoplinNoteType) {
-        projectedItem.Body = _KnowledgeRepository.GetAggregatedContent(
-          record.Area
-        );
+        string knowledgeBody =
+          _KnowledgeRepository.GetAggregatedContent(
+            record.Area
+          );
+
+        projectedItem.Body =
+          this.TranslateKnowledgeBodyToJoplin(
+            record.Area,
+            knowledgeBody,
+            state
+          );
       }
       else {
         projectedItem.Body = string.Empty;
