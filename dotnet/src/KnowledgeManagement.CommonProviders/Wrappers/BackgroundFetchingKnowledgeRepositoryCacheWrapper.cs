@@ -9,6 +9,7 @@ using System.Net;
 using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 
 namespace KnowledgeManagement.SmartStandards.Wrappers {
@@ -30,8 +31,10 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     private const string _CacheEntryExtension = ".cache";
     private const int _InitialTooManyRequestsDelayMilliseconds = 60000;
     private const int _MaximumTooManyRequestsDelayMilliseconds = 900000;
+    private const string _KnowledgeResourceReferencePrefix = "knowledge-resource:";
 
     private readonly object _SyncRoot;
+    private readonly object _PrefetchSyncRoot;
     private readonly IKnowledgeRepository _WrappedSource;
     private readonly TimeSpan _Lifetime;
     private readonly string _CacheFileSystemPath;
@@ -63,6 +66,7 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       }
 
       _SyncRoot = new object();
+      _PrefetchSyncRoot = new object();
       _WrappedSource = wrappedSource;
       _Lifetime = TimeSpan.FromMinutes(lifetimeMin);
       _CacheFileSystemPath = this.ResolveCacheFileSystemPath(cacheFileSystemPath);
@@ -185,20 +189,83 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     }
 
     /// <summary>
-    /// Returns cached resource metadata without source I/O.
+    /// Returns resource metadata from the local cache whenever possible.
+    ///
+    /// A narrowly scoped synchronous source read is allowed when already cached content
+    /// references resources but the metadata required to resolve those references is missing
+    /// or incomplete. This preserves cache/source consistency without fabricating placeholder
+    /// resources.
     /// </summary>
     public KnowledgeResourceInfo[] GetResources(string area) {
       lock (_SyncRoot) {
-        return this.ReadCachedOnly("resources", area, Array.Empty<KnowledgeResourceInfo>());
+        KnowledgeResourceInfo[] resources;
+        PersistentCacheEntry entry;
+        string[] referencedResourceIds = this.GetReferencedResourceIdsFromCachedContent(area);
+
+        if (this.TryReadCacheValue("resources", area, out entry, out resources)) {
+          DateTime utcNow = DateTime.UtcNow;
+          TimeSpan age = utcNow - entry.CreatedUtc;
+          string[] unresolvedResourceIds = this.GetUnresolvedResourceIds(resources, referencedResourceIds);
+
+          if (unresolvedResourceIds.Length > 0) {
+            DevLogger.LogTrace(0, 99999, "Background knowledge cache requires synchronous dependency fetch: operation='resources', argument='" + area + "', reason='cached content references resource identifiers absent from cached resource metadata', referencedResourceCount=" + referencedResourceIds.Length.ToString() + ", unresolvedResourceCount=" + unresolvedResourceIds.Length.ToString() + ".");
+            return this.FetchResourceMetadataSynchronously(area, "cached content references resource identifiers absent from cached resource metadata");
+          }
+
+          if (!this.IsFresh(entry.CreatedUtc, utcNow)) {
+            DevLogger.LogTrace(0, 99999, "Background knowledge cache answered resource metadata from stale cache: area='" + area + "', resourceCount=" + resources.Length.ToString() + ", ageSeconds=" + ((long)age.TotalSeconds).ToString() + ", lifetimeSeconds=" + ((long)_Lifetime.TotalSeconds).ToString() + ". Queuing refresh.");
+            this.EnqueuePriorityWork("resources", area, "stale resource metadata was served");
+          }
+          else {
+            DevLogger.LogTrace(0, 99999, "Background knowledge cache answered resource metadata from cache: area='" + area + "', resourceCount=" + resources.Length.ToString() + ", ageSeconds=" + ((long)age.TotalSeconds).ToString() + ".");
+          }
+
+          return resources;
+        }
+
+        if (referencedResourceIds.Length > 0) {
+          DevLogger.LogTrace(0, 99999, "Background knowledge cache requires synchronous dependency fetch: operation='resources', argument='" + area + "', reason='cached content references resources whose metadata is not cached', referencedResourceCount=" + referencedResourceIds.Length.ToString() + ".");
+          return this.FetchResourceMetadataSynchronously(area, "cached content references resources whose metadata is not cached");
+        }
+
+        this.EnqueuePriorityWork("resources", area, "resource metadata is not cached");
+        DevLogger.LogTrace(0, 99999, "Background knowledge cache answered with empty resource fallback: area='" + area + "', reason='resource metadata is not cached and cached content exposes no resource references'.");
+        return Array.Empty<KnowledgeResourceInfo>();
       }
     }
 
     /// <summary>
-    /// Returns cached resource bytes without source I/O.
+    /// Returns cached resource bytes. A synchronous source read is used only when the resource
+    /// is already confirmed by cached resource metadata and its binary payload is still missing.
     /// </summary>
     public byte[] GetResourceContent(string resourceId) {
       lock (_SyncRoot) {
-        return this.ReadCachedOnly("resource-content", resourceId, Array.Empty<byte>());
+        byte[] content;
+        PersistentCacheEntry entry;
+
+        if (this.TryReadCacheValue("resource-content", resourceId, out entry, out content)) {
+          DateTime utcNow = DateTime.UtcNow;
+          TimeSpan age = utcNow - entry.CreatedUtc;
+
+          if (!this.IsFresh(entry.CreatedUtc, utcNow)) {
+            DevLogger.LogTrace(0, 99999, "Background knowledge cache answered resource content from stale cache: resourceId='" + resourceId + "', byteCount=" + content.Length.ToString() + ", ageSeconds=" + ((long)age.TotalSeconds).ToString() + ", lifetimeSeconds=" + ((long)_Lifetime.TotalSeconds).ToString() + ". Queuing refresh.");
+            this.EnqueuePriorityWork("resource-content", resourceId, "stale resource content was served");
+          }
+          else {
+            DevLogger.LogTrace(0, 99999, "Background knowledge cache answered resource content from cache: resourceId='" + resourceId + "', byteCount=" + content.Length.ToString() + ", ageSeconds=" + ((long)age.TotalSeconds).ToString() + ".");
+          }
+
+          return content;
+        }
+
+        if (this.IsResourceConfirmedByCachedMetadata(resourceId)) {
+          DevLogger.LogTrace(0, 99999, "Background knowledge cache requires synchronous dependency fetch: operation='resource-content', argument='" + resourceId + "', reason='resource metadata is cached but binary content is not cached'.");
+          return this.FetchResourceContentSynchronously(resourceId, "resource metadata is cached but binary content is not cached");
+        }
+
+        this.EnqueuePriorityWork("resource-content", resourceId, "resource content is not cached");
+        DevLogger.LogTrace(0, 99999, "Background knowledge cache answered with empty resource-content fallback: resourceId='" + resourceId + "', reason='binary content is not cached and no cached resource metadata confirms the identifier'.");
+        return Array.Empty<byte>();
       }
     }
 
@@ -250,7 +317,8 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     /// </summary>
     public string GetDirectContent(string area) {
       lock (_SyncRoot) {
-        return this.ReadCachedOnly("direct-content", area, string.Empty);
+        string content = this.ReadCachedOnly("direct-content", area, string.Empty);
+        return this.GetConsistentCachedContent(area, content);
       }
     }
 
@@ -259,7 +327,8 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     /// </summary>
     public string GetAggregatedContent(string area) {
       lock (_SyncRoot) {
-        return this.ReadCachedOnly("aggregated-content", area, string.Empty);
+        string content = this.ReadCachedOnly("aggregated-content", area, string.Empty);
+        return this.GetConsistentCachedContent(area, content);
       }
     }
 
@@ -352,53 +421,233 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     /// True when one source value was fetched and cached; false when no work is currently due.
     /// </returns>
     public bool PrefetchNext(CancellationToken cancellationToken) {
-      FetchWorkItem workItem;
+      lock (_PrefetchSyncRoot) {
+        FetchWorkItem workItem;
 
-      lock (_SyncRoot) {
-        if (!this.TryDequeuePriorityWork(out workItem)) {
-          workItem = this.FindNextBackgroundWorkItem();
+        lock (_SyncRoot) {
+          if (!this.TryDequeuePriorityWork(out workItem)) {
+            workItem = this.FindNextBackgroundWorkItem();
+          }
+        }
+
+        if (workItem != null) {
+          DevLogger.LogTrace(0, 99999, "Background knowledge cache selected fetch: operation='" + workItem.Operation + "', argument='" + workItem.Argument + "', reason='" + workItem.Reason + "', priorityQueueLength=" + this.GetPriorityQueueLength().ToString() + ".");
+        }
+
+        if (workItem == null) {
+          return false;
+        }
+
+        int tooManyRequestsDelayMilliseconds = _InitialTooManyRequestsDelayMilliseconds;
+
+        while (true) {
+          cancellationToken.ThrowIfCancellationRequested();
+
+          try {
+            object value = this.FetchFromSource(workItem);
+
+            lock (_SyncRoot) {
+              this.WriteCacheValue(workItem.Operation, workItem.Argument, value);
+            }
+
+            DevLogger.LogTrace(0, 99999, "Background knowledge cache fetch completed: operation='" + workItem.Operation + "', argument='" + workItem.Argument + "', reason='" + workItem.Reason + "'.");
+            return true;
+          }
+          catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.TooManyRequests) {
+            DevLogger.LogTrace(
+              0,
+              99999,
+              "Background knowledge cache received HTTP 429 Too Many Requests for operation '"
+              + workItem.Operation
+              + "' and argument '"
+              + workItem.Argument
+              + "'. Waiting "
+              + tooManyRequestsDelayMilliseconds
+              + " ms before retrying the same fetch."
+            );
+
+            if (cancellationToken.WaitHandle.WaitOne(tooManyRequestsDelayMilliseconds)) {
+              cancellationToken.ThrowIfCancellationRequested();
+            }
+
+            long nextDelay = (long)tooManyRequestsDelayMilliseconds * 2L;
+            tooManyRequestsDelayMilliseconds = (int)Math.Min(nextDelay, _MaximumTooManyRequestsDelayMilliseconds);
+          }
+        }
+      }
+    }
+
+    /// <summary>
+    /// Keeps resource-bearing cached content immediately available and records any missing
+    /// metadata dependency. The dependency itself is resolved synchronously only when a
+    /// consumer subsequently asks for the corresponding resource metadata.
+    /// </summary>
+    private string GetConsistentCachedContent(string area, string content) {
+      if (string.IsNullOrEmpty(content)) {
+        return content;
+      }
+
+      string[] referencedResourceIds = this.ExtractKnowledgeResourceIds(content);
+      if (referencedResourceIds.Length == 0) {
+        return content;
+      }
+
+      CachedCapabilities capabilities;
+      bool capabilitiesCached = this.TryReadCachedPayloadOnly("capabilities", area, out capabilities);
+      if (!capabilitiesCached) {
+        this.EnqueuePriorityWork("capabilities", area, "cached content references resources but capabilities are not cached");
+      }
+
+      KnowledgeResourceInfo[] resources;
+      bool resourcesCached = this.TryReadCachedPayloadOnly("resources", area, out resources);
+      if (!resourcesCached) {
+        this.EnqueuePriorityWork("resources", area, "cached content references resources but resource metadata is not cached");
+        DevLogger.LogTrace(0, 99999, "Background knowledge cache served resource-bearing content with pending metadata dependency: area='" + area + "', referencedResourceCount=" + referencedResourceIds.Length.ToString() + ", capabilitiesCached=" + capabilitiesCached.ToString() + ", resourceMetadataCached=False. A later GetResources call may resolve this dependency synchronously.");
+        return content;
+      }
+
+      string[] unresolvedResourceIds = this.GetUnresolvedResourceIds(resources, referencedResourceIds);
+      if (unresolvedResourceIds.Length > 0) {
+        this.EnqueuePriorityWork("resources", area, "cached content references resource identifiers absent from cached resource metadata");
+        DevLogger.LogTrace(0, 99999, "Background knowledge cache detected resource/content mismatch: area='" + area + "', referencedResourceCount=" + referencedResourceIds.Length.ToString() + ", cachedResourceCount=" + resources.Length.ToString() + ", unresolvedReferenceCount=" + unresolvedResourceIds.Length.ToString() + ". Content remains available; a later GetResources call may resolve the dependency synchronously.");
+      }
+      else {
+        DevLogger.LogTrace(0, 99999, "Background knowledge cache validated resource-bearing cached content: area='" + area + "', referencedResourceCount=" + referencedResourceIds.Length.ToString() + ", cachedResourceCount=" + resources.Length.ToString() + ".");
+      }
+
+      return content;
+    }
+
+    /// <summary>
+    /// Returns resource identifiers referenced by content but absent from the supplied metadata.
+    /// </summary>
+    private string[] GetUnresolvedResourceIds(KnowledgeResourceInfo[] resources, string[] referencedResourceIds) {
+      HashSet<string> exposedResourceIds = new HashSet<string>(StringComparer.Ordinal);
+
+      foreach (KnowledgeResourceInfo resource in resources) {
+        if (resource != null && !string.IsNullOrWhiteSpace(resource.ResourceId)) {
+          exposedResourceIds.Add(resource.ResourceId);
         }
       }
 
-      if (workItem == null) {
-        return false;
+      List<string> unresolvedResourceIds = new List<string>();
+      foreach (string resourceId in referencedResourceIds) {
+        if (!exposedResourceIds.Contains(resourceId)) {
+          unresolvedResourceIds.Add(resourceId);
+        }
       }
 
-      int tooManyRequestsDelayMilliseconds = _InitialTooManyRequestsDelayMilliseconds;
+      return unresolvedResourceIds.ToArray();
+    }
 
-      while (true) {
-        cancellationToken.ThrowIfCancellationRequested();
+    /// <summary>
+    /// Performs the exceptional synchronous metadata fetch required to make already served
+    /// resource-bearing content resolvable, and stores the authoritative result in the cache.
+    /// </summary>
+    private KnowledgeResourceInfo[] FetchResourceMetadataSynchronously(string area, string reason) {
+      DevLogger.LogTrace(0, 99999, "Background knowledge cache synchronous dependency fetch started: operation='resources', argument='" + area + "', reason='" + reason + "'.");
+      KnowledgeResourceInfo[] resources = _WrappedSource.GetResources(area);
+      this.WriteCacheValue("resources", area, resources);
+      DevLogger.LogTrace(0, 99999, "Background knowledge cache synchronous dependency fetch completed: operation='resources', argument='" + area + "', resourceCount=" + resources.Length.ToString() + ", reason='" + reason + "'.");
+      return resources;
+    }
 
+    /// <summary>
+    /// Performs the exceptional synchronous binary fetch for a resource whose authoritative
+    /// metadata is already known, and stores the payload in the normal cache.
+    /// </summary>
+    private byte[] FetchResourceContentSynchronously(string resourceId, string reason) {
+      DevLogger.LogTrace(0, 99999, "Background knowledge cache synchronous dependency fetch started: operation='resource-content', argument='" + resourceId + "', reason='" + reason + "'.");
+      byte[] content = _WrappedSource.GetResourceContent(resourceId);
+      this.WriteCacheValue("resource-content", resourceId, content);
+      DevLogger.LogTrace(0, 99999, "Background knowledge cache synchronous dependency fetch completed: operation='resource-content', argument='" + resourceId + "', byteCount=" + content.Length.ToString() + ", reason='" + reason + "'.");
+      return content;
+    }
+
+    /// <summary>
+    /// Determines whether any cached authoritative resource metadata currently exposes the
+    /// supplied opaque resource identifier.
+    /// </summary>
+    private bool IsResourceConfirmedByCachedMetadata(string resourceId) {
+      PersistentCacheEntry[] entries = this.ReadAllPersistentEntries();
+
+      foreach (PersistentCacheEntry entry in entries) {
+        if (!string.Equals(entry.Operation, "resources", StringComparison.Ordinal)) {
+          continue;
+        }
+
+        KnowledgeResourceInfo[] resources;
         try {
-          object value = this.FetchFromSource(workItem);
-
-          lock (_SyncRoot) {
-            this.WriteCacheValue(workItem.Operation, workItem.Argument, value);
-          }
-
-          return true;
+          resources = JsonConvert.DeserializeObject<KnowledgeResourceInfo[]>(entry.PayloadJson);
         }
-        catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.TooManyRequests) {
-          DevLogger.LogTrace(
-            0,
-            99999,
-            "Background knowledge cache received HTTP 429 Too Many Requests for operation '"
-            + workItem.Operation
-            + "' and argument '"
-            + workItem.Argument
-            + "'. Waiting "
-            + tooManyRequestsDelayMilliseconds
-            + " ms before retrying the same fetch."
-          );
+        catch (JsonException ex) {
+          DevLogger.LogError(ex);
+          continue;
+        }
 
-          if (cancellationToken.WaitHandle.WaitOne(tooManyRequestsDelayMilliseconds)) {
-            cancellationToken.ThrowIfCancellationRequested();
+        if (resources == null) {
+          continue;
+        }
+
+        foreach (KnowledgeResourceInfo resource in resources) {
+          if (resource != null && string.Equals(resource.ResourceId, resourceId, StringComparison.Ordinal)) {
+            return true;
           }
-
-          long nextDelay = (long)tooManyRequestsDelayMilliseconds * 2L;
-          tooManyRequestsDelayMilliseconds = (int)Math.Min(nextDelay, _MaximumTooManyRequestsDelayMilliseconds);
         }
       }
+
+      return false;
+    }
+
+    /// <summary>
+    /// Collects resource identifiers referenced by any currently cached textual projection
+    /// of one area without queueing work or accessing the wrapped source.
+    /// </summary>
+    private string[] GetReferencedResourceIdsFromCachedContent(string area) {
+      HashSet<string> resourceIds = new HashSet<string>(StringComparer.Ordinal);
+      string directContent;
+      string aggregatedContent;
+
+      if (this.TryReadCachedPayloadOnly("direct-content", area, out directContent)) {
+        foreach (string resourceId in this.ExtractKnowledgeResourceIds(directContent)) {
+          resourceIds.Add(resourceId);
+        }
+      }
+
+      if (this.TryReadCachedPayloadOnly("aggregated-content", area, out aggregatedContent)) {
+        foreach (string resourceId in this.ExtractKnowledgeResourceIds(aggregatedContent)) {
+          resourceIds.Add(resourceId);
+        }
+      }
+
+      return resourceIds.ToArray();
+    }
+
+    /// <summary>
+    /// Extracts opaque provider resource identifiers from provider-neutral knowledge-resource
+    /// references. The parser intentionally stops only at URI/Markdown delimiters and does
+    /// not interpret the provider-owned identifier itself.
+    /// </summary>
+    private string[] ExtractKnowledgeResourceIds(string content) {
+      if (string.IsNullOrEmpty(content)) {
+        return Array.Empty<string>();
+      }
+
+      MatchCollection matches = Regex.Matches(
+        content,
+        @"knowledge-resource:(?<id>[^\s\)\]>""']+)",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant
+      );
+
+      HashSet<string> resourceIds = new HashSet<string>(StringComparer.Ordinal);
+      foreach (Match match in matches) {
+        string resourceId = match.Groups["id"].Value;
+        if (!string.IsNullOrWhiteSpace(resourceId)) {
+          resourceIds.Add(resourceId);
+        }
+      }
+
+      return resourceIds.ToArray();
     }
 
     /// <summary>
@@ -408,14 +657,22 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       PersistentCacheEntry entry;
       T value;
 
+      DateTime utcNow = DateTime.UtcNow;
+
       if (this.TryReadCacheValue(operation, argument, out entry, out value)) {
-        if (!this.IsFresh(entry.CreatedUtc, DateTime.UtcNow)) {
-          this.EnqueuePriorityWork(operation, argument);
+        TimeSpan age = utcNow - entry.CreatedUtc;
+        if (!this.IsFresh(entry.CreatedUtc, utcNow)) {
+          DevLogger.LogTrace(0, 99999, "Background knowledge cache answered from stale cache: operation='" + operation + "', argument='" + argument + "', ageSeconds=" + ((long)age.TotalSeconds).ToString() + ", lifetimeSeconds=" + ((long)_Lifetime.TotalSeconds).ToString() + ". Queuing refresh.");
+          this.EnqueuePriorityWork(operation, argument, "stale cache value was served");
+        }
+        else {
+          DevLogger.LogTrace(0, 99999, "Background knowledge cache answered from cache: operation='" + operation + "', argument='" + argument + "', ageSeconds=" + ((long)age.TotalSeconds).ToString() + ".");
         }
         return value;
       }
 
-      this.EnqueuePriorityWork(operation, argument);
+      DevLogger.LogTrace(0, 99999, "Background knowledge cache answered with fallback: operation='" + operation + "', argument='" + argument + "', reason='cache entry does not exist'. Queuing initial fetch.");
+      this.EnqueuePriorityWork(operation, argument, "cache entry does not exist");
       return fallbackValue;
     }
 
@@ -423,9 +680,29 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     /// Adds one source operation to the high-priority queue without creating duplicates.
     /// </summary>
     private void EnqueuePriorityWork(string operation, string argument) {
-      FetchWorkItem workItem = new FetchWorkItem(operation, argument);
+      this.EnqueuePriorityWork(operation, argument, "explicit dependency request");
+    }
+
+    /// <summary>
+    /// Adds one source operation to the high-priority queue and records why it was queued.
+    /// </summary>
+    private void EnqueuePriorityWork(string operation, string argument, string reason) {
+      FetchWorkItem workItem = new FetchWorkItem(operation, argument, reason);
       if (_QueuedWorkKeys.Add(workItem.Key)) {
         _PriorityQueue.Enqueue(workItem);
+        DevLogger.LogTrace(0, 99999, "Background knowledge cache queued priority fetch: operation='" + operation + "', argument='" + argument + "', reason='" + reason + "', priorityQueueLength=" + _PriorityQueue.Count.ToString() + ".");
+      }
+      else {
+        DevLogger.LogTrace(0, 99999, "Background knowledge cache priority fetch already queued: operation='" + operation + "', argument='" + argument + "', additionalReason='" + reason + "'.");
+      }
+    }
+
+    /// <summary>
+    /// Returns the current priority queue length for diagnostics.
+    /// </summary>
+    private int GetPriorityQueueLength() {
+      lock (_SyncRoot) {
+        return _PriorityQueue.Count;
       }
     }
 
@@ -485,23 +762,26 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
 
         foreach (string operation in basicOperations) {
           if (!this.HasCacheEntry(operation, area)) {
-            return new FetchWorkItem(operation, area);
+            return new FetchWorkItem(operation, area, "missing breadth-first cache entry");
           }
         }
 
         CachedCapabilities capabilities;
         if (this.TryReadCachedPayloadOnly("capabilities", area, out capabilities)) {
-          if (capabilities.ContentLevel != ContentLevel.BeyondContent) {
-            if (!this.HasCacheEntry("direct-content", area)) {
-              return new FetchWorkItem("direct-content", area);
-            }
-            if (!this.HasCacheEntry("aggregated-content", area)) {
-              return new FetchWorkItem("aggregated-content", area);
-            }
+          // Resource metadata is fetched before textual content. This keeps the externally
+          // visible cache projection consistent when content contains knowledge-resource
+          // references.
+          if (capabilities.SupportsResources && !this.HasCacheEntry("resources", area)) {
+            return new FetchWorkItem("resources", area, "missing resource metadata before content prefetch");
           }
 
-          if (capabilities.SupportsResources && !this.HasCacheEntry("resources", area)) {
-            return new FetchWorkItem("resources", area);
+          if (capabilities.ContentLevel != ContentLevel.BeyondContent) {
+            if (!this.HasCacheEntry("direct-content", area)) {
+              return new FetchWorkItem("direct-content", area, "missing breadth-first direct content");
+            }
+            if (!this.HasCacheEntry("aggregated-content", area)) {
+              return new FetchWorkItem("aggregated-content", area, "missing breadth-first aggregated content");
+            }
           }
         }
 
@@ -546,7 +826,7 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
 
         foreach (KnowledgeResourceInfo resource in resources) {
           if (!this.HasCacheEntry("resource-content", resource.ResourceId)) {
-            return new FetchWorkItem("resource-content", resource.ResourceId);
+            return new FetchWorkItem("resource-content", resource.ResourceId, "missing binary content for known resource");
           }
         }
       }
@@ -580,14 +860,14 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         return null;
       }
 
-      return new FetchWorkItem(oldest.Operation, oldest.Argument);
+      return new FetchWorkItem(oldest.Operation, oldest.Argument, "oldest expired cache entry");
     }
 
     /// <summary>
     /// Executes one logical source operation.
     /// </summary>
     private object FetchFromSource(FetchWorkItem workItem) {
-      DevLogger.LogTrace(0, 99999, "Background knowledge cache fetch: " + workItem.Operation + " | " + workItem.Argument);
+      DevLogger.LogTrace(0, 99999, "Background knowledge cache fetch started: operation='" + workItem.Operation + "', argument='" + workItem.Argument + "', reason='" + workItem.Reason + "'.");
 
       if (string.Equals(workItem.Operation, "children", StringComparison.Ordinal)) {
         return _WrappedSource.GetAreas(false, workItem.Argument);
@@ -844,7 +1124,7 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
           this.TryDeleteFile(file);
         }
 
-        this.EnqueuePriorityWork("children", "/");
+        this.EnqueuePriorityWork("children", "/", "authoritative mutation invalidated the cache");
       }
     }
 
@@ -927,13 +1207,21 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
 
       private readonly string _Operation;
       private readonly string _Argument;
+      private readonly string _Reason;
 
       /// <summary>
       /// Creates one immutable work item.
       /// </summary>
-      public FetchWorkItem(string operation, string argument) {
+      public FetchWorkItem(string operation, string argument) : this(operation, argument, "unspecified") {
+      }
+
+      /// <summary>
+      /// Creates one immutable work item with diagnostic scheduling context.
+      /// </summary>
+      public FetchWorkItem(string operation, string argument, string reason) {
         _Operation = operation;
         _Argument = argument;
+        _Reason = reason;
       }
 
       /// <summary>
@@ -951,6 +1239,16 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       public string Argument {
         get {
           return _Argument;
+        }
+      }
+
+
+      /// <summary>
+      /// Gets the diagnostic reason why this work item was selected or queued.
+      /// </summary>
+      public string Reason {
+        get {
+          return _Reason;
         }
       }
 

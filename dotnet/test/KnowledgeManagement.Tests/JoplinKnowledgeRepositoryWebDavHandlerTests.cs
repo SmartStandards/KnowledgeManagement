@@ -419,11 +419,12 @@ namespace KnowledgeManagement.SmartStandards.Tests {
     }
 
     /// <summary>
-    /// Verifies that a Joplin internal link to another note is not mistaken for a binary
+    /// Verifies that a Joplin internal link to another note is translated into a
+    /// provider-neutral knowledge-area reference and is not mistaken for a binary
     /// resource reference merely because both use the :/ID syntax.
     /// </summary>
     [TestMethod]
-    public void Put_JoplinNoteLink_DoesNotTranslateLinkAsResource() {
+    public void Put_JoplinNoteLink_TranslatesToKnowledgeAreaReference() {
       using (KnowledgeRepositoryTestContext context =
         new KnowledgeRepositoryTestContext()) {
 
@@ -477,6 +478,12 @@ namespace KnowledgeManagement.SmartStandards.Tests {
           );
 
         Assert.Contains(
+          "[Open target](knowledge-area:/Target Note)",
+          storedContent,
+          StringComparison.Ordinal
+        );
+
+        Assert.DoesNotContain(
           ":/" + _NoteAId,
           storedContent,
           StringComparison.Ordinal
