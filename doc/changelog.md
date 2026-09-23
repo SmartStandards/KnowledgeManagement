@@ -12,6 +12,17 @@ This files contains a version history including all changes relevant for semanti
 
 
 
+## v 0.1.2
+released **2026-09-23**, including:
+ - Merge branch 'master' of https://github.com/SmartStandards/KnowledgeManagement
+ - läuft durch
+ - zwischenstand
+ - geht wieder
+ - vor UpdateExFix
+ - zwischenstand
+
+
+
 ## v 0.1.1
 released **2026-09-18**, including:
  - suchtreffer werden asnyc aufgebaut
