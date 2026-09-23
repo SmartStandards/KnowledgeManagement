@@ -19,10 +19,23 @@ namespace KnowledgeManagement.SmartStandards {
   /// storage paths.
   /// 
   /// Areas participate in textual content according to <see cref="ContentLevel"/>:
-  /// <see cref="ContentLevel.BeyondContent"/> for pure navigation,
-  /// <see cref="ContentLevel.ContentAggregation"/> for content-access scopes that do
-  /// not own direct content, and <see cref="ContentLevel.ContentContainer"/> for
-  /// concrete areas that may own direct textual content.
+  /// <see cref="ContentLevel.BeyondContent"/> for pure navigation and as a hard
+  /// aggregation boundary, <see cref="ContentLevel.ContentAggregation"/> for explicit
+  /// bounded content-access scopes that do not own direct content, and
+  /// <see cref="ContentLevel.ContentContainer"/> for concrete areas that may own direct
+  /// textual content.
+  ///
+  /// <see cref="ContentLevel.ContentAggregation"/> is intentionally a strong semantic
+  /// and performance promise. A provider SHOULD expose it only where retrieving the
+  /// complete aggregatable content scope is expected, bounded and reasonably efficient.
+  /// Providers SHOULD NOT mark repository roots, large folder trees, notebooks or other
+  /// high structural levels as content aggregation merely because content exists somewhere
+  /// below them.
+  ///
+  /// <see cref="ContentLevel.BeyondContent"/> is not merely a statement that an area owns
+  /// no direct text. It also marks a traversal boundary for content aggregation. Consumers
+  /// and composite repositories MUST NOT recursively traverse through such an area while
+  /// evaluating aggregated textual content in order to discover content deeper below it.
   /// 
   /// Area ordering is semantically significant. Providers MUST preserve the natural
   /// order of sibling areas. Recursive enumeration MUST use pre-order traversal:
@@ -117,11 +130,25 @@ namespace KnowledgeManagement.SmartStandards {
     /// 
     /// <paramref name="contentLevel"/> describes how the area participates in content:
     /// 
-    /// - <see cref="ContentLevel.BeyondContent"/> means the area is purely structural.
+    /// - <see cref="ContentLevel.BeyondContent"/> means the area is purely structural
+    ///   from the textual-content perspective and forms a hard aggregation boundary.
+    ///   Aggregated-content traversal MUST NOT pass through this area merely to discover
+    ///   content-capable descendants deeper in its subtree.
     /// - <see cref="ContentLevel.ContentAggregation"/> means aggregated content can be
-    ///   obtained through the area, but the area owns no direct textual content.
+    ///   obtained through the area, but the area owns no direct textual content. Reporting
+    ///   this level is an explicit promise that materializing and retrieving the complete
+    ///   aggregatable content scope below the area is a meaningful and reasonably bounded
+    ///   operation.
     /// - <see cref="ContentLevel.ContentContainer"/> means the area may own direct
-    ///   textual content and may additionally contain subordinate content.
+    ///   textual content and may additionally contain subordinate content that belongs to
+    ///   the same logical content unit.
+    ///
+    /// Providers SHOULD assign <see cref="ContentLevel.ContentAggregation"/> sparingly.
+    /// Typical examples are a document-like scope whose subordinate areas represent
+    /// sections or headings, or another explicitly bounded logical unit such as a chapter
+    /// group. Large repository roots, broad folder hierarchies and navigation-only mounts
+    /// SHOULD normally remain <see cref="ContentLevel.BeyondContent"/> unless complete
+    /// aggregation is intentionally supported and operationally reasonable.
     /// 
     /// <paramref name="supportsSubAreas"/> indicates whether the area can structurally
     /// contain direct child areas. This is intentionally independent from
@@ -286,29 +313,48 @@ namespace KnowledgeManagement.SmartStandards {
 
     /// <summary>
     /// Returns the complete textual representation accessible through the specified
-    /// content-capable area, including subordinate content areas in natural hierarchical
-    /// order.
-    /// 
+    /// content-capable area, including eligible subordinate content areas in natural
+    /// hierarchical order.
+    ///
     /// This method is valid for both <see cref="ContentLevel.ContentAggregation"/> and
     /// <see cref="ContentLevel.ContentContainer"/>.
-    /// 
+    ///
+    /// <see cref="ContentLevel.BeyondContent"/> is a hard aggregation boundary. An
+    /// implementation MUST NOT recursively traverse through a BeyondContent area in order
+    /// to discover content-capable descendants deeper below it. Such a subtree contributes
+    /// no textual content to the current aggregation unless it is exposed separately through
+    /// an explicitly content-capable area.
+    ///
+    /// In a composite or aggregated repository, direct children may therefore participate
+    /// independently. Children that expose <see cref="ContentLevel.ContentAggregation"/> or
+    /// <see cref="ContentLevel.ContentContainer"/> may contribute to the result, while
+    /// children that expose <see cref="ContentLevel.BeyondContent"/> are skipped without
+    /// materializing or traversing their descendant trees. This allows content mounted
+    /// directly into a composite root to remain aggregatable without causing unrelated
+    /// structural mounts to be recursively loaded.
+    ///
     /// For a content aggregation area, the returned value is assembled entirely from
     /// subordinate content because the aggregation area itself owns no direct content.
-    /// The aggregation may represent a physical parent such as a notebook or may be
-    /// virtual and synthesized from content located in multiple unrelated physical or
-    /// logical source areas.
-    /// 
+    /// The aggregation may represent a bounded physical or virtual parent and may synthesize
+    /// content from multiple explicitly selected source areas.
+    ///
     /// For a content container, the result includes the area's own direct content plus
-    /// all subordinate content.
-    /// 
+    /// subordinate content that belongs to the same logical content unit.
+    ///
+    /// Providers SHOULD expose <see cref="ContentLevel.ContentAggregation"/> only where
+    /// retrieving the complete aggregatable scope is an expected, bounded and reasonably
+    /// efficient operation. A provider SHOULD NOT assign this level merely because content
+    /// exists somewhere in a large descendant tree. Typical valid uses include a page whose
+    /// child areas represent headings, or another intentionally bounded document-like scope.
+    ///
     /// Aggregation MUST preserve the logical order exposed by the provider. The provider
     /// is responsible for rendering subordinate structure in a valid textual form.
-    /// 
+    ///
     /// A virtual cross-cutting aggregation MAY intentionally project selected content
     /// from multiple source branches, for example all "Conclusion" sections or all code
     /// example sections. Such an aggregation MUST be deterministic, read-consistent and
     /// explicit through its area identity and reported capabilities.
-    /// 
+    ///
     /// This operation is read-only and MUST NOT mutate, normalize or rewrite the
     /// underlying source repository.
     /// </summary>

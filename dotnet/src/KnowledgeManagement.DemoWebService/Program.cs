@@ -49,7 +49,7 @@ namespace KnowledgeManagement.SmartStandards.DemoWebService {
 
 
       AggregatedKnowledgeRepository root = new AggregatedKnowledgeRepository();
-
+ 
       AggregatedKnowledgeRepository slowAccessableSources = new AggregatedKnowledgeRepository();
 
       BackgroundFetchingKnowledgeRepositoryCacheWrapper passiveCahcedSlowAccessableSources = new BackgroundFetchingKnowledgeRepositoryCacheWrapper(
@@ -75,7 +75,7 @@ namespace KnowledgeManagement.SmartStandards.DemoWebService {
           "https://github.com/SmartStandards/FUSE-fx.RepositoryContract",
           true, "", "/doc/"
         ),
-        "/_GIT_Repo_Docs/FUSE-fx.RepositoryContract/"
+        "/GIT-Repo (doc)/FUSE-fx.RepositoryContract/"
       );
 
       //////////////////////////////////////////////////////////////////////////////////////////
@@ -123,9 +123,9 @@ namespace KnowledgeManagement.SmartStandards.DemoWebService {
       );
 
 
-      AddOneNoteSource(slowAccessableSources, authenticationProvider, config, "Organisation");
-      AddOneNoteSource(slowAccessableSources, authenticationProvider, config, "BCGer");
-      AddOneNoteSource(slowAccessableSources, authenticationProvider, config, "KI-Themen");
+      //AddOneNoteSource(slowAccessableSources, authenticationProvider, config, "Organisation");
+      //AddOneNoteSource(slowAccessableSources, authenticationProvider, config, "BCGer");
+      //AddOneNoteSource(slowAccessableSources, authenticationProvider, config, "KI-Themen");
       AddOneNoteSource(slowAccessableSources, authenticationProvider, config, "1 x 1 der Programmierung");
 
       //////////////////////////////////////////////////////////////////////////////////////////
@@ -144,8 +144,11 @@ namespace KnowledgeManagement.SmartStandards.DemoWebService {
       services.AddCyclicTriggering((ct) => {
       ct.AddTriggerTarget((c) => passiveCahcedSlowAccessableSources.PrefetchNext(c), goTriggerSec);
         //ct.EnableInternalSelftrigger();
+
         ct.EnableTriggeringEndpoint();
         ct.EnableLoopbackSelftrigger(goTriggerSec, "http://localhost:55202/.well-known/cyclic-trigger/go");
+
+        //ct.EnableTriggerOnAnyEnpoint();
       });
 
       //services.AddSingleton<IJoplinSyncStateStore>(
@@ -161,7 +164,11 @@ namespace KnowledgeManagement.SmartStandards.DemoWebService {
       //  //TODO: ...
 
       //});
+      services.AddDynamicUjmwControllers((opt) => {
 
+        opt.AddControllerFor<IKnowledgeRepository>();
+
+      });
 
       services.AddSwaggerGenSmartStandardsFlavored();
 

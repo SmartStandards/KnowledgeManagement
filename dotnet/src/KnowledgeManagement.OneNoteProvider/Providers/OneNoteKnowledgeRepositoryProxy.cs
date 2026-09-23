@@ -662,11 +662,49 @@ namespace KnowledgeManagement.SmartStandards.Providers {
 
     /// <summary>
     /// Loads page metadata of one section without downloading page HTML.
+    ///
+    /// OneNote may expose companion pages whose title ends with "_onefiles". These pages
+    /// represent OneNote-internal resource containers and are not logical knowledge pages.
+    /// They are therefore excluded directly at provider level so they never become visible
+    /// through repository enumeration, aggregation, caching or downstream projections.
     /// </summary>
     private void LoadSectionChildren(AreaNode section) {
       foreach (JObject page in this.GetValues(this.GetJson(this.SiteOneNoteUrl("/sections/" + Uri.EscapeDataString(section.NativeId) + "/pages")))) {
-        string pageId = this.Required(page, "id");
-        this.AddChild(section, NodeKind.Page, this.Display(page, "title", "Untitled"), pageId, pageId, string.Empty, 0, ContentLevel.ContentContainer);
+        string pageTitle = this.Display(
+          page,
+          "title",
+          "Untitled"
+        );
+
+        if (pageTitle.EndsWith(
+              "_onefiles",
+              StringComparison.OrdinalIgnoreCase
+            )) {
+          DevLogger.LogTrace(
+            0,
+            99999,
+            "Ignoring OneNote _onefiles companion page: "
+            + pageTitle
+          );
+
+          continue;
+        }
+
+        string pageId = this.Required(
+          page,
+          "id"
+        );
+
+        this.AddChild(
+          section,
+          NodeKind.Page,
+          pageTitle,
+          pageId,
+          pageId,
+          string.Empty,
+          0,
+          ContentLevel.ContentContainer
+        );
       }
     }
 
@@ -1021,13 +1059,11 @@ namespace KnowledgeManagement.SmartStandards.Providers {
     /// </summary>
     private string EscapeMarkdownLinkTarget(string value) {
       return value.Replace(" ", "%20").Replace("(", "%28").Replace(")", "%29");
-    }
-
-    /// <summary>
-    /// Removes OneNote-generated identifiers and presentation metadata that have no meaning
-    /// in the provider-neutral Markdown representation. Semantic attributes such as href,
-    /// src, alt, title and attachment metadata are deliberately preserved.
-    /// </summary>
+    }/// <summary>
+     /// Removes OneNote-generated identifiers and presentation metadata that have no meaning
+     /// in the provider-neutral Markdown representation. Semantic attributes such as href,
+     /// src, alt, title and attachment metadata are deliberately preserved.
+     /// </summary>
     private void RemoveOneNoteProjectionAttributes(HtmlDocument document) {
       HtmlNodeCollection nodes = document.DocumentNode.SelectNodes("//*");
       if (nodes == null) {

@@ -582,8 +582,8 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     /// - If any concrete contributor is a <see cref="ContentLevel.ContentContainer"/>,
     ///   the global area is exposed as <see cref="ContentLevel.ContentContainer"/>.
     /// - Otherwise, if any contributor is a <see cref="ContentLevel.ContentAggregation"/>
-    ///   or the global area is a synthetic mount node with content descendants, it is
-    ///   exposed as <see cref="ContentLevel.ContentAggregation"/>.
+    ///   or the global area exposes at least one direct independently aggregatable child,
+    ///   it is exposed as <see cref="ContentLevel.ContentAggregation"/>.
     /// - Otherwise it is <see cref="ContentLevel.BeyondContent"/>.
     /// 
     /// Structural child support is the union of all contributors and synthetic children.
@@ -998,7 +998,7 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
             this.LogProviderReadFailure(
               ex,
               contribution,
-              "HasDirectContent",
+"HasDirectContent",
               contribution.LocalArea
             );
           }
@@ -1068,23 +1068,19 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
 
     /// <summary>
     /// Returns the complete aggregated textual view rooted at the specified global area.
-    /// 
-    /// The method renders the global overlay tree rather than blindly concatenating whole
-    /// provider documents. This prevents duplicate structural branches when several
-    /// repositories overlap the same logical area.
-    /// 
-    /// For every global node:
-    /// 
-    /// - direct content from all concrete content contributors is concatenated in
-    ///   registration order;
-    /// - visible child areas are rendered once in global natural order;
-    /// - synthetic mount areas participate like content aggregations;
-    /// - a content aggregation contributor that exposes no child areas but still returns
-    ///   provider-native aggregated content is treated as an opaque aggregate leaf and
-    ///   its aggregated content is included.
-    /// 
-    /// The returned representation uses Markdown-style headings as the neutral textual
-    /// projection of the aggregated area tree.
+    ///
+    /// Aggregation is deliberately content-boundary aware. Direct child areas are inspected
+    /// one level at a time and only branches that explicitly participate in content are
+    /// traversed. A <see cref="ContentLevel.BeyondContent"/> area is a hard aggregation
+    /// boundary and its descendants are neither materialized nor searched for hidden content.
+    ///
+    /// This is particularly important for composite roots. Content-capable repositories or
+    /// document scopes mounted directly below such a root may participate in aggregation,
+    /// while unrelated navigation-only mounts remain completely outside the aggregated read.
+    ///
+    /// The method never materializes the complete subtree before rendering. Complete subtree
+    /// materialization remains reserved for operations that explicitly ask for complete
+    /// structural enumeration.
     /// </summary>
     public string GetAggregatedContent(string area) {
       lock (_SyncRoot) {
@@ -1100,10 +1096,9 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
           return string.Empty;
         }
 
-        // Aggregated content is an explicit subtree operation. Materialize only the
-        // requested scope, one provider level at a time, instead of eagerly building the
-        // complete repository tree from the global root.
-        this.EnsureSubtreeMaterialized(
+        // Only content-capable contributions are allowed to expose children for an
+        // aggregated-content read. Structural providers are intentionally not traversed.
+        this.EnsureAggregationChildrenMaterialized(
           tree,
           node
         );
@@ -1115,7 +1110,12 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         }
 
         StringBuilder builder = new StringBuilder();
-        this.RenderAggregatedNodeContent(node, builder, 1);
+        this.RenderAggregatedNodeContent(
+          tree,
+          node,
+          builder,
+          1
+        );
 
         return builder.ToString().TrimEnd('\r', '\n');
       }
@@ -2204,98 +2204,168 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         return;
       }
 
-      bool hadProviderFailure =
-        false;
+      bool hadProviderFailure = false;
 
       foreach (AreaContribution contribution in node.Contributions) {
-        string[] localChildren;
+        bool succeeded = this.MaterializeContributionChildren(
+          tree,
+          node,
+          contribution
+        );
+
+        if (!succeeded) {
+          hadProviderFailure = true;
+        }
+      }
+
+      // A complete structural materialization also contains every child that could be
+      // relevant for content aggregation.
+      node.ChildrenMaterialized = !hadProviderFailure;
+      if (node.ChildrenMaterialized) {
+        node.AggregationChildrenMaterialized = true;
+      }
+    }
+
+    /// <summary>
+    /// Loads only direct children that are reachable through content-capable contributions.
+    ///
+    /// BeyondContent contributions are intentionally not enumerated. This makes
+    /// BeyondContent a real aggregation boundary and prevents a single aggregated-content
+    /// read from recursively walking navigation-only repositories.
+    /// </summary>
+    private void EnsureAggregationChildrenMaterialized(
+      AggregatedTree tree,
+      AggregatedNode node
+    ) {
+      if (node.ChildrenMaterialized ||
+          node.AggregationChildrenMaterialized) {
+        return;
+      }
+
+      bool hadProviderFailure = false;
+
+      foreach (AreaContribution contribution in node.Contributions) {
+        ContentLevel contributionContentLevel;
+
+        if (!this.TryGetContributionContentLevel(
+              contribution,
+              out contributionContentLevel
+            )) {
+          hadProviderFailure = true;
+          continue;
+        }
+
+        if (contributionContentLevel == ContentLevel.BeyondContent) {
+          continue;
+        }
+
+        bool succeeded = this.MaterializeContributionChildren(
+          tree,
+          node,
+          contribution
+        );
+
+        if (!succeeded) {
+          hadProviderFailure = true;
+        }
+      }
+
+      node.AggregationChildrenMaterialized = !hadProviderFailure;
+    }
+
+    /// <summary>
+    /// Materializes the direct children contributed by one concrete mounted repository.
+    /// </summary>
+    /// <returns>
+    /// True when the contribution was read without provider failures; otherwise false.
+    /// Partial children remain usable when a provider fails while resolving display names.
+    /// </returns>
+    private bool MaterializeContributionChildren(
+      AggregatedTree tree,
+      AggregatedNode node,
+      AreaContribution contribution
+    ) {
+      string[] localChildren;
+
+      try {
+        localChildren =
+          contribution.MountedRepository.Repository.GetAreas(
+            false,
+            contribution.LocalArea
+          );
+      }
+      catch (Exception ex) {
+        this.LogProviderReadFailure(
+          ex,
+          contribution,
+          "GetAreas",
+          contribution.LocalArea
+        );
+
+        return false;
+      }
+
+      bool succeeded = true;
+
+      foreach (string localChild in localChildren) {
+        string globalChild =
+          this.ToGlobalPath(
+            contribution.MountedRepository,
+            localChild
+          );
+
+        string expectedParent =
+          this.GetParentAreaPath(
+            globalChild
+          );
+
+        if (!string.Equals(
+              expectedParent,
+              node.Path,
+              StringComparison.Ordinal
+            )) {
+          continue;
+        }
+
+        string displayName;
 
         try {
-          localChildren =
-            contribution.MountedRepository.Repository.GetAreas(
-              false,
-              contribution.LocalArea
+          displayName =
+            contribution.MountedRepository.Repository.GetAreaName(
+              localChild
             );
         }
         catch (Exception ex) {
-          hadProviderFailure =
-            true;
+          succeeded = false;
 
           this.LogProviderReadFailure(
             ex,
             contribution,
-            "GetAreas",
-            contribution.LocalArea
+            "GetAreaName",
+            localChild
           );
 
-          continue;
-        }
-
-        foreach (string localChild in localChildren) {
-          string globalChild =
-            this.ToGlobalPath(
-              contribution.MountedRepository,
-              localChild
-            );
-
-          string expectedParent =
-            this.GetParentAreaPath(
+          displayName =
+            this.GetLastAreaSegment(
               globalChild
             );
-
-          if (!string.Equals(
-                expectedParent,
-                node.Path,
-                StringComparison.Ordinal
-              )) {
-            continue;
-          }
-
-          string displayName;
-
-          try {
-            displayName =
-              contribution.MountedRepository.Repository.GetAreaName(
-                localChild
-              );
-          }
-          catch (Exception ex) {
-            hadProviderFailure =
-              true;
-
-            this.LogProviderReadFailure(
-              ex,
-              contribution,
-              "GetAreaName",
-              localChild
-            );
-
-            displayName =
-              this.GetLastAreaSegment(
-                globalChild
-              );
-          }
-
-          AggregatedNode globalNode =
-            tree.GetOrCreate(
-              globalChild,
-              displayName
-            );
-
-          globalNode.AddContribution(
-            new AreaContribution(
-              contribution.MountedRepository,
-              localChild
-            )
-          );
         }
+
+        AggregatedNode globalNode =
+          tree.GetOrCreate(
+            globalChild,
+            displayName
+          );
+
+        globalNode.AddContribution(
+          new AreaContribution(
+            contribution.MountedRepository,
+            localChild
+          )
+        );
       }
 
-      // A partial materialization remains usable immediately, but a failed contributor
-      // must be retried on a later read burst instead of permanently marking the node as
-      // complete.
-      node.ChildrenMaterialized =
-        !hadProviderFailure;
+      return succeeded;
     }
 
     /// <summary>
@@ -2340,8 +2410,8 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
 
     /// <summary>
     /// Materializes one requested aggregate subtree iteratively. This is used only by
-    /// explicit bulk operations such as recursive enumeration and aggregated-content
-    /// rendering.
+    /// explicit structural bulk operations such as recursive enumeration and broad local
+    /// search preparation. Aggregated-content rendering deliberately does not use it.
     /// </summary>
     private void EnsureSubtreeMaterialized(
       AggregatedTree tree,
@@ -2431,41 +2501,31 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
 
     /// <summary>
     /// Resolves the effective read-oriented content level of a merged global area.
+    ///
+    /// Concrete provider contributions keep their explicit content semantics. In addition,
+    /// a synthetic aggregate node may become ContentAggregation when at least one direct
+    /// child is independently content-capable. Content is never discovered by traversing
+    /// through a BeyondContent contribution.
     /// </summary>
     private ContentLevel ResolveCombinedContentLevel(AggregatedNode node) {
-      bool hasAggregation =
-        false;
+      bool hasAggregation = false;
 
       foreach (AreaContribution contribution in node.Contributions) {
-        try {
-          contribution.MountedRepository.Repository.GetAreaCapabilities(
-            contribution.LocalArea,
-            out ContentLevel contentLevel,
-            out bool supportsSubAreas,
-            out bool canBeRenamed,
-            out bool canBeDeleted,
-            out bool canAddSubAreas,
-            out bool canAppendContent,
-            out bool canTruncate,
-            out bool supportsResources
-          );
+        ContentLevel contributionContentLevel;
 
-          if (contentLevel == ContentLevel.ContentContainer) {
-            return ContentLevel.ContentContainer;
-          }
-
-          if (contentLevel == ContentLevel.ContentAggregation) {
-            hasAggregation =
-              true;
-          }
+        if (!this.TryGetContributionContentLevel(
+              contribution,
+              out contributionContentLevel
+            )) {
+          continue;
         }
-        catch (Exception ex) {
-          this.LogProviderReadFailure(
-            ex,
-            contribution,
-            "GetAreaCapabilities",
-            contribution.LocalArea
-          );
+
+        if (contributionContentLevel == ContentLevel.ContentContainer) {
+          return ContentLevel.ContentContainer;
+        }
+
+        if (contributionContentLevel == ContentLevel.ContentAggregation) {
+          hasAggregation = true;
         }
       }
 
@@ -2473,10 +2533,7 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         return ContentLevel.ContentAggregation;
       }
 
-      if (node.Children.Count > 0 &&
-          this.HasContentDescendant(
-            node
-          )) {
+      if (this.HasDirectAggregatableChild(node)) {
         return ContentLevel.ContentAggregation;
       }
 
@@ -2484,59 +2541,13 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     }
 
     /// <summary>
-    /// Determines whether a synthetic or structural area has any content-capable
-    /// descendant without allowing one failing contributor to hide healthy siblings.
+    /// Determines whether at least one direct child can participate in aggregation without
+    /// crossing a BeyondContent provider boundary.
     /// </summary>
-    private bool HasContentDescendant(AggregatedNode node) {
-      Stack<AggregatedNode> pending =
-        new Stack<AggregatedNode>();
-
-      for (int index = node.Children.Count - 1;
-           index >= 0;
-           index--) {
-        pending.Push(
-          node.Children[index]
-        );
-      }
-
-      while (pending.Count > 0) {
-        AggregatedNode current =
-          pending.Pop();
-
-        foreach (AreaContribution contribution in current.Contributions) {
-          try {
-            contribution.MountedRepository.Repository.GetAreaCapabilities(
-              contribution.LocalArea,
-              out ContentLevel contentLevel,
-              out bool supportsSubAreas,
-              out bool canBeRenamed,
-              out bool canBeDeleted,
-              out bool canAddSubAreas,
-              out bool canAppendContent,
-              out bool canTruncate,
-              out bool supportsResources
-            );
-
-            if (contentLevel != ContentLevel.BeyondContent) {
-              return true;
-            }
-          }
-          catch (Exception ex) {
-            this.LogProviderReadFailure(
-              ex,
-              contribution,
-              "GetAreaCapabilities",
-              contribution.LocalArea
-            );
-          }
-        }
-
-        for (int index = current.Children.Count - 1;
-             index >= 0;
-             index--) {
-          pending.Push(
-            current.Children[index]
-          );
+    private bool HasDirectAggregatableChild(AggregatedNode node) {
+      foreach (AggregatedNode child in node.Children) {
+        if (this.IsChildVisibleToAggregation(node, child)) {
+          return true;
         }
       }
 
@@ -2544,9 +2555,123 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     }
 
     /// <summary>
-    /// Renders the global overlay tree as a Markdown-like neutral aggregate projection.
+    /// Determines whether one direct global child belongs to the current content aggregation.
+    ///
+    /// A direct mount root is evaluated independently. Otherwise a child contributed by a
+    /// concrete repository is eligible only when the same repository contributes the parent
+    /// as ContentAggregation or ContentContainer. This prevents a content-capable descendant
+    /// from leaking through a BeyondContent parent contribution.
+    /// </summary>
+    private bool IsChildVisibleToAggregation(
+      AggregatedNode parent,
+      AggregatedNode child
+    ) {
+      if (child.Contributions.Count == 0) {
+        return this.ResolveCombinedContentLevel(child) != ContentLevel.BeyondContent;
+      }
+
+      foreach (AreaContribution childContribution in child.Contributions) {
+        ContentLevel childContentLevel;
+
+        if (!this.TryGetContributionContentLevel(
+              childContribution,
+              out childContentLevel
+            )) {
+          continue;
+        }
+
+        if (childContentLevel == ContentLevel.BeyondContent) {
+          continue;
+        }
+
+        bool isDirectMountRoot =
+          string.Equals(
+            childContribution.LocalArea,
+            _RootArea,
+            StringComparison.Ordinal
+          ) &&
+          string.Equals(
+            childContribution.MountedRepository.MountPoint,
+            child.Path,
+            StringComparison.Ordinal
+          );
+
+        if (isDirectMountRoot) {
+          return true;
+        }
+
+        foreach (AreaContribution parentContribution in parent.Contributions) {
+          if (!object.ReferenceEquals(
+                parentContribution.MountedRepository,
+                childContribution.MountedRepository
+              )) {
+            continue;
+          }
+
+          ContentLevel parentContentLevel;
+
+          if (!this.TryGetContributionContentLevel(
+                parentContribution,
+                out parentContentLevel
+              )) {
+            continue;
+          }
+
+          if (parentContentLevel != ContentLevel.BeyondContent) {
+            return true;
+          }
+        }
+      }
+
+      return false;
+    }
+
+    /// <summary>
+    /// Reads the content level of one concrete provider contribution and isolates provider
+    /// failures from the remaining aggregate tree.
+    /// </summary>
+    private bool TryGetContributionContentLevel(
+      AreaContribution contribution,
+      out ContentLevel contentLevel
+    ) {
+      try {
+        contribution.MountedRepository.Repository.GetAreaCapabilities(
+          contribution.LocalArea,
+          out contentLevel,
+          out bool supportsSubAreas,
+          out bool canBeRenamed,
+          out bool canBeDeleted,
+          out bool canAddSubAreas,
+          out bool canAppendContent,
+          out bool canTruncate,
+          out bool supportsResources
+        );
+
+        return true;
+      }
+      catch (Exception ex) {
+        this.LogProviderReadFailure(
+          ex,
+          contribution,
+          "GetAreaCapabilities",
+          contribution.LocalArea
+        );
+
+        contentLevel = ContentLevel.BeyondContent;
+        return false;
+      }
+    }
+
+    /// <summary>
+    /// Renders the content-capable portion of the global overlay tree as a Markdown-like
+    /// neutral aggregate projection.
+    ///
+    /// Only direct children that remain inside an explicit content-capable branch are
+    /// materialized and rendered. BeyondContent children are skipped without traversing
+    /// their descendants.
     /// </summary>
     private void RenderAggregatedNodeContent(
+      AggregatedTree tree,
       AggregatedNode node,
       StringBuilder builder,
       int childHeadingLevel
@@ -2554,18 +2679,40 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       string directContent = this.GetDirectContent(node.Path);
 
       if (!string.IsNullOrWhiteSpace(directContent)) {
-        builder.Append(directContent.Trim('\r', '\n'));
+        builder.Append(
+          directContent.Trim('\r', '\n')
+        );
+
         builder.Append(Environment.NewLine);
         builder.Append(Environment.NewLine);
       }
 
-      this.RenderOpaqueAggregationLeafContent(node, builder);
+      this.RenderOpaqueAggregationLeafContent(
+        node,
+        builder
+      );
+
+      // Materialize exactly one aggregation-relevant child level.
+      // BeyondContent provider branches are not traversed.
+      this.EnsureAggregationChildrenMaterialized(
+        tree,
+        node
+      );
 
       foreach (AggregatedNode child in node.Children) {
-        ContentLevel childContentLevel = this.ResolveCombinedContentLevel(child);
+        if (!this.IsChildVisibleToAggregation(
+              node,
+              child
+            )) {
+          continue;
+        }
 
-        if (childContentLevel == ContentLevel.BeyondContent &&
-            !this.HasContentDescendant(child)) {
+        ContentLevel childContentLevel =
+          this.ResolveCombinedContentLevel(
+            child
+          );
+
+        if (childContentLevel == ContentLevel.BeyondContent) {
           continue;
         }
 
@@ -2575,13 +2722,20 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
           effectiveHeadingLevel = 6;
         }
 
-        builder.Append(new string('#', effectiveHeadingLevel));
+        builder.Append(
+          new string(
+            '#',
+            effectiveHeadingLevel
+          )
+        );
+
         builder.Append(' ');
         builder.Append(child.DisplayName);
         builder.Append(Environment.NewLine);
         builder.Append(Environment.NewLine);
 
         this.RenderAggregatedNodeContent(
+          tree,
           child,
           builder,
           childHeadingLevel + 1
@@ -2997,7 +3151,6 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     /// Owns all child cache-policy scopes opened for one aggregated consumer request.
     /// </summary>
     private sealed class CompositeCacheReadScope : IDisposable {
-
       private readonly IDisposable[] _Scopes;
       private bool _Disposed;
 
@@ -3204,6 +3357,7 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       private readonly List<AggregatedNode> _Children;
       private readonly List<AreaContribution> _Contributions;
       private bool _ChildrenMaterialized;
+      private bool _AggregationChildrenMaterialized;
 
       /// <summary>
       /// Creates one global tree node.
@@ -3217,6 +3371,7 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         _Children = new List<AggregatedNode>();
         _Contributions = new List<AreaContribution>();
         _ChildrenMaterialized = false;
+        _AggregationChildrenMaterialized = false;
       }
 
       /// <summary>
@@ -3277,6 +3432,19 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         }
         set {
           _ChildrenMaterialized = value;
+        }
+      }
+
+      /// <summary>
+      /// Gets or sets whether direct children from content-capable provider contributions
+      /// have already been materialized for aggregated-content reads.
+      /// </summary>
+      public bool AggregationChildrenMaterialized {
+        get {
+          return _AggregationChildrenMaterialized;
+        }
+        set {
+          _AggregationChildrenMaterialized = value;
         }
       }
 

@@ -718,6 +718,18 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
             record.IsSuppressed = false;
 
             state.Records.Add(record);
+
+            DevLogger.LogTrace(
+              0,
+              99999,
+              "Joplin projection discovered new knowledge area: area='"
+              + area
+              + "', joplinId='"
+              + record.Id
+              + "', type="
+              + type.ToString(CultureInfo.InvariantCulture)
+              + "."
+            );
           }
 
           // Only mark the area as current after the provider has successfully confirmed its
@@ -837,20 +849,21 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
         .ToArray();
 
       foreach (JoplinProjectionRecord staleRecord in staleRecords) {
+        // Projection records are identity mappings, not a snapshot of the currently visible
+        // repository tree. Keep mappings for temporarily absent knowledge areas so a later
+        // reappearance receives exactly the same Joplin item ID. The record is deliberately
+        // not emitted as an item during this projection pass because the area is absent from
+        // the current repository enumeration.
         DevLogger.LogTrace(
           0,
           99999,
-          "Joplin projection removed stale mapping: area='"
+          "Joplin projection retained inactive mapping: area='"
           + staleRecord.Area
           + "', joplinId='"
           + staleRecord.Id
           + "', type="
           + staleRecord.Type.ToString(CultureInfo.InvariantCulture)
-          + "."
-        );
-
-        state.Records.Remove(
-          staleRecord
+          + ", reason='knowledge area is not present in the current repository snapshot'."
         );
       }
 

@@ -21,16 +21,16 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
   /// Normal repository reads never access the wrapped source. Missing or expired values are
   /// queued with high priority and the best locally available value is returned immediately.
   /// <see cref="PrefetchNext"/> performs exactly one logical source fetch per successful call.
-  /// When no explicitly requested work is pending, missing values are discovered breadth-first
-  /// from the repository root before expired values are refreshed oldest-first.
+  /// Explicit consumer demand is always processed first. Autonomous work first completes the
+  /// navigable structure breadth-first and only then fills content deepest-first. Aggregated
+  /// content is never prefetched autonomously because it represents an explicit subtree read.
   /// </summary>
   public sealed class BackgroundFetchingKnowledgeRepositoryCacheWrapper : IKnowledgeRepository {
 
     private const int _CacheFormatVersion = 2;
     private const string _CacheDirectoryName = ".knowledge-cache";
     private const string _CacheEntryExtension = ".cache";
-    private const int _InitialTooManyRequestsDelayMilliseconds = 60000;
-    private const int _MaximumTooManyRequestsDelayMilliseconds = 900000;
+    private const string _CacheGenerationFileName = ".generation";
     private const string _KnowledgeResourceReferencePrefix = "knowledge-resource:";
 
     private readonly object _SyncRoot;
@@ -39,7 +39,9 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     private readonly TimeSpan _Lifetime;
     private readonly string _CacheFileSystemPath;
     private readonly string _CacheDirectory;
+    private readonly string _CacheGenerationFile;
     private readonly Dictionary<string, MemoryCacheEntry> _MemoryCache;
+    private string _KnownCacheGeneration;
     private readonly Queue<FetchWorkItem> _PriorityQueue;
     private readonly HashSet<string> _QueuedWorkKeys;
 
@@ -54,7 +56,7 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     /// </param>
     public BackgroundFetchingKnowledgeRepositoryCacheWrapper(
       IKnowledgeRepository wrappedSource,
-      int lifetimeMin = 240,
+      int lifetimeMin = 10,
       string cacheFileSystemPath = null
     ) {
       if (wrappedSource == null) {
@@ -71,11 +73,24 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       _Lifetime = TimeSpan.FromMinutes(lifetimeMin);
       _CacheFileSystemPath = this.ResolveCacheFileSystemPath(cacheFileSystemPath);
       _CacheDirectory = Path.Combine(_CacheFileSystemPath, _CacheDirectoryName);
+      _CacheGenerationFile = Path.Combine(_CacheDirectory, _CacheGenerationFileName);
       _MemoryCache = new Dictionary<string, MemoryCacheEntry>(StringComparer.Ordinal);
       _PriorityQueue = new Queue<FetchWorkItem>();
       _QueuedWorkKeys = new HashSet<string>(StringComparer.Ordinal);
 
       Directory.CreateDirectory(_CacheDirectory);
+      _KnownCacheGeneration = this.GetOrCreateCacheGeneration();
+
+      // The persistent cache can survive application restarts while the composition of an
+      // aggregated repository may have changed, for example because a provider was mounted
+      // at a different logical path. Always revalidate the root structure on the first
+      // available heartbeat instead of trusting a still-fresh persisted root enumeration.
+      this.EnqueuePriorityWork(
+        "children",
+        "/",
+        "startup root structure revalidation",
+        true
+      );
     }
 
     /// <summary>
@@ -112,7 +127,9 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     public string[] GetAreas(bool recurse, string startArea = "/") {
       lock (_SyncRoot) {
         if (!recurse) {
-          return this.ReadCachedOnly("children", startArea, Array.Empty<string>());
+          string[] directChildren = this.ReadCachedOnly("children", startArea, Array.Empty<string>());
+          DevLogger.LogTrace(0, 99999, "STRUCTURE-DIAG GetAreas(false): parent='" + startArea + "', count=" + directChildren.Length.ToString() + ", children=" + this.FormatDiagnosticAreas(directChildren) + ".");
+          return directChildren;
         }
 
         List<string> result = new List<string>();
@@ -133,7 +150,9 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
           }
         }
 
-        return result.ToArray();
+        string[] recursiveAreas = result.ToArray();
+        DevLogger.LogTrace(0, 99999, "STRUCTURE-DIAG GetAreas(true): start='" + startArea + "', count=" + recursiveAreas.Length.ToString() + ", areas=" + this.FormatDiagnosticAreas(recursiveAreas) + ".");
+        return recursiveAreas;
       }
     }
 
@@ -410,18 +429,41 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     }
 
     /// <summary>
-    /// Performs exactly one successful logical background fetch.
+    /// Performs at most one logical background fetch attempt.
     ///
     /// Explicitly requested cache misses and stale reads are processed first. Otherwise the
-    /// known repository is scanned breadth-first for missing values and then oldest-first for
-    /// expired values. HTTP 429 keeps this method blocked on the same work item using bounded
-    /// exponential backoff. The supplied cancellation token interrupts that wait immediately.
+    /// known repository is scanned breadth-first for one missing value and then oldest-first
+    /// for one expired value.
+    ///
+    /// This method deliberately never loops and never waits for a retry. One invocation is
+    /// one heartbeat work unit. A throttled request is queued again for a later heartbeat.
+    /// Cancellation is treated as a graceful stop request and therefore returns false rather
+    /// than throwing <see cref="OperationCanceledException"/>.
     /// </summary>
     /// <returns>
-    /// True when one source value was fetched and cached; false when no work is currently due.
+    /// True when one source value was fetched and cached or one orphaned area was healed;
+    /// otherwise false.
     /// </returns>
     public bool PrefetchNext(CancellationToken cancellationToken) {
-      lock (_PrefetchSyncRoot) {
+      if (cancellationToken.IsCancellationRequested) {
+        return false;
+      }
+
+      if (!Monitor.TryEnter(_PrefetchSyncRoot)) {
+        DevLogger.LogTrace(
+          0,
+          99999,
+          "Background knowledge cache skipped heartbeat because another PrefetchNext invocation is still active."
+        );
+
+        return false;
+      }
+
+      try {
+        if (cancellationToken.IsCancellationRequested) {
+          return false;
+        }
+
         FetchWorkItem workItem;
 
         lock (_SyncRoot) {
@@ -430,67 +472,188 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
           }
         }
 
-        if (workItem != null) {
-          DevLogger.LogTrace(0, 99999, "Background knowledge cache selected fetch: operation='" + workItem.Operation + "', argument='" + workItem.Argument + "', reason='" + workItem.Reason + "', priorityQueueLength=" + this.GetPriorityQueueLength().ToString() + ".");
-        }
-
         if (workItem == null) {
           return false;
         }
 
-        int tooManyRequestsDelayMilliseconds = _InitialTooManyRequestsDelayMilliseconds;
+        DevLogger.LogTrace(
+          0,
+          99999,
+          "Background knowledge cache selected fetch: operation='"
+          + workItem.Operation
+          + "', argument='"
+          + workItem.Argument
+          + "', reason='"
+          + workItem.Reason
+          + "', priorityQueueLength="
+          + this.GetPriorityQueueLength().ToString()
+          + "."
+        );
 
-        while (true) {
-          cancellationToken.ThrowIfCancellationRequested();
-
-          try {
-            object value = this.FetchFromSource(workItem);
-
-            lock (_SyncRoot) {
-              this.WriteCacheValue(workItem.Operation, workItem.Argument, value);
-            }
-
-            DevLogger.LogTrace(0, 99999, "Background knowledge cache fetch completed: operation='" + workItem.Operation + "', argument='" + workItem.Argument + "', reason='" + workItem.Reason + "'.");
-            return true;
-          }
-          catch (InvalidOperationException ex) when (this.IsMissingAggregatedKnowledgeAreaException(ex, workItem.Argument)) {
-            lock (_SyncRoot) {
-              this.HealOrphanedArea(workItem.Argument);
-            }
-
-            DevLogger.LogTrace(
-              0,
-              99999,
-              "Background knowledge cache completed orphan cleanup instead of fetch: operation='"
-              + workItem.Operation
-              + "', argument='"
-              + workItem.Argument
-              + "', reason='authoritative aggregated repository no longer exposes the cached area'."
+        if (cancellationToken.IsCancellationRequested) {
+          lock (_SyncRoot) {
+            this.EnqueuePriorityWork(
+              workItem.Operation,
+              workItem.Argument,
+              "selected background fetch was cancelled before source access",
+              workItem.ForceRefresh
             );
-
-            return true;
           }
-          catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.TooManyRequests) {
-            DevLogger.LogTrace(
-              0,
-              99999,
-              "Background knowledge cache received HTTP 429 Too Many Requests for operation '"
-              + workItem.Operation
-              + "' and argument '"
-              + workItem.Argument
-              + "'. Waiting "
-              + tooManyRequestsDelayMilliseconds
-              + " ms before retrying the same fetch."
-            );
 
-            if (cancellationToken.WaitHandle.WaitOne(tooManyRequestsDelayMilliseconds)) {
-              cancellationToken.ThrowIfCancellationRequested();
-            }
-
-            long nextDelay = (long)tooManyRequestsDelayMilliseconds * 2L;
-            tooManyRequestsDelayMilliseconds = (int)Math.Min(nextDelay, _MaximumTooManyRequestsDelayMilliseconds);
-          }
+          return false;
         }
+
+        try {
+          string[] previousChildren = null;
+
+          if (string.Equals(workItem.Operation, "children", StringComparison.Ordinal)) {
+            lock (_SyncRoot) {
+              string[] cachedChildren;
+
+              if (this.TryReadCachedPayloadOnly(
+                    "children",
+                    workItem.Argument,
+                    out cachedChildren
+                  )) {
+                previousChildren = cachedChildren;
+              }
+            }
+          }
+
+          if (cancellationToken.IsCancellationRequested) {
+            lock (_SyncRoot) {
+              this.EnqueuePriorityWork(
+                workItem.Operation,
+                workItem.Argument,
+                "selected background fetch was cancelled before source access",
+                workItem.ForceRefresh
+              );
+            }
+
+            return false;
+          }
+
+          DevLogger.LogTrace(
+            0,
+            99999,
+            "Background knowledge cache fetch started: operation='"
+            + workItem.Operation
+            + "', argument='"
+            + workItem.Argument
+            + "', reason='"
+            + workItem.Reason
+            + "'."
+          );
+
+          object value = this.FetchFromSource(workItem);
+
+          if (string.Equals(workItem.Operation, "children", StringComparison.Ordinal)) {
+            string[] sourceChildren = value as string[];
+
+            if (sourceChildren == null) {
+              sourceChildren = Array.Empty<string>();
+            }
+
+            DevLogger.LogTrace(
+              0,
+              99999,
+              "STRUCTURE-DIAG source returned children: parent='"
+              + workItem.Argument
+              + "', count="
+              + sourceChildren.Length.ToString()
+              + ", children="
+              + this.FormatDiagnosticAreas(sourceChildren)
+              + "."
+            );
+          }
+
+          // A synchronous source call cannot be interrupted through the repository contract.
+          // If cancellation arrived while it was running, the completed result is still
+          // committed so the next heartbeat does not repeat already completed source work.
+          lock (_SyncRoot) {
+            this.WriteCacheValue(
+              workItem.Operation,
+              workItem.Argument,
+              value
+            );
+
+            if (string.Equals(workItem.Operation, "children", StringComparison.Ordinal)) {
+              string[] currentChildren = value as string[];
+
+              if (currentChildren == null) {
+                currentChildren = Array.Empty<string>();
+              }
+
+              this.ProcessChildrenTransition(
+                workItem.Argument,
+                previousChildren,
+                currentChildren
+              );
+            }
+          }
+
+          DevLogger.LogTrace(
+            0,
+            99999,
+            "Background knowledge cache fetch completed: operation='"
+            + workItem.Operation
+            + "', argument='"
+            + workItem.Argument
+            + "', reason='"
+            + workItem.Reason
+            + "'."
+          );
+
+          return true;
+        }
+        catch (InvalidOperationException ex) when (
+          this.IsMissingAggregatedKnowledgeAreaException(ex, workItem.Argument)
+        ) {
+          lock (_SyncRoot) {
+            this.HealOrphanedArea(workItem.Argument);
+          }
+
+          DevLogger.LogTrace(
+            0,
+            99999,
+            "Background knowledge cache completed orphan cleanup instead of fetch: operation='"
+            + workItem.Operation
+            + "', argument='"
+            + workItem.Argument
+            + "', reason='authoritative aggregated repository no longer exposes the cached area'."
+          );
+
+          return true;
+        }
+        catch (HttpRequestException ex) when (
+          ex.StatusCode == HttpStatusCode.TooManyRequests
+        ) {
+          DevLogger.LogError(ex);
+
+          lock (_SyncRoot) {
+            this.EnqueuePriorityWork(
+              workItem.Operation,
+              workItem.Argument,
+              "previous background fetch received HTTP 429 Too Many Requests",
+              workItem.ForceRefresh
+            );
+          }
+
+          DevLogger.LogTrace(
+            0,
+            99999,
+            "Background knowledge cache deferred throttled fetch to a later heartbeat: operation='"
+            + workItem.Operation
+            + "', argument='"
+            + workItem.Argument
+            + "'."
+          );
+
+          return false;
+        }
+      }
+      finally {
+        Monitor.Exit(_PrefetchSyncRoot);
       }
     }
 
@@ -678,6 +841,16 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
 
       if (this.TryReadCacheValue(operation, argument, out entry, out value)) {
         TimeSpan age = utcNow - entry.CreatedUtc;
+
+        if (string.Equals(operation, "children", StringComparison.Ordinal)) {
+          object cachedValue = value;
+          string[] cachedChildren = cachedValue as string[];
+          if (cachedChildren == null) {
+            cachedChildren = Array.Empty<string>();
+          }
+
+          DevLogger.LogTrace(0, 99999, "STRUCTURE-DIAG cache read children: parent='" + argument + "', createdUtc='" + entry.CreatedUtc.ToString("O") + "', ageSeconds=" + ((long)age.TotalSeconds).ToString() + ", count=" + cachedChildren.Length.ToString() + ", children=" + this.FormatDiagnosticAreas(cachedChildren) + ".");
+        }
         if (!this.IsFresh(entry.CreatedUtc, utcNow)) {
           DevLogger.LogTrace(0, 99999, "Background knowledge cache answered from stale cache: operation='" + operation + "', argument='" + argument + "', ageSeconds=" + ((long)age.TotalSeconds).ToString() + ", lifetimeSeconds=" + ((long)_Lifetime.TotalSeconds).ToString() + ". Queuing refresh.");
           this.EnqueuePriorityWork(operation, argument, "stale cache value was served");
@@ -695,23 +868,147 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
 
     /// <summary>
     /// Adds one source operation to the high-priority queue without creating duplicates.
+    ///
+    /// Re-requesting an already queued operation is treated as renewed consumer interest and
+    /// therefore promotes that work item to the front of the priority queue.
     /// </summary>
     private void EnqueuePriorityWork(string operation, string argument) {
-      this.EnqueuePriorityWork(operation, argument, "explicit dependency request");
+      this.EnqueuePriorityWork(
+        operation,
+        argument,
+        "explicit dependency request",
+        false
+      );
     }
 
     /// <summary>
     /// Adds one source operation to the high-priority queue and records why it was queued.
+    ///
+    /// Re-requesting an already queued operation promotes it to the front so interactive
+    /// navigation can overtake unrelated older background demand.
     /// </summary>
-    private void EnqueuePriorityWork(string operation, string argument, string reason) {
-      FetchWorkItem workItem = new FetchWorkItem(operation, argument, reason);
-      if (_QueuedWorkKeys.Add(workItem.Key)) {
-        _PriorityQueue.Enqueue(workItem);
-        DevLogger.LogTrace(0, 99999, "Background knowledge cache queued priority fetch: operation='" + operation + "', argument='" + argument + "', reason='" + reason + "', priorityQueueLength=" + _PriorityQueue.Count.ToString() + ".");
+    private void EnqueuePriorityWork(
+      string operation,
+      string argument,
+      string reason
+    ) {
+      this.EnqueuePriorityWork(
+        operation,
+        argument,
+        reason,
+        false
+      );
+    }
+
+    /// <summary>
+    /// Adds one source operation to the high-priority queue.
+    ///
+    /// The queue remains duplicate-free. If the same logical operation is already queued,
+    /// the existing entry is removed and the merged work item is inserted at the front.
+    /// Force-refresh semantics are preserved when either the existing or the new request
+    /// requires them.
+    ///
+    /// This promotion behavior is intentional: every repeated request indicates current
+    /// consumer interest and must be able to move the corresponding work ahead of unrelated
+    /// queued work.
+    /// </summary>
+    private void EnqueuePriorityWork(
+      string operation,
+      string argument,
+      string reason,
+      bool forceRefresh
+    ) {
+      FetchWorkItem requestedItem = new FetchWorkItem(
+        operation,
+        argument,
+        reason,
+        forceRefresh
+      );
+
+      if (_QueuedWorkKeys.Add(requestedItem.Key)) {
+        _PriorityQueue.Enqueue(
+          requestedItem
+        );
+
+        DevLogger.LogTrace(
+          0,
+          99999,
+          "Background knowledge cache queued priority fetch: operation='"
+          + operation
+          + "', argument='"
+          + argument
+          + "', reason='"
+          + reason
+          + "', forceRefresh="
+          + forceRefresh.ToString()
+          + ", priorityQueueLength="
+          + _PriorityQueue.Count.ToString()
+          + "."
+        );
+
+        return;
       }
-      else {
-        DevLogger.LogTrace(0, 99999, "Background knowledge cache priority fetch already queued: operation='" + operation + "', argument='" + argument + "', additionalReason='" + reason + "'.");
+
+      Queue<FetchWorkItem> retainedItems = new Queue<FetchWorkItem>();
+      FetchWorkItem existingItem = null;
+
+      while (_PriorityQueue.Count > 0) {
+        FetchWorkItem queuedItem = _PriorityQueue.Dequeue();
+
+        if (existingItem == null &&
+            string.Equals(
+              queuedItem.Key,
+              requestedItem.Key,
+              StringComparison.Ordinal
+            )) {
+          existingItem = queuedItem;
+          continue;
+        }
+
+        retainedItems.Enqueue(
+          queuedItem
+        );
       }
+
+      bool effectiveForceRefresh = forceRefresh;
+
+      if (existingItem != null &&
+          existingItem.ForceRefresh) {
+        effectiveForceRefresh = true;
+      }
+
+      FetchWorkItem promotedItem = new FetchWorkItem(
+        operation,
+        argument,
+        reason,
+        effectiveForceRefresh
+      );
+
+      _PriorityQueue.Enqueue(
+        promotedItem
+      );
+
+      while (retainedItems.Count > 0) {
+        _PriorityQueue.Enqueue(
+          retainedItems.Dequeue()
+        );
+      }
+
+      DevLogger.LogTrace(
+        0,
+        99999,
+        "Background knowledge cache promoted already queued priority fetch to front: operation='"
+        + operation
+        + "', argument='"
+        + argument
+        + "', reason='"
+        + reason
+        + "', forceRefresh="
+        + effectiveForceRefresh.ToString()
+        + ", priorityQueueLength="
+        + _PriorityQueue.Count.ToString()
+        + "."
+      );
     }
 
     /// <summary>
@@ -724,19 +1021,24 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     }
 
     /// <summary>
-    /// Removes the next still-relevant high-priority work item.
+    /// Removes the oldest still-relevant explicitly requested work item.
+    ///
+    /// The priority queue represents consumer demand and therefore always wins over
+    /// autonomous background discovery. Its insertion order is preserved deliberately:
+    /// navigating into a branch queues exactly the values the consumer is waiting for and
+    /// those requests must not be reordered behind unrelated autonomous structural work.
     /// </summary>
     private bool TryDequeuePriorityWork(out FetchWorkItem workItem) {
       while (_PriorityQueue.Count > 0) {
         FetchWorkItem candidate = _PriorityQueue.Dequeue();
         _QueuedWorkKeys.Remove(candidate.Key);
 
-        PersistentCacheEntry entry;
-        if (!this.TryReadCacheEntry(candidate.Operation, candidate.Argument, out entry) ||
-            !this.IsFresh(entry.CreatedUtc, DateTime.UtcNow)) {
-          workItem = candidate;
-          return true;
+        if (!this.IsPriorityWorkStillRelevant(candidate)) {
+          continue;
         }
+
+        workItem = candidate;
+        return true;
       }
 
       workItem = null;
@@ -744,62 +1046,110 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     }
 
     /// <summary>
-    /// Finds the next background operation by first completing missing values breadth-first
-    /// and then selecting the oldest expired cache entry.
+    /// Determines whether a queued cache refresh is still required.
     /// </summary>
-    private FetchWorkItem FindNextBackgroundWorkItem() {
-      FetchWorkItem missing = this.FindNextMissingBreadthFirst();
-      if (missing != null) {
-        return missing;
+    private bool IsPriorityWorkStillRelevant(
+      FetchWorkItem workItem
+    ) {
+      if (workItem.ForceRefresh) {
+        return true;
+      }
+      PersistentCacheEntry entry;
+
+      if (!this.TryReadCacheEntry(
+            workItem.Operation,
+            workItem.Argument,
+            out entry
+          )) {
+        return true;
       }
 
-      return this.FindOldestExpiredWorkItem();
+      return !this.IsFresh(
+        entry.CreatedUtc,
+        DateTime.UtcNow
+      );
     }
 
     /// <summary>
-    /// Finds the first missing operation while traversing known areas breadth-first.
+    /// Finds exactly one autonomous background work item.
+    ///
+    /// Autonomous prefetching is intentionally split into two phases:
+    ///
+    /// 1. Complete the visible repository structure breadth-first using only names,
+    ///    capabilities and direct-child enumerations.
+    /// 2. After the known structure is complete, fill content deepest-first so leaf content
+    ///    becomes available before broader parent projections.
+    ///
+    /// Aggregated content is deliberately not prefetched autonomously. It is an explicit
+    /// subtree operation and is fetched only when a consumer actually requests it, in which
+    /// case the normal priority queue moves that request ahead of autonomous work.
     /// </summary>
-    private FetchWorkItem FindNextMissingBreadthFirst() {
+    private FetchWorkItem FindNextBackgroundWorkItem() {
+      FetchWorkItem missingStructure = this.FindNextMissingStructureBreadthFirst();
+      if (missingStructure != null) {
+        return missingStructure;
+      }
+
+      FetchWorkItem missingContent = this.FindNextMissingContentDeepestFirst();
+      if (missingContent != null) {
+        return missingContent;
+      }
+
+      FetchWorkItem missingResource = this.FindMissingResourceContentWorkItem();
+      if (missingResource != null) {
+        return missingResource;
+      }
+
+      FetchWorkItem expiredStructure = this.FindOldestExpiredStructuralWorkItem();
+      if (expiredStructure != null) {
+        return expiredStructure;
+      }
+
+      return this.FindOldestExpiredContentWorkItem();
+    }
+
+    /// <summary>
+    /// Finds one missing structural operation while traversing the locally known tree
+    /// breadth-first.
+    ///
+    /// This phase never requests textual content or resources. Its only purpose is to make
+    /// the complete navigable structure available as quickly as possible.
+    /// </summary>
+    private FetchWorkItem FindNextMissingStructureBreadthFirst() {
       Queue<string> pendingAreas = new Queue<string>();
       HashSet<string> visitedAreas = new HashSet<string>(StringComparer.Ordinal);
+
       pendingAreas.Enqueue("/");
 
       while (pendingAreas.Count > 0) {
         string area = pendingAreas.Dequeue();
+
         if (!visitedAreas.Add(area)) {
           continue;
         }
 
-        string[] basicOperations = new string[] {
-          "children",
-          "capabilities",
-          "name",
-          "has-direct-content"
-        };
-
-        foreach (string operation in basicOperations) {
-          if (!this.HasCacheEntry(operation, area)) {
-            return new FetchWorkItem(operation, area, "missing breadth-first cache entry");
-          }
+        if (!this.HasCacheEntry("name", area)) {
+          return new FetchWorkItem(
+            "name",
+            area,
+            "missing breadth-first structural name"
+          );
         }
 
-        CachedCapabilities capabilities;
-        if (this.TryReadCachedPayloadOnly("capabilities", area, out capabilities)) {
-          // Resource metadata is fetched before textual content. This keeps the externally
-          // visible cache projection consistent when content contains knowledge-resource
-          // references.
-          if (capabilities.SupportsResources && !this.HasCacheEntry("resources", area)) {
-            return new FetchWorkItem("resources", area, "missing resource metadata before content prefetch");
-          }
+        if (!this.HasCacheEntry("capabilities", area)) {
+          return new FetchWorkItem(
+            "capabilities",
+            area,
+            "missing breadth-first structural capabilities"
+          );
+        }
 
-          if (capabilities.ContentLevel != ContentLevel.BeyondContent) {
-            if (!this.HasCacheEntry("direct-content", area)) {
-              return new FetchWorkItem("direct-content", area, "missing breadth-first direct content");
-            }
-            if (!this.HasCacheEntry("aggregated-content", area)) {
-              return new FetchWorkItem("aggregated-content", area, "missing breadth-first aggregated content");
-            }
-          }
+        if (!this.HasCacheEntry("children", area)) {
+          return new FetchWorkItem(
+            "children",
+            area,
+            "missing breadth-first structural children"
+          );
         }
 
         string[] children;
@@ -810,12 +1160,109 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         }
       }
 
-      FetchWorkItem missingResource = this.FindMissingResourceContentWorkItem();
-      if (missingResource != null) {
-        return missingResource;
+      return null;
+    }
+
+    /// <summary>
+    /// Finds one missing content operation after structural discovery has completed.
+    ///
+    /// Areas are processed deepest-first. This makes leaf content available before parent
+    /// content and avoids using aggregated-content as an implicit recursive discovery
+    /// mechanism.
+    /// </summary>
+    private FetchWorkItem FindNextMissingContentDeepestFirst() {
+      string[] knownAreas = this.GetKnownAreasOrderedByDescendingDepth();
+
+      foreach (string area in knownAreas) {
+        CachedCapabilities capabilities;
+
+        if (!this.TryReadCachedPayloadOnly(
+              "capabilities",
+              area,
+              out capabilities
+            )) {
+          continue;
+        }
+
+        if (capabilities.ContentLevel == ContentLevel.BeyondContent) {
+          continue;
+        }
+
+        if (capabilities.SupportsResources &&
+            !this.HasCacheEntry("resources", area)) {
+          return new FetchWorkItem(
+            "resources",
+            area,
+            "missing deepest-first resource metadata"
+          );
+        }
+
+        if (!this.HasCacheEntry("has-direct-content", area)) {
+          return new FetchWorkItem(
+            "has-direct-content",
+            area,
+            "missing deepest-first direct-content state"
+          );
+        }
+
+        if (!this.HasCacheEntry("direct-content", area)) {
+          return new FetchWorkItem(
+            "direct-content",
+            area,
+            "missing deepest-first direct content"
+          );
+        }
       }
 
       return null;
+    }
+
+    /// <summary>
+    /// Returns every locally known area ordered from deepest to shallowest.
+    ///
+    /// Only cached child enumerations are inspected. This method never calls the wrapped
+    /// source and therefore cannot accidentally turn scheduling into a recursive fetch.
+    /// </summary>
+    private string[] GetKnownAreasOrderedByDescendingDepth() {
+      Queue<string> pendingAreas = new Queue<string>();
+      HashSet<string> visitedAreas = new HashSet<string>(StringComparer.Ordinal);
+      List<string> areas = new List<string>();
+
+      pendingAreas.Enqueue("/");
+
+      while (pendingAreas.Count > 0) {
+        string area = pendingAreas.Dequeue();
+
+        if (!visitedAreas.Add(area)) {
+          continue;
+        }
+
+        areas.Add(area);
+
+        string[] children;
+        if (this.TryReadCachedPayloadOnly("children", area, out children)) {
+          foreach (string child in children) {
+            pendingAreas.Enqueue(child);
+          }
+        }
+      }
+
+      return areas
+        .OrderByDescending((string area) => this.GetAreaDepth(area))
+        .ThenBy((string area) => area, StringComparer.Ordinal)
+        .ToArray();
+    }
+
+    /// <summary>
+    /// Returns the logical path depth of one absolute knowledge area.
+    /// </summary>
+    private int GetAreaDepth(string area) {
+      if (string.IsNullOrWhiteSpace(area) ||
+          string.Equals(area, "/", StringComparison.Ordinal)) {
+        return 0;
+      }
+
+      return area.Count((char character) => character == '/');
     }
 
     /// <summary>
@@ -852,15 +1299,18 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     }
 
     /// <summary>
-    /// Finds the oldest expired persisted operation.
+    /// Finds the oldest expired structural cache entry.
+    ///
+    /// Structural refresh remains ahead of autonomous content refresh so externally changed
+    /// trees are rediscovered before old content is refreshed.
     /// </summary>
-    private FetchWorkItem FindOldestExpiredWorkItem() {
+    private FetchWorkItem FindOldestExpiredStructuralWorkItem() {
       DateTime utcNow = DateTime.UtcNow;
       PersistentCacheEntry[] entries = this.ReadAllPersistentEntries();
       PersistentCacheEntry oldest = null;
 
       foreach (PersistentCacheEntry entry in entries) {
-        if (string.Equals(entry.Operation, "search", StringComparison.Ordinal)) {
+        if (!this.IsStructuralOperation(entry.Operation)) {
           continue;
         }
 
@@ -868,7 +1318,8 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
           continue;
         }
 
-        if (oldest == null || entry.CreatedUtc < oldest.CreatedUtc) {
+        if (oldest == null ||
+            entry.CreatedUtc < oldest.CreatedUtc) {
           oldest = entry;
         }
       }
@@ -877,7 +1328,75 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         return null;
       }
 
-      return new FetchWorkItem(oldest.Operation, oldest.Argument, "oldest expired cache entry");
+      return new FetchWorkItem(
+        oldest.Operation,
+        oldest.Argument,
+        "oldest expired structural cache entry"
+      );
+    }
+
+    /// <summary>
+    /// Finds one expired autonomous content entry, preferring deeper areas over shallower
+    /// areas.
+    ///
+    /// Aggregated content is excluded deliberately. A stale aggregated-content entry is
+    /// refreshed only after a consumer requests it and thereby places it in the priority
+    /// queue.
+    /// </summary>
+    private FetchWorkItem FindOldestExpiredContentWorkItem() {
+      DateTime utcNow = DateTime.UtcNow;
+      PersistentCacheEntry[] entries = this.ReadAllPersistentEntries();
+
+      PersistentCacheEntry[] candidates = entries
+        .Where(
+          (PersistentCacheEntry entry) =>
+            this.IsAutonomousContentOperation(entry.Operation) &&
+            !this.IsFresh(entry.CreatedUtc, utcNow)
+        )
+        .OrderByDescending(
+          (PersistentCacheEntry entry) => this.GetAreaDepth(entry.Argument)
+        )
+        .ThenBy(
+          (PersistentCacheEntry entry) => entry.CreatedUtc
+        )
+        .ToArray();
+
+      if (candidates.Length == 0) {
+        return null;
+      }
+
+      PersistentCacheEntry selected = candidates[0];
+
+      return new FetchWorkItem(
+        selected.Operation,
+        selected.Argument,
+        "expired deepest-first content cache entry"
+      );
+    }
+
+    /// <summary>
+    /// Determines whether an operation belongs to autonomous structural discovery.
+    /// </summary>
+    private bool IsStructuralOperation(string operation) {
+      return
+        string.Equals(operation, "name", StringComparison.Ordinal) ||
+        string.Equals(operation, "capabilities", StringComparison.Ordinal) ||
+        string.Equals(operation, "children", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Determines whether an operation may be refreshed autonomously during the content
+    /// phase.
+    ///
+    /// Aggregated content is intentionally absent because it can represent an arbitrarily
+    /// large explicit subtree operation.
+    /// </summary>
+    private bool IsAutonomousContentOperation(string operation) {
+      return
+        string.Equals(operation, "has-direct-content", StringComparison.Ordinal) ||
+        string.Equals(operation, "direct-content", StringComparison.Ordinal) ||
+        string.Equals(operation, "resources", StringComparison.Ordinal) ||
+        string.Equals(operation, "resource-content", StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -963,6 +1482,7 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     /// Reads one typed value from memory or persistent storage without queue side effects.
     /// </summary>
     private bool TryReadCacheValue<T>(string operation, string argument, out PersistentCacheEntry entry, out T value) {
+      this.EnsureMemoryCacheGenerationIsCurrent();
       string cacheKey = this.CreateCacheKey(operation, argument);
       MemoryCacheEntry memoryEntry;
 
@@ -997,6 +1517,7 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     /// Reads one cache envelope without deserializing its payload.
     /// </summary>
     private bool TryReadCacheEntry(string operation, string argument, out PersistentCacheEntry entry) {
+      this.EnsureMemoryCacheGenerationIsCurrent();
       string cacheKey = this.CreateCacheKey(operation, argument);
       MemoryCacheEntry memoryEntry;
       if (_MemoryCache.TryGetValue(cacheKey, out memoryEntry)) {
@@ -1035,9 +1556,12 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       string file = this.GetCacheFilePath(cacheKey);
       string temporaryFile = file + "." + Guid.NewGuid().ToString("N") + ".tmp";
 
+      bool persisted = false;
+
       try {
         File.WriteAllText(temporaryFile, JsonConvert.SerializeObject(entry, Formatting.None), Encoding.UTF8);
         File.Move(temporaryFile, file, true);
+        persisted = true;
       }
       catch (IOException ex) {
         DevLogger.LogError(ex);
@@ -1048,7 +1572,31 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         this.TryDeleteFile(temporaryFile);
       }
 
+      if (persisted) {
+        this.AdvanceCacheGeneration();
+      }
+
       this.StoreMemoryValue(cacheKey, entry.CreatedUtc, value);
+
+      if (string.Equals(operation, "children", StringComparison.Ordinal)) {
+        string[] writtenChildren = value as string[];
+        if (writtenChildren == null) {
+          writtenChildren = Array.Empty<string>();
+        }
+
+        DevLogger.LogTrace(0, 99999, "STRUCTURE-DIAG cache wrote children: parent='" + argument + "', createdUtc='" + entry.CreatedUtc.ToString("O") + "', count=" + writtenChildren.Length.ToString() + ", children=" + this.FormatDiagnosticAreas(writtenChildren) + ".");
+      }
+    }
+
+    /// <summary>
+    /// Formats logical areas for compact structure diagnostics.
+    /// </summary>
+    private string FormatDiagnosticAreas(string[] areas) {
+      if (areas == null || areas.Length == 0) {
+        return "[]";
+      }
+
+      return "[" + string.Join(", ", areas.Select((string area) => "'" + area + "'").ToArray()) + "]";
     }
 
     /// <summary>
@@ -1125,6 +1673,105 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       }
 
       return result.ToArray();
+    }
+
+    /// <summary>
+    /// Processes a freshly fetched direct-child enumeration and reconciles structural
+    /// changes with the rest of the local cache.
+    ///
+    /// Newly discovered children are deliberately not expanded into priority work here.
+    /// The autonomous structure phase will discover their name, capabilities and children
+    /// breadth-first on subsequent heartbeats. This keeps the priority queue reserved for
+    /// real consumer demand and prevents a wide node from generating hundreds of content
+    /// work items at once.
+    /// </summary>
+    private void ProcessChildrenTransition(
+      string parentArea,
+      string[] previousChildren,
+      string[] currentChildren
+    ) {
+      string[] previous = previousChildren;
+      if (previous == null) {
+        previous = Array.Empty<string>();
+      }
+
+      string[] current = currentChildren;
+      if (current == null) {
+        current = Array.Empty<string>();
+      }
+
+      HashSet<string> previousSet = new HashSet<string>(
+        previous,
+        StringComparer.Ordinal
+      );
+
+      HashSet<string> currentSet = new HashSet<string>(
+        current,
+        StringComparer.Ordinal
+      );
+
+      string[] addedChildren = current
+        .Where((string child) => !previousSet.Contains(child))
+        .ToArray();
+
+      string[] removedChildren = previous
+        .Where((string child) => !currentSet.Contains(child))
+        .ToArray();
+
+      foreach (string removedChild in removedChildren) {
+        DevLogger.LogTrace(
+          0,
+          99999,
+          "Background knowledge cache detected removed child: parent='"
+          + parentArea
+          + "', child='"
+          + removedChild
+          + "', action='remove cached subtree'."
+        );
+
+        this.HealOrphanedArea(
+          removedChild
+        );
+      }
+
+      if (addedChildren.Length > 0 || removedChildren.Length > 0) {
+        this.EnqueuePriorityWork(
+          "capabilities",
+          parentArea,
+          "parent structure changed and structural capabilities must be refreshed",
+          true
+        );
+      }
+
+      foreach (string addedChild in addedChildren) {
+        DevLogger.LogTrace(
+          0,
+          99999,
+          "Background knowledge cache discovered new child: parent='"
+          + parentArea
+          + "', child='"
+          + addedChild
+          + "', action='leave discovery to breadth-first structure phase'."
+        );
+      }
+
+      if (addedChildren.Length > 0 || removedChildren.Length > 0) {
+        DevLogger.LogTrace(
+          0,
+          99999,
+          "Background knowledge cache applied children transition: parent='"
+          + parentArea
+          + "', previousCount="
+          + previous.Length.ToString()
+          + ", currentCount="
+          + current.Length.ToString()
+          + ", addedCount="
+          + addedChildren.Length.ToString()
+          + ", removedCount="
+          + removedChildren.Length.ToString()
+          + "."
+        );
+      }
     }
 
     /// <summary>
@@ -1317,6 +1964,7 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
 
       string file = this.GetCacheFilePath(cacheKey);
       this.TryDeleteFile(file);
+      this.AdvanceCacheGeneration();
     }
 
     /// <summary>
@@ -1377,7 +2025,133 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
           this.TryDeleteFile(file);
         }
 
+        this.AdvanceCacheGeneration();
         this.EnqueuePriorityWork("children", "/", "authoritative mutation invalidated the cache");
+      }
+    }
+
+    /// <summary>
+    /// Ensures that the process-local memory cache belongs to the current persistent cache
+    /// generation. Another wrapper instance can advance the generation after writing cache
+    /// entries, in which case this instance discards only its process-local values and starts
+    /// reading the shared persistent cache again.
+    /// </summary>
+    private void EnsureMemoryCacheGenerationIsCurrent() {
+      string currentGeneration = this.ReadCacheGeneration();
+
+      if (string.IsNullOrEmpty(currentGeneration)) {
+        currentGeneration = this.GetOrCreateCacheGeneration();
+      }
+
+      if (string.Equals(currentGeneration, _KnownCacheGeneration, StringComparison.Ordinal)) {
+        return;
+      }
+
+      int discardedEntryCount = _MemoryCache.Count;
+      _MemoryCache.Clear();
+      _KnownCacheGeneration = currentGeneration;
+
+      DevLogger.LogTrace(
+        0,
+        99999,
+        "Background knowledge cache detected a persistent cache generation change. "
+        + "Discarded process-local cache entries=" + discardedEntryCount.ToString()
+        + ", generation='" + currentGeneration + "'."
+      );
+    }
+
+    /// <summary>
+    /// Reads the current persistent cache generation token.
+    /// </summary>
+    private string ReadCacheGeneration() {
+      try {
+        if (!File.Exists(_CacheGenerationFile)) {
+          return string.Empty;
+        }
+
+        return File.ReadAllText(_CacheGenerationFile, Encoding.UTF8).Trim();
+      }
+      catch (IOException ex) {
+        DevLogger.LogError(ex);
+        return string.Empty;
+      }
+      catch (UnauthorizedAccessException ex) {
+        DevLogger.LogError(ex);
+        return string.Empty;
+      }
+    }
+
+    /// <summary>
+    /// Returns the existing persistent cache generation or creates the initial generation
+    /// token when this cache directory has not been used by a generation-aware wrapper yet.
+    /// </summary>
+    private string GetOrCreateCacheGeneration() {
+      string existingGeneration = this.ReadCacheGeneration();
+      if (!string.IsNullOrEmpty(existingGeneration)) {
+        return existingGeneration;
+      }
+
+      string newGeneration = Guid.NewGuid().ToString("N");
+
+      try {
+        using (FileStream stream = new FileStream(
+          _CacheGenerationFile,
+          FileMode.CreateNew,
+          FileAccess.Write,
+          FileShare.Read
+        )) {
+          byte[] bytes = Encoding.UTF8.GetBytes(newGeneration);
+          stream.Write(bytes, 0, bytes.Length);
+          stream.Flush(true);
+        }
+
+        return newGeneration;
+      }
+      catch (IOException ex) {
+        DevLogger.LogError(ex);
+
+        string concurrentGeneration = this.ReadCacheGeneration();
+        if (!string.IsNullOrEmpty(concurrentGeneration)) {
+          return concurrentGeneration;
+        }
+
+        return newGeneration;
+      }
+      catch (UnauthorizedAccessException ex) {
+        DevLogger.LogError(ex);
+        return newGeneration;
+      }
+    }
+
+    /// <summary>
+    /// Advances the shared persistent cache generation after this wrapper has changed the
+    /// persistent cache. The generation file is replaced atomically and remains constant in
+    /// size, so cache coherence does not create a history or grow the cache.
+    /// </summary>
+    private void AdvanceCacheGeneration() {
+      string newGeneration = Guid.NewGuid().ToString("N");
+      string temporaryFile = _CacheGenerationFile + "." + Guid.NewGuid().ToString("N") + ".tmp";
+
+      try {
+        File.WriteAllText(temporaryFile, newGeneration, Encoding.UTF8);
+        File.Move(temporaryFile, _CacheGenerationFile, true);
+        _KnownCacheGeneration = newGeneration;
+
+        DevLogger.LogTrace(
+          0,
+          99999,
+          "Background knowledge cache advanced persistent cache generation to '"
+          + newGeneration
+          + "'."
+        );
+      }
+      catch (IOException ex) {
+        DevLogger.LogError(ex);
+        this.TryDeleteFile(temporaryFile);
+      }
+      catch (UnauthorizedAccessException ex) {
+        DevLogger.LogError(ex);
+        this.TryDeleteFile(temporaryFile);
       }
     }
 
@@ -1461,20 +2235,29 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       private readonly string _Operation;
       private readonly string _Argument;
       private readonly string _Reason;
+      private readonly bool _ForceRefresh;
 
       /// <summary>
       /// Creates one immutable work item.
       /// </summary>
-      public FetchWorkItem(string operation, string argument) : this(operation, argument, "unspecified") {
+      public FetchWorkItem(string operation, string argument) : this(operation, argument, "unspecified", false) {
       }
 
       /// <summary>
       /// Creates one immutable work item with diagnostic scheduling context.
       /// </summary>
-      public FetchWorkItem(string operation, string argument, string reason) {
+      public FetchWorkItem(string operation, string argument, string reason) : this(operation, argument, reason, false) {
+      }
+
+      /// <summary>
+      /// Creates one immutable work item with diagnostic scheduling context and an optional
+      /// forced-refresh flag.
+      /// </summary>
+      public FetchWorkItem(string operation, string argument, string reason, bool forceRefresh) {
         _Operation = operation;
         _Argument = argument;
         _Reason = reason;
+        _ForceRefresh = forceRefresh;
       }
 
       /// <summary>
@@ -1502,6 +2285,15 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       public string Reason {
         get {
           return _Reason;
+        }
+      }
+
+      /// <summary>
+      /// Gets whether this work item must bypass normal cache-freshness suppression.
+      /// </summary>
+      public bool ForceRefresh {
+        get {
+          return _ForceRefresh;
         }
       }
 

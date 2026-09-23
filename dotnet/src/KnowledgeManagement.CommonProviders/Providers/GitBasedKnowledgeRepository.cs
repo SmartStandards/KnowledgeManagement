@@ -481,7 +481,7 @@ namespace KnowledgeManagement.SmartStandards.Providers {
             Signature signature = this.CreateCommitSignature();
 
             _Repository.Commit(
-              operationDescription,
+              operationDescription + " [skip ci]",
               signature,
               signature
             );
