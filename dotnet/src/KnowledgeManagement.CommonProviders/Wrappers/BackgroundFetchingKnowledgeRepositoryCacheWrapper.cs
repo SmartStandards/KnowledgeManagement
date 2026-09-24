@@ -33,6 +33,7 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     private const string _CacheGenerationFileName = ".generation";
     private const string _KnowledgeResourceReferencePrefix = "knowledge-resource:";
 
+
     private readonly object _SyncRoot;
     private readonly object _PrefetchSyncRoot;
     private readonly IKnowledgeRepository _WrappedSource;
@@ -445,14 +446,24 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     /// otherwise false.
     /// </returns>
     public bool PrefetchNext(CancellationToken cancellationToken) {
+      DevLogger.LogTrace(
+        7421903804101L,
+        75200,
+        "Background knowledge cache PrefetchNext entered. priorityQueueLength="
+        + this.GetPriorityQueueLength().ToString()
+        + ", cancellationRequested="
+        + cancellationToken.IsCancellationRequested.ToString()
+        + "."
+      );
+
       if (cancellationToken.IsCancellationRequested) {
         return false;
       }
 
       if (!Monitor.TryEnter(_PrefetchSyncRoot)) {
         DevLogger.LogTrace(
-          0,
-          99999,
+          7421903804102L,
+          75201,
           "Background knowledge cache skipped heartbeat because another PrefetchNext invocation is still active."
         );
 
@@ -467,12 +478,37 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         FetchWorkItem workItem;
 
         lock (_SyncRoot) {
-          if (!this.TryDequeuePriorityWork(out workItem)) {
+          if (this.TryDequeuePriorityWork(out workItem)) {
+            DevLogger.LogTrace(
+              7421903804103L,
+              75202,
+              "Background knowledge cache selected work from priority queue: operation='"
+              + workItem.Operation
+              + "', argument='"
+              + workItem.Argument
+              + "', remainingPriorityQueueLength="
+              + _PriorityQueue.Count.ToString()
+              + "."
+            );
+          }
+          else {
+            DevLogger.LogTrace(
+              7421903804104L,
+              75203,
+              "Background knowledge cache priority queue contains no relevant work. Starting autonomous scheduler."
+            );
+
             workItem = this.FindNextBackgroundWorkItem();
           }
         }
 
         if (workItem == null) {
+          DevLogger.LogTrace(
+            7421903804116L,
+            75215,
+            "Background knowledge cache PrefetchNext found no work item and returns without source access."
+          );
+
           return false;
         }
 
@@ -1054,6 +1090,7 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       if (workItem.ForceRefresh) {
         return true;
       }
+
       PersistentCacheEntry entry;
 
       if (!this.TryReadCacheEntry(
@@ -1085,27 +1122,130 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     /// case the normal priority queue moves that request ahead of autonomous work.
     /// </summary>
     private FetchWorkItem FindNextBackgroundWorkItem() {
+      DateTime schedulerStartedUtc = DateTime.UtcNow;
+
+      DevLogger.LogTrace(
+        7421903804105L,
+        75204,
+        "Background knowledge cache autonomous scheduler entered."
+      );
+
       FetchWorkItem missingStructure = this.FindNextMissingStructureBreadthFirst();
       if (missingStructure != null) {
+        DevLogger.LogTrace(
+          7421903804107L,
+          75206,
+          "Background knowledge cache autonomous scheduler selected missing structure: operation='"
+          + missingStructure.Operation
+          + "', argument='"
+          + missingStructure.Argument
+          + "', elapsedMilliseconds="
+          + ((long)(DateTime.UtcNow - schedulerStartedUtc).TotalMilliseconds).ToString()
+          + "."
+        );
+
         return missingStructure;
       }
 
+      DevLogger.LogTrace(
+        7421903804106L,
+        75205,
+        "Background knowledge cache autonomous scheduler found no missing structural work."
+      );
+
       FetchWorkItem missingContent = this.FindNextMissingContentDeepestFirst();
       if (missingContent != null) {
+        DevLogger.LogTrace(
+          7421903804109L,
+          75208,
+          "Background knowledge cache autonomous scheduler selected missing content: operation='"
+          + missingContent.Operation
+          + "', argument='"
+          + missingContent.Argument
+          + "', elapsedMilliseconds="
+          + ((long)(DateTime.UtcNow - schedulerStartedUtc).TotalMilliseconds).ToString()
+          + "."
+        );
+
         return missingContent;
       }
 
+      DevLogger.LogTrace(
+        7421903804108L,
+        75207,
+        "Background knowledge cache autonomous scheduler found no missing content work."
+      );
+
       FetchWorkItem missingResource = this.FindMissingResourceContentWorkItem();
       if (missingResource != null) {
+        DevLogger.LogTrace(
+          7421903804111L,
+          75210,
+          "Background knowledge cache autonomous scheduler selected missing resource binary: argument='"
+          + missingResource.Argument
+          + "', elapsedMilliseconds="
+          + ((long)(DateTime.UtcNow - schedulerStartedUtc).TotalMilliseconds).ToString()
+          + "."
+        );
+
         return missingResource;
       }
 
+      DevLogger.LogTrace(
+        7421903804110L,
+        75209,
+        "Background knowledge cache autonomous scheduler found no missing resource binary work."
+      );
+
       FetchWorkItem expiredStructure = this.FindOldestExpiredStructuralWorkItem();
       if (expiredStructure != null) {
+        DevLogger.LogTrace(
+          7421903804113L,
+          75212,
+          "Background knowledge cache autonomous scheduler selected expired structure: operation='"
+          + expiredStructure.Operation
+          + "', argument='"
+          + expiredStructure.Argument
+          + "', elapsedMilliseconds="
+          + ((long)(DateTime.UtcNow - schedulerStartedUtc).TotalMilliseconds).ToString()
+          + "."
+        );
+
         return expiredStructure;
       }
 
-      return this.FindOldestExpiredContentWorkItem();
+      DevLogger.LogTrace(
+        7421903804112L,
+        75211,
+        "Background knowledge cache autonomous scheduler found no expired structural work."
+      );
+
+      FetchWorkItem expiredContent = this.FindOldestExpiredContentWorkItem();
+      if (expiredContent != null) {
+        DevLogger.LogTrace(
+          7421903804115L,
+          75214,
+          "Background knowledge cache autonomous scheduler selected expired content: operation='"
+          + expiredContent.Operation
+          + "', argument='"
+          + expiredContent.Argument
+          + "', elapsedMilliseconds="
+          + ((long)(DateTime.UtcNow - schedulerStartedUtc).TotalMilliseconds).ToString()
+          + "."
+        );
+
+        return expiredContent;
+      }
+
+      DevLogger.LogTrace(
+        7421903804114L,
+        75213,
+        "Background knowledge cache autonomous scheduler found no expired content work. totalElapsedMilliseconds="
+        + ((long)(DateTime.UtcNow - schedulerStartedUtc).TotalMilliseconds).ToString()
+        + "."
+      );
+
+      return null;
     }
 
     /// <summary>
@@ -1116,6 +1256,7 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     /// the complete navigable structure available as quickly as possible.
     /// </summary>
     private FetchWorkItem FindNextMissingStructureBreadthFirst() {
+      DateTime scanStartedUtc = DateTime.UtcNow;
       Queue<string> pendingAreas = new Queue<string>();
       HashSet<string> visitedAreas = new HashSet<string>(StringComparer.Ordinal);
 
@@ -1160,6 +1301,16 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         }
       }
 
+      DevLogger.LogTrace(
+        7421903804117L,
+        75216,
+        "Background knowledge cache structural missing scan completed without candidate. visitedAreaCount="
+        + visitedAreas.Count.ToString()
+        + ", elapsedMilliseconds="
+        + ((long)(DateTime.UtcNow - scanStartedUtc).TotalMilliseconds).ToString()
+        + "."
+      );
+
       return null;
     }
 
@@ -1171,7 +1322,9 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     /// mechanism.
     /// </summary>
     private FetchWorkItem FindNextMissingContentDeepestFirst() {
+      DateTime scanStartedUtc = DateTime.UtcNow;
       string[] knownAreas = this.GetKnownAreasOrderedByDescendingDepth();
+      int contentCapableAreaCount = 0;
 
       foreach (string area in knownAreas) {
         CachedCapabilities capabilities;
@@ -1187,6 +1340,8 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         if (capabilities.ContentLevel == ContentLevel.BeyondContent) {
           continue;
         }
+
+        contentCapableAreaCount++;
 
         if (capabilities.SupportsResources &&
             !this.HasCacheEntry("resources", area)) {
@@ -1213,6 +1368,18 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
           );
         }
       }
+
+      DevLogger.LogTrace(
+        7421903804118L,
+        75217,
+        "Background knowledge cache content missing scan completed without candidate. knownAreaCount="
+        + knownAreas.Length.ToString()
+        + ", contentCapableAreaCount="
+        + contentCapableAreaCount.ToString()
+        + ", elapsedMilliseconds="
+        + ((long)(DateTime.UtcNow - scanStartedUtc).TotalMilliseconds).ToString()
+        + "."
+      );
 
       return null;
     }
@@ -1269,11 +1436,16 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     /// Finds one known resource whose binary content has not yet been cached.
     /// </summary>
     private FetchWorkItem FindMissingResourceContentWorkItem() {
+      DateTime scanStartedUtc = DateTime.UtcNow;
       PersistentCacheEntry[] entries = this.ReadAllPersistentEntries();
+      int resourceMetadataEntryCount = 0;
+
       foreach (PersistentCacheEntry entry in entries.OrderBy((PersistentCacheEntry item) => item.CreatedUtc)) {
         if (!string.Equals(entry.Operation, "resources", StringComparison.Ordinal)) {
           continue;
         }
+
+        resourceMetadataEntryCount++;
 
         KnowledgeResourceInfo[] resources;
         try {
@@ -1295,6 +1467,18 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         }
       }
 
+      DevLogger.LogTrace(
+        7421903804119L,
+        75218,
+        "Background knowledge cache resource binary missing scan completed without candidate. persistentEntryCount="
+        + entries.Length.ToString()
+        + ", resourceMetadataEntryCount="
+        + resourceMetadataEntryCount.ToString()
+        + ", elapsedMilliseconds="
+        + ((long)(DateTime.UtcNow - scanStartedUtc).TotalMilliseconds).ToString()
+        + "."
+      );
+
       return null;
     }
 
@@ -1305,24 +1489,47 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     /// trees are rediscovered before old content is refreshed.
     /// </summary>
     private FetchWorkItem FindOldestExpiredStructuralWorkItem() {
+      DateTime scanStartedUtc = DateTime.UtcNow;
       DateTime utcNow = DateTime.UtcNow;
       PersistentCacheEntry[] entries = this.ReadAllPersistentEntries();
       PersistentCacheEntry oldest = null;
+      int structuralEntryCount = 0;
+      int expiredStructuralEntryCount = 0;
 
       foreach (PersistentCacheEntry entry in entries) {
         if (!this.IsStructuralOperation(entry.Operation)) {
           continue;
         }
 
+        structuralEntryCount++;
+
         if (this.IsFresh(entry.CreatedUtc, utcNow)) {
           continue;
         }
+
+        expiredStructuralEntryCount++;
 
         if (oldest == null ||
             entry.CreatedUtc < oldest.CreatedUtc) {
           oldest = entry;
         }
       }
+
+      DevLogger.LogTrace(
+        7421903804120L,
+        75219,
+        "Background knowledge cache expired structural scan completed. persistentEntryCount="
+        + entries.Length.ToString()
+        + ", structuralEntryCount="
+        + structuralEntryCount.ToString()
+        + ", expiredStructuralEntryCount="
+        + expiredStructuralEntryCount.ToString()
+        + ", selected="
+        + (oldest != null).ToString()
+        + ", elapsedMilliseconds="
+        + ((long)(DateTime.UtcNow - scanStartedUtc).TotalMilliseconds).ToString()
+        + "."
+      );
 
       if (oldest == null) {
         return null;
@@ -1344,6 +1551,7 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     /// queue.
     /// </summary>
     private FetchWorkItem FindOldestExpiredContentWorkItem() {
+      DateTime scanStartedUtc = DateTime.UtcNow;
       DateTime utcNow = DateTime.UtcNow;
       PersistentCacheEntry[] entries = this.ReadAllPersistentEntries();
 
@@ -1360,6 +1568,18 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
           (PersistentCacheEntry entry) => entry.CreatedUtc
         )
         .ToArray();
+
+      DevLogger.LogTrace(
+        7421903804121L,
+        75220,
+        "Background knowledge cache expired content scan completed. persistentEntryCount="
+        + entries.Length.ToString()
+        + ", expiredAutonomousContentEntryCount="
+        + candidates.Length.ToString()
+        + ", elapsedMilliseconds="
+        + ((long)(DateTime.UtcNow - scanStartedUtc).TotalMilliseconds).ToString()
+        + "."
+      );
 
       if (candidates.Length == 0) {
         return null;
@@ -1662,15 +1882,33 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     /// Reads all valid persistent cache envelopes.
     /// </summary>
     private PersistentCacheEntry[] ReadAllPersistentEntries() {
+      DateTime scanStartedUtc = DateTime.UtcNow;
       List<PersistentCacheEntry> result = new List<PersistentCacheEntry>();
-      string[] files = Directory.GetFiles(_CacheDirectory, "*" + _CacheEntryExtension, SearchOption.TopDirectoryOnly);
+      string[] files = Directory.GetFiles(
+        _CacheDirectory,
+        "*" + _CacheEntryExtension,
+        SearchOption.TopDirectoryOnly
+      );
 
       foreach (string file in files) {
         PersistentCacheEntry entry;
+
         if (this.TryReadPersistentEntry(file, out entry)) {
           result.Add(entry);
         }
       }
+
+      DevLogger.LogTrace(
+        7421903804122L,
+        75221,
+        "Background knowledge cache persistent entry scan completed. cacheFileCount="
+        + files.Length.ToString()
+        + ", validEntryCount="
+        + result.Count.ToString()
+        + ", elapsedMilliseconds="
+        + ((long)(DateTime.UtcNow - scanStartedUtc).TotalMilliseconds).ToString()
+        + "."
+      );
 
       return result.ToArray();
     }
