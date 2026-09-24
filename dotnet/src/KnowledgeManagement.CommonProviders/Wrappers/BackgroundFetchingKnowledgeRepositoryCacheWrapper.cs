@@ -892,7 +892,7 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
           this.EnqueuePriorityWork(operation, argument, "stale cache value was served");
         }
         else {
-          DevLogger.LogTrace(0, 99999, "Background knowledge cache answered from cache: operation='" + operation + "', argument='" + argument + "', ageSeconds=" + ((long)age.TotalSeconds).ToString() + ".");
+          //DevLogger.LogTrace(0, 99999, "Background knowledge cache answered from cache: operation='" + operation + "', argument='" + argument + "', ageSeconds=" + ((long)age.TotalSeconds).ToString() + ".");
         }
         return value;
       }

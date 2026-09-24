@@ -1244,62 +1244,27 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
     private static string Plain(string html) { return WebUtility.HtmlDecode(Regex.Replace(html, "<[^>]*>", "")).Trim(); }
 
     /// <summary>
-    /// Returns subordinate content-container areas of one human-visible document in
-    /// deterministic depth-first order without using recursive repository enumeration.
+    /// Returns subordinate logical areas of one human-visible document in deterministic
+    /// depth-first order.
+    ///
+    /// This is deliberately the one HTML navigation scope where recursive repository
+    /// enumeration is preferable. A document can contain many Markdown headings. Walking
+    /// those headings through repeated GetAreas(false, ...) and GetAreaCapabilities(...)
+    /// calls forces file-based providers to resolve and parse the same physical document
+    /// again for every heading and also repeats filesystem exposure checks.
+    ///
+    /// GetAreas(true, documentArea) is bounded to the already selected document subtree. It
+    /// therefore does not materialize the complete repository tree, while allowing providers
+    /// such as FileBasedKnowledgeRepository to parse the document exactly once and traverse
+    /// its in-memory heading tree efficiently.
     /// </summary>
     private string[] GetDocumentContentAreas(
       string documentArea
     ) {
-      List<string> result =
-        new List<string>();
-
-      Stack<string> pending =
-        new Stack<string>();
-
-      string[] directChildren =
-        this.Areas(
-          documentArea,
-          false
-        );
-
-      for (int index = directChildren.Length - 1;
-           index >= 0;
-           index--) {
-        pending.Push(
-          directChildren[index]
-        );
-      }
-
-      while (pending.Count > 0) {
-        string current =
-          pending.Pop();
-
-        if (this.Level(
-              current
-            ) != ContentLevel.ContentContainer) {
-          continue;
-        }
-
-        result.Add(
-          current
-        );
-
-        string[] children =
-          this.Areas(
-            current,
-            false
-          );
-
-        for (int index = children.Length - 1;
-             index >= 0;
-             index--) {
-          pending.Push(
-            children[index]
-          );
-        }
-      }
-
-      return result.ToArray();
+      return this.Areas(
+        documentArea,
+        true
+      );
     }
 
     private IActionResult GetAreaInternal(string area) {

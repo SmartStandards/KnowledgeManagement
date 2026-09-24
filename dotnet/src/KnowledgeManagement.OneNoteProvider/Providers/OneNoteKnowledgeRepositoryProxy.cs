@@ -614,11 +614,11 @@ namespace KnowledgeManagement.SmartStandards.Providers {
       this.EnsureNotDisposed();
       lock (_SyncRoot) {
         if (_CachedTree != null) {
-          DevLogger.LogTrace(0, 99999, "OneNote repository tree cache hit.");
+          //DevLogger.LogTrace(0, 99999, "OneNote repository tree cache hit.");
           return _CachedTree;
         }
 
-        DevLogger.LogTrace(0, 99999, "OneNote repository tree cache miss. Loading notebook metadata from Microsoft Graph.");
+        //DevLogger.LogTrace(0, 99999, "OneNote repository tree cache miss. Loading notebook metadata from Microsoft Graph.");
         NotebookInfo[] notebooks = this.LoadNotebooks();
         if (!string.IsNullOrWhiteSpace(_NotebookName)) {
           NotebookInfo configuredNotebook = this.GetConfiguredNotebook(notebooks);

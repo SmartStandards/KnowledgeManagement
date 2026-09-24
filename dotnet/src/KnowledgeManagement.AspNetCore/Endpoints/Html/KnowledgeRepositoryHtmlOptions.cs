@@ -9,7 +9,10 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
     /// <summary>Null/empty disables persistent caching. Use an absolute private directory outside wwwroot.</summary>
     public string CacheDirectory { get; set; }
 
-    public TimeSpan CacheLifetime { get; set; } = TimeSpan.Zero;// TimeSpan.FromMinutes(5);
+
+    public TimeSpan CacheLifetime { get; set; } = TimeSpan.Zero;
+    //public TimeSpan CacheLifetime { get; set; } =  TimeSpan.FromMinutes(5);
+
 
     /// <summary>Distinct identity for the logical repository/configuration. Change when mounts or credentials change.</summary>
     public string CacheNamespace { get; set; } = "knowledge-html-v1";

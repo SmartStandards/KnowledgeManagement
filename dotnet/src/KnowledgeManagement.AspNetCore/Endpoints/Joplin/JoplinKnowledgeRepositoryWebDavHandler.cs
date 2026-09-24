@@ -248,6 +248,10 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
       this.TraceWebDavRequest();
 
       lock (_SyncRoot) {
+        this.TrySelfHealProjectedResourceStateFile(
+          path
+        );
+
         JoplinProjection projection = null;
         JoplinWebDavEntry entry;
 
@@ -395,6 +399,10 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
       this.TraceWebDavRequest();
 
       lock (_SyncRoot) {
+        this.TrySelfHealProjectedResourceStateFile(
+          path
+        );
+
         JoplinWebDavEntry stateEntry;
 
         if (this.TryResolveStateStoreEntry(
@@ -410,6 +418,12 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
           byte[] stateContent = _SyncStateStore.ReadFile(
             stateEntry.Path
           );
+
+          stateContent =
+            this.EnsureJoplinResourceMetadataIdentityForWebDav(
+              stateEntry.Path,
+              stateContent
+            );
 
           this.ApplyFileHeaders(
             stateEntry
@@ -464,6 +478,10 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
       this.TraceWebDavRequest();
 
       lock (_SyncRoot) {
+        this.TrySelfHealProjectedResourceStateFile(
+          path
+        );
+
         JoplinWebDavEntry stateEntry;
 
         if (this.TryResolveStateStoreEntry(
@@ -529,14 +547,25 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
         }
 
         if (!this.IsRootItemFile(path)) {
-          bool hadPreviousState = _SyncStateStore.FileExists(path);
-          byte[] previousState = Array.Empty<byte>();
+          bool hadPreviousState =
+            _SyncStateStore.FileExists(
+              path
+            );
+
+          byte[] previousState =
+            Array.Empty<byte>();
 
           if (hadPreviousState) {
-            previousState = _SyncStateStore.ReadFile(path);
+            previousState =
+              _SyncStateStore.ReadFile(
+                path
+              );
           }
 
-          _SyncStateStore.WriteFile(path, content);
+          _SyncStateStore.WriteFile(
+            path,
+            content
+          );
 
           if (path.StartsWith(
                 _ResourceCollection + "/",
@@ -553,14 +582,24 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
             );
 
             if (resourceApplyResult == ResourceApplyResult.TemporarilyUnavailable) {
-              this.RestoreJoplinStateFile(
-                path,
-                hadPreviousState,
-                previousState
+              // The resource blob was already durably accepted into the sync-state store.
+              // Keep it as pending state instead of rolling it back and aborting the complete
+              // Joplin synchronization cycle with HTTP 503.
+              this.SaveProjectionState(
+                state
               );
 
-              this.Response.Headers["Retry-After"] = "1";
-              return this.StatusCode(StatusCodes.Status503ServiceUnavailable);
+              DevLogger.LogTrace(
+                0,
+                99999,
+                "Joplin resource blob PUT accepted as pending because the knowledge storage is temporarily unavailable: id="
+                + resourceId
+                + "."
+              );
+
+              return this.StatusCode(
+                StatusCodes.Status204NoContent
+              );
             }
 
             if (resourceApplyResult == ResourceApplyResult.Invalid) {
@@ -591,14 +630,25 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
         }
 
         if (item.Type == _JoplinResourceType) {
-          bool hadPreviousState = _SyncStateStore.FileExists(path);
-          byte[] previousState = Array.Empty<byte>();
+          bool hadPreviousState =
+            _SyncStateStore.FileExists(
+              path
+            );
+
+          byte[] previousState =
+            Array.Empty<byte>();
 
           if (hadPreviousState) {
-            previousState = _SyncStateStore.ReadFile(path);
+            previousState =
+              _SyncStateStore.ReadFile(
+                path
+              );
           }
 
-          _SyncStateStore.WriteFile(path, content);
+          _SyncStateStore.WriteFile(
+            path,
+            content
+          );
 
           JoplinProjectionState state = this.LoadProjectionState();
           ResourceApplyResult resourceApplyResult = this.TryApplyUploadedJoplinResource(
@@ -607,14 +657,24 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
           );
 
           if (resourceApplyResult == ResourceApplyResult.TemporarilyUnavailable) {
-            this.RestoreJoplinStateFile(
-              path,
-              hadPreviousState,
-              previousState
+            // The resource metadata item was already durably accepted into the sync-state
+            // store. Preserve it for automatic replay rather than restoring the previous
+            // version and returning HTTP 503.
+            this.SaveProjectionState(
+              state
             );
 
-            this.Response.Headers["Retry-After"] = "1";
-            return this.StatusCode(StatusCodes.Status503ServiceUnavailable);
+            DevLogger.LogTrace(
+              0,
+              99999,
+              "Joplin resource metadata PUT accepted as pending because the knowledge storage is temporarily unavailable: id="
+              + item.Id
+              + "."
+            );
+
+            return this.StatusCode(
+              StatusCodes.Status204NoContent
+            );
           }
 
           if (resourceApplyResult == ResourceApplyResult.Invalid) {
@@ -696,22 +756,27 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
         }
 
         if (materializationResult == MaterializationResult.TemporarilyUnavailable) {
-          _SyncStateStore.Delete(
-            path
+          // The raw Joplin item was already persisted before materialization started.
+          // Keep that accepted sync item as a replayable pending write instead of returning
+          // 503 and forcing Joplin to fail the complete synchronization cycle.
+          //
+          // This is especially important for file-backed repositories where editors,
+          // remounted filesystems, antivirus scanners or transient sharing violations can
+          // make one atomic knowledge mutation temporarily unavailable.
+          this.SaveProjectionState(
+            projection.State
           );
-
-          this.Response.Headers["Retry-After"] = "1";
 
           DevLogger.LogTrace(
             0,
             99999,
-            "Joplin PUT could not be committed because the knowledge storage is temporarily unavailable: id="
+            "Joplin PUT accepted as pending because the knowledge storage is temporarily unavailable: id="
             + item.Id
-            + "."
+            + ". The raw sync item remains stored for automatic replay."
           );
 
           return this.StatusCode(
-            StatusCodes.Status503ServiceUnavailable
+            StatusCodes.Status204NoContent
           );
         }
 
@@ -1960,6 +2025,703 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
     }
 
     /// <summary>
+    /// Ensures that one root-level Joplin resource metadata payload contains the exact item
+    /// identity encoded by its WebDAV file name.
+    ///
+    /// Joplin derives the remote item ID from the path while downloading, but the serialized
+    /// resource metadata must still contain its own <c>id</c> property. Without that field the
+    /// client can deserialize enough resource properties to create a local object and later
+    /// fail in updateSyncTimeQueries because the local item has no ID.
+    ///
+    /// This repair intentionally does not depend on projection state. Historical or partially
+    /// migrated state files may outlive their projection mapping, while the WebDAV path itself
+    /// remains an authoritative Joplin item identity.
+    /// </summary>
+    private byte[] EnsureJoplinResourceMetadataIdentityForWebDav(
+      string path,
+      byte[] content
+    ) {
+      if (!this.IsRootItemFile(
+            path
+          ) ||
+          content == null ||
+          content.Length == 0) {
+        return content;
+      }
+
+      string itemId =
+        Path.GetFileNameWithoutExtension(
+          path
+        );
+
+      if (!Regex.IsMatch(
+            itemId,
+            "^[0-9a-fA-F]{32}$",
+            RegexOptions.CultureInvariant
+          )) {
+        return content;
+      }
+
+      string text =
+        Encoding.UTF8.GetString(
+          content
+        );
+
+      string normalized =
+        text.Replace(
+          "\r\n",
+          "\n",
+          StringComparison.Ordinal
+        ).Replace(
+          '\r',
+          '\n'
+        );
+
+      string[] lines =
+        normalized.Split(
+          '\n'
+        );
+
+      int metadataStartIndex =
+        -1;
+
+      int typeLineIndex =
+        -1;
+
+      int idLineIndex =
+        -1;
+
+      int mimeLineIndex =
+        -1;
+
+      int fileExtensionLineIndex =
+        -1;
+
+      int fileNameLineIndex =
+        -1;
+
+      for (int index = lines.Length - 1;
+           index >= 0;
+           index--) {
+        string line =
+          lines[index];
+
+        if (line.Length == 0) {
+          if (metadataStartIndex >= 0) {
+            break;
+          }
+
+          continue;
+        }
+
+        int separator =
+          line.IndexOf(
+            ": ",
+            StringComparison.Ordinal
+          );
+
+        if (separator <= 0) {
+          if (metadataStartIndex >= 0) {
+            break;
+          }
+
+          return content;
+        }
+
+        metadataStartIndex =
+          index;
+
+        string key =
+          line.Substring(
+            0,
+            separator
+          );
+
+        if (string.Equals(
+              key,
+              "type_",
+              StringComparison.Ordinal
+            )) {
+          typeLineIndex =
+            index;
+        }
+        else if (string.Equals(
+                   key,
+                   "id",
+                   StringComparison.Ordinal
+                 )) {
+          idLineIndex =
+            index;
+        }
+        else if (string.Equals(
+                   key,
+                   "mime",
+                   StringComparison.Ordinal
+                 )) {
+          mimeLineIndex =
+            index;
+        }
+        else if (string.Equals(
+                   key,
+                   "file_extension",
+                   StringComparison.Ordinal
+                 )) {
+          fileExtensionLineIndex =
+            index;
+        }
+        else if (string.Equals(
+                   key,
+                   "filename",
+                   StringComparison.Ordinal
+                 )) {
+          fileNameLineIndex =
+            index;
+        }
+      }
+
+      if (metadataStartIndex < 0 ||
+          typeLineIndex < 0) {
+        return content;
+      }
+
+      string typeLine =
+        lines[typeLineIndex];
+
+      int typeSeparator =
+        typeLine.IndexOf(
+          ": ",
+          StringComparison.Ordinal
+        );
+
+      string typeValue =
+        typeLine.Substring(
+          typeSeparator + 2
+        ).Trim();
+
+      if (!string.Equals(
+            typeValue,
+            _JoplinResourceType.ToString(
+              CultureInfo.InvariantCulture
+            ),
+            StringComparison.Ordinal
+          )) {
+        return content;
+      }
+
+      bool changed =
+        false;
+
+      if (idLineIndex >= 0) {
+        string expectedIdLine =
+          "id: "
+          + itemId;
+
+        if (!string.Equals(
+              lines[idLineIndex],
+              expectedIdLine,
+              StringComparison.Ordinal
+            )) {
+          lines[idLineIndex] =
+            expectedIdLine;
+
+          changed =
+            true;
+        }
+      }
+      else {
+        List<string> repairedLines =
+          new List<string>(
+            lines.Length + 1
+          );
+
+        for (int index = 0;
+             index < lines.Length;
+             index++) {
+          if (index == metadataStartIndex) {
+            repairedLines.Add(
+              "id: "
+              + itemId
+            );
+          }
+
+          repairedLines.Add(
+            lines[index]
+          );
+        }
+
+        lines =
+          repairedLines.ToArray();
+
+        metadataStartIndex++;
+        typeLineIndex++;
+        if (mimeLineIndex >= 0) {
+          mimeLineIndex++;
+        }
+
+        if (fileExtensionLineIndex >= 0) {
+          fileExtensionLineIndex++;
+        }
+
+        if (fileNameLineIndex >= 0) {
+          fileNameLineIndex++;
+        }
+
+        changed =
+          true;
+      }
+
+      string currentMime =
+        string.Empty;
+
+      if (mimeLineIndex >= 0) {
+        int mimeSeparator =
+          lines[mimeLineIndex].IndexOf(
+            ": ",
+            StringComparison.Ordinal
+          );
+
+        if (mimeSeparator >= 0) {
+          currentMime =
+            lines[mimeLineIndex]
+              .Substring(
+                mimeSeparator + 2
+              )
+              .Trim();
+        }
+      }
+
+      if (string.IsNullOrWhiteSpace(
+            currentMime
+          )) {
+        string extension =
+          string.Empty;
+
+        if (fileExtensionLineIndex >= 0) {
+          int extensionSeparator =
+            lines[fileExtensionLineIndex].IndexOf(
+              ": ",
+              StringComparison.Ordinal
+            );
+
+          if (extensionSeparator >= 0) {
+            extension =
+              lines[fileExtensionLineIndex]
+                .Substring(
+                  extensionSeparator + 2
+                )
+                .Trim();
+          }
+        }
+
+        if (string.IsNullOrWhiteSpace(
+              extension
+            ) &&
+            fileNameLineIndex >= 0) {
+          int fileNameSeparator =
+            lines[fileNameLineIndex].IndexOf(
+              ": ",
+              StringComparison.Ordinal
+            );
+
+          if (fileNameSeparator >= 0) {
+            string fileName =
+              lines[fileNameLineIndex]
+                .Substring(
+                  fileNameSeparator + 2
+                )
+                .Trim();
+
+            extension =
+              Path.GetExtension(
+                fileName
+              );
+          }
+        }
+
+        string repairedMime =
+          this.GetMimeTypeFromExtension(
+            extension
+          );
+
+        if (mimeLineIndex >= 0) {
+          lines[mimeLineIndex] =
+            "mime: "
+            + repairedMime;
+        }
+        else {
+          List<string> repairedLines =
+            new List<string>(
+              lines.Length + 1
+            );
+
+          for (int index = 0;
+               index < lines.Length;
+               index++) {
+            repairedLines.Add(
+              lines[index]
+            );
+
+            if (index == metadataStartIndex) {
+              repairedLines.Add(
+                "mime: "
+                + repairedMime
+              );
+            }
+          }
+
+          lines =
+            repairedLines.ToArray();
+        }
+
+        changed =
+          true;
+      }
+
+      if (!changed) {
+        return content;
+      }
+
+      string repairedText =
+        string.Join(
+          "\n",
+          lines
+        );
+
+      byte[] repairedContent =
+        Encoding.UTF8.GetBytes(
+          repairedText
+        );
+
+      this.WriteStateFileIfChanged(
+        path,
+        repairedContent
+      );
+
+      DevLogger.LogTrace(
+        0,
+        99999,
+        "Joplin resource metadata identity self-healed from WebDAV path: path='"
+        + path
+        + "', id='"
+        + itemId
+        + "'."
+      );
+
+      return repairedContent;
+    }
+
+    /// <summary>
+    /// Repairs one already synchronized Joplin resource metadata file before it is exposed
+    /// through WebDAV.
+    ///
+    /// Old or interrupted synchronization state can contain a resource metadata item whose
+    /// <c>id</c>, <c>type_</c> or <c>file_extension</c> is missing. Current Joplin clients
+    /// may accept enough of such an item to create a local resource row and only fail later
+    /// when updating the sync timestamp because the local item has no valid ID.
+    ///
+    /// Self-healing is deliberately restricted to an existing persistent resource mapping.
+    /// Unknown root item files remain untouched because the adapter has no evidence that
+    /// they belong to a previously synchronized Knowledge resource.
+    /// </summary>
+    private void TrySelfHealProjectedResourceStateFile(
+      string path
+    ) {
+      if (!this.IsRootItemFile(
+            path
+          )) {
+        return;
+      }
+
+      string joplinId =
+        Path.GetFileNameWithoutExtension(
+          path
+        );
+
+      JoplinProjectionState state =
+        this.LoadProjectionState();
+
+      JoplinResourceProjectionRecord record =
+        state.Resources.FirstOrDefault(
+          (JoplinResourceProjectionRecord candidate) =>
+            string.Equals(
+              candidate.JoplinId,
+              joplinId,
+              StringComparison.OrdinalIgnoreCase
+            )
+        );
+
+      if (record == null) {
+        return;
+      }
+
+      this.EnsureProjectedResourceStateFile(
+        record,
+        state
+      );
+    }
+
+    /// <summary>
+    /// Ensures that one known Joplin resource mapping exposes structurally valid metadata.
+    ///
+    /// A malformed metadata file is rebuilt from the authoritative Knowledge resource when
+    /// possible. If the Knowledge resource is no longer available, an existing resource blob
+    /// and the persisted projection metadata are sufficient to repair the sync item. When
+    /// neither source can reconstruct a safe resource item, the old mapping is suppressed and
+    /// its WebDAV files are removed so Joplin can reconcile a server-side deletion instead of
+    /// repeatedly receiving a corrupt item.
+    /// </summary>
+    private void EnsureProjectedResourceStateFile(
+      JoplinResourceProjectionRecord record,
+      JoplinProjectionState state
+    ) {
+      string metadataPath =
+        "/"
+        + record.JoplinId
+        + _MarkdownExtension;
+
+      string blobPath =
+        _ResourceCollection
+        + "/"
+        + record.JoplinId;
+
+      if (record.IsSuppressed) {
+        _SyncStateStore.Delete(
+          metadataPath
+        );
+
+        _SyncStateStore.Delete(
+          blobPath
+        );
+
+        return;
+      }
+
+      bool metadataValid =
+        false;
+
+      if (_SyncStateStore.FileExists(
+            metadataPath
+          )) {
+        try {
+          JoplinSerializedItem metadataItem =
+            this.ParseJoplinItem(
+              Encoding.UTF8.GetString(
+                _SyncStateStore.ReadFile(
+                  metadataPath
+                )
+              )
+            );
+
+          metadataValid =
+            metadataItem != null &&
+            metadataItem.Type == _JoplinResourceType &&
+            string.Equals(
+              metadataItem.Id,
+              record.JoplinId,
+              StringComparison.OrdinalIgnoreCase
+            ) &&
+            !string.IsNullOrWhiteSpace(
+              metadataItem.FileExtension
+            ) &&
+            !string.IsNullOrWhiteSpace(
+              metadataItem.Mime
+            );
+        }
+        catch (InvalidOperationException ex) {
+          DevLogger.LogError(
+            ex
+          );
+
+          metadataValid =
+            false;
+        }
+      }
+
+      if (metadataValid) {
+        return;
+      }
+
+      KnowledgeResourceInfo resource =
+        null;
+
+      byte[] content =
+        null;
+
+      if (!string.IsNullOrWhiteSpace(
+            record.AreaHint
+          )) {
+        try {
+          KnowledgeResourceInfo[] resources =
+            _KnowledgeRepository.GetResources(
+              record.AreaHint
+            );
+
+          resource =
+            resources.FirstOrDefault(
+              (KnowledgeResourceInfo candidate) =>
+                string.Equals(
+                  candidate.ResourceId,
+                  record.ResourceId,
+                  StringComparison.Ordinal
+                )
+            );
+
+          if (resource != null) {
+            content =
+              _KnowledgeRepository.GetResourceContent(
+                record.ResourceId
+              );
+          }
+        }
+        catch (InvalidOperationException ex) {
+          DevLogger.LogError(
+            ex
+          );
+        }
+        catch (IOException ex) {
+          DevLogger.LogError(
+            ex
+          );
+        }
+        catch (UnauthorizedAccessException ex) {
+          DevLogger.LogError(
+            ex
+          );
+        }
+      }
+
+      if (resource == null &&
+          _SyncStateStore.FileExists(
+            blobPath
+          )) {
+        content =
+          _SyncStateStore.ReadFile(
+            blobPath
+          );
+
+        resource =
+          new KnowledgeResourceInfo();
+
+        resource.ResourceId =
+          record.ResourceId;
+
+        resource.FileName =
+          record.FileName;
+
+        resource.ContentType =
+          record.ContentType;
+      }
+
+      if (resource == null ||
+          content == null) {
+        record.IsSuppressed =
+          true;
+
+        record.ModifiedUtc =
+          DateTime.UtcNow;
+
+        _SyncStateStore.Delete(
+          metadataPath
+        );
+
+        _SyncStateStore.Delete(
+          blobPath
+        );
+
+        this.SaveProjectionState(
+          state
+        );
+
+        DevLogger.LogTrace(
+          0,
+          99999,
+          "Joplin resource metadata self-healing suppressed an unrecoverable resource item: joplinId='"
+          + record.JoplinId
+          + "', resourceId='"
+          + record.ResourceId
+          + "'."
+        );
+
+        return;
+      }
+
+      if (string.IsNullOrWhiteSpace(
+            record.FileExtension
+          )) {
+        string repairedExtension =
+          Path.GetExtension(
+            resource.FileName
+          );
+
+        if (string.IsNullOrWhiteSpace(
+              repairedExtension
+            )) {
+          repairedExtension =
+            this.GetExtensionFromMimeType(
+              resource.ContentType
+            );
+        }
+
+        if (string.IsNullOrWhiteSpace(
+              repairedExtension
+            )) {
+          repairedExtension =
+            ".bin";
+        }
+
+        record.FileExtension =
+          repairedExtension;
+      }
+
+      if (string.IsNullOrWhiteSpace(
+            record.FileName
+          )) {
+        record.FileName =
+          resource.FileName;
+      }
+
+      if (string.IsNullOrWhiteSpace(
+            record.ContentType
+          )) {
+        record.ContentType =
+          resource.ContentType;
+      }
+
+      byte[] metadata =
+        Encoding.UTF8.GetBytes(
+          this.SerializeJoplinResourceMetadata(
+            record,
+            resource,
+            content.LongLength
+          )
+        );
+
+      this.WriteStateFileIfChanged(
+        metadataPath,
+        metadata
+      );
+
+      this.WriteStateFileIfChanged(
+        blobPath,
+        content
+      );
+
+      this.SaveProjectionState(
+        state
+      );
+
+      DevLogger.LogTrace(
+        0,
+        99999,
+        "Joplin resource metadata self-healed before WebDAV exposure: joplinId='"
+        + record.JoplinId
+        + "', resourceId='"
+        + record.ResourceId
+        + "'."
+      );
+    }
+
+    /// <summary>
     /// Serializes one Joplin resource metadata item in the same raw sync-item structure
     /// used for notes and folders.
     /// </summary>
@@ -1968,43 +2730,80 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
       KnowledgeResourceInfo resource,
       long length
     ) {
-      string extension = Path.GetExtension(
-        resource.FileName
-      );
+      string contentType =
+        this.NormalizeJoplinResourceContentType(
+          resource.ContentType,
+          record.ContentType
+        );
 
-      if (extension == null) {
-        extension = string.Empty;
+      string extension =
+        this.NormalizeJoplinResourceExtension(
+          contentType,
+          record.FileExtension,
+          resource.FileName,
+          record.FileName
+        );
+
+      if (string.IsNullOrWhiteSpace(
+            contentType
+          )) {
+        contentType =
+          this.GetMimeTypeFromExtension(
+            extension
+          );
       }
 
-      string fallbackFileName = resource.FileName;
+      string fileName =
+        this.NormalizeJoplinResourceFileName(
+          record.FileName,
+          resource.FileName,
+          extension
+        );
 
-      if (string.IsNullOrWhiteSpace(fallbackFileName)) {
-        fallbackFileName = "Resource" + extension;
+      string title =
+        this.NormalizeJoplinResourceScalar(
+          record.Title,
+          255
+        );
+
+      if (string.IsNullOrWhiteSpace(
+            title
+          )) {
+        title =
+          this.NormalizeJoplinResourceScalar(
+            fileName,
+            255
+          );
       }
 
-      string fileName = record.FileName;
-
-      if (string.IsNullOrWhiteSpace(fileName)) {
-        fileName = fallbackFileName;
+      if (string.IsNullOrWhiteSpace(
+            title
+          )) {
+        title =
+          "Resource";
       }
 
-      string title = record.Title;
+      // Persist repaired scalar values so legacy multiline metadata is not reintroduced
+      // during a later projection rebuild.
+      record.ContentType =
+        contentType;
 
-      if (string.IsNullOrWhiteSpace(title)) {
-        title = fileName;
-      }
+      record.FileExtension =
+        extension;
 
-      StringBuilder properties = new StringBuilder();
+      record.FileName =
+        fileName;
+
+      record.Title =
+        title;
+
+      StringBuilder properties =
+        new StringBuilder();
+
       properties.Append("id: ");
       properties.Append(record.JoplinId);
       properties.Append('\n');
       properties.Append("mime: ");
-      string contentType = resource.ContentType;
-
-      if (contentType == null) {
-        contentType = string.Empty;
-      }
-
       properties.Append(contentType);
       properties.Append('\n');
       properties.Append("filename: ");
@@ -2053,6 +2852,302 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
       return title
         + "\n\n"
         + properties.ToString();
+    }
+
+    /// <summary>
+    /// Normalizes one Joplin resource scalar to exactly one metadata line.
+    /// </summary>
+    private string NormalizeJoplinResourceScalar(
+      string value,
+      int maximumLength
+    ) {
+      if (string.IsNullOrWhiteSpace(
+            value
+          )) {
+        return string.Empty;
+      }
+
+      string normalized =
+        value.Replace(
+          "\r\n",
+          "\n",
+          StringComparison.Ordinal
+        ).Replace(
+          '\r',
+          '\n'
+        );
+
+      int lineBreakIndex =
+        normalized.IndexOf(
+          '\n'
+        );
+
+      if (lineBreakIndex >= 0) {
+        normalized =
+          normalized.Substring(
+            0,
+            lineBreakIndex
+          );
+      }
+
+      StringBuilder builder =
+        new StringBuilder();
+
+      bool previousWhitespace =
+        false;
+
+      foreach (char character in normalized) {
+        if (char.IsControl(
+              character
+            )) {
+          continue;
+        }
+
+        if (char.IsWhiteSpace(
+              character
+            )) {
+          if (!previousWhitespace) {
+            builder.Append(' ');
+            previousWhitespace =
+              true;
+          }
+
+          continue;
+        }
+
+        builder.Append(
+          character
+        );
+
+        previousWhitespace =
+          false;
+      }
+
+      string result =
+        builder.ToString().Trim();
+
+      if (result.Length > maximumLength) {
+        result =
+          result.Substring(
+            0,
+            maximumLength
+          ).Trim();
+      }
+
+      return result;
+    }
+
+    /// <summary>
+    /// Resolves a valid single-line MIME type for one Joplin resource.
+    /// </summary>
+    private string NormalizeJoplinResourceContentType(
+      string resourceContentType,
+      string persistedContentType
+    ) {
+      string contentType =
+        this.NormalizeJoplinResourceScalar(
+          resourceContentType,
+          128
+        );
+
+      if (string.IsNullOrWhiteSpace(
+            contentType
+          )) {
+        contentType =
+          this.NormalizeJoplinResourceScalar(
+            persistedContentType,
+            128
+          );
+      }
+
+      if (!string.IsNullOrWhiteSpace(
+            contentType
+          ) &&
+          contentType.Contains(
+            "/",
+            StringComparison.Ordinal
+          )) {
+        return contentType;
+      }
+
+      return string.Empty;
+    }
+
+    /// <summary>
+    /// Resolves one safe Joplin file extension without trusting arbitrary provider text.
+    /// </summary>
+    private string NormalizeJoplinResourceExtension(
+      string contentType,
+      string persistedExtension,
+      string resourceFileName,
+      string persistedFileName
+    ) {
+      string extension =
+        this.GetExtensionFromMimeType(
+          contentType
+        );
+
+      if (string.IsNullOrWhiteSpace(
+            extension
+          )) {
+        extension =
+          this.NormalizeJoplinResourceExtensionCandidate(
+            persistedExtension
+          );
+      }
+
+      if (string.IsNullOrWhiteSpace(
+            extension
+          )) {
+        string normalizedResourceFileName =
+          this.NormalizeJoplinResourceScalar(
+            resourceFileName,
+            512
+          );
+
+        extension =
+          this.NormalizeJoplinResourceExtensionCandidate(
+            Path.GetExtension(
+              normalizedResourceFileName
+            )
+          );
+      }
+
+      if (string.IsNullOrWhiteSpace(
+            extension
+          )) {
+        string normalizedPersistedFileName =
+          this.NormalizeJoplinResourceScalar(
+            persistedFileName,
+            512
+          );
+
+        extension =
+          this.NormalizeJoplinResourceExtensionCandidate(
+            Path.GetExtension(
+              normalizedPersistedFileName
+            )
+          );
+      }
+
+      if (string.IsNullOrWhiteSpace(
+            extension
+          )) {
+        extension =
+          ".bin";
+      }
+
+      return extension.ToLowerInvariant();
+    }
+
+    /// <summary>
+    /// Validates one candidate resource extension for use in Joplin metadata.
+    /// </summary>
+    private string NormalizeJoplinResourceExtensionCandidate(
+      string extension
+    ) {
+      string value =
+        this.NormalizeJoplinResourceScalar(
+          extension,
+          24
+        );
+
+      if (string.IsNullOrWhiteSpace(
+            value
+          )) {
+        return string.Empty;
+      }
+
+      if (!value.StartsWith(
+            ".",
+            StringComparison.Ordinal
+          )) {
+        value =
+          "."
+          + value;
+      }
+
+      if (!Regex.IsMatch(
+            value,
+            @"^\.[A-Za-z0-9]{1,16}$",
+            RegexOptions.CultureInvariant
+          )) {
+        return string.Empty;
+      }
+
+      return value;
+    }
+
+    /// <summary>
+    /// Resolves one safe single-line filename for Joplin resource metadata.
+    /// </summary>
+    private string NormalizeJoplinResourceFileName(
+      string persistedFileName,
+      string resourceFileName,
+      string extension
+    ) {
+      string fileName =
+        this.NormalizeJoplinResourceScalar(
+          persistedFileName,
+          180
+        );
+
+      if (string.IsNullOrWhiteSpace(
+            fileName
+          )) {
+        fileName =
+          this.NormalizeJoplinResourceScalar(
+            resourceFileName,
+            180
+          );
+      }
+
+      if (string.IsNullOrWhiteSpace(
+            fileName
+          )) {
+        fileName =
+          "Resource";
+      }
+
+      fileName =
+        fileName.Replace(
+          "/",
+          "_",
+          StringComparison.Ordinal
+        ).Replace(
+          "\\",
+          "_",
+          StringComparison.Ordinal
+        );
+
+      string currentExtension =
+        this.NormalizeJoplinResourceExtensionCandidate(
+          Path.GetExtension(
+            fileName
+          )
+        );
+
+      if (string.IsNullOrWhiteSpace(
+            currentExtension
+          )) {
+        fileName =
+          fileName.TrimEnd(
+            '.',
+            ' '
+          );
+
+        if (string.IsNullOrWhiteSpace(
+              fileName
+            )) {
+          fileName =
+            "Resource";
+        }
+
+        fileName +=
+          extension;
+      }
+
+      return fileName;
     }
 
     /// <summary>
@@ -2119,6 +3214,69 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
     /// <summary>
     /// Maps common MIME types to file extensions for Joplin resources with incomplete
     /// legacy metadata.
+    /// </summary>
+    /// <summary>
+    /// Returns a safe MIME type for one resource file extension.
+    /// </summary>
+    private string GetMimeTypeFromExtension(
+      string extension
+    ) {
+      string value =
+        extension;
+
+      if (string.IsNullOrWhiteSpace(
+            value
+          )) {
+        return "application/octet-stream";
+      }
+
+      value =
+        value.Trim();
+
+      if (value.StartsWith(
+            ".",
+            StringComparison.Ordinal
+          )) {
+        value =
+          value.Substring(
+            1
+          );
+      }
+
+      value =
+        value.ToLowerInvariant();
+
+      if (value == "png") {
+        return "image/png";
+      }
+      else if (value == "jpg" ||
+               value == "jpeg") {
+        return "image/jpeg";
+      }
+      else if (value == "gif") {
+        return "image/gif";
+      }
+      else if (value == "webp") {
+        return "image/webp";
+      }
+      else if (value == "svg") {
+        return "image/svg+xml";
+      }
+      else if (value == "pdf") {
+        return "application/pdf";
+      }
+      else if (value == "txt") {
+        return "text/plain";
+      }
+      else if (value == "md") {
+        return "text/markdown";
+      }
+
+      return "application/octet-stream";
+    }
+
+    /// <summary>
+    /// Returns a preferred resource file extension for one MIME type.
     /// </summary>
     private string GetExtensionFromMimeType(string mimeType) {
       string value = mimeType;

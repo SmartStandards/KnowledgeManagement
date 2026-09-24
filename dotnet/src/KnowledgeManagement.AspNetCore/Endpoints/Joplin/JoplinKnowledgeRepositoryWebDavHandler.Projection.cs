@@ -301,6 +301,47 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
         JoplinProjection projection =
           this.BuildStateProjection();
 
+        // Resource PUTs can be accepted while the backing knowledge provider is temporarily
+        // unavailable. Retry those durable blob/metadata pairs before materializing notes so
+        // note references can immediately observe the repaired provider resource.
+        foreach (JoplinResourceProjectionRecord resourceRecord in projection.State.Resources) {
+          if (resourceRecord.IsSuppressed ||
+              string.IsNullOrWhiteSpace(
+                resourceRecord.JoplinId
+              )) {
+            continue;
+          }
+
+          ResourceApplyResult resourceResult =
+            this.TryApplyUploadedJoplinResource(
+              resourceRecord.JoplinId,
+              projection.State
+            );
+
+          if (resourceResult == ResourceApplyResult.Applied) {
+            this.SaveProjectionState(
+              projection.State
+            );
+
+            DevLogger.LogTrace(
+              0,
+              99999,
+              "Pending Joplin resource '"
+              + resourceRecord.JoplinId
+              + "' was applied successfully."
+            );
+          }
+          else if (resourceResult == ResourceApplyResult.TemporarilyUnavailable) {
+            DevLogger.LogTrace(
+              0,
+              99999,
+              "Pending Joplin resource '"
+              + resourceRecord.JoplinId
+              + "' remains pending because the knowledge storage is temporarily unavailable."
+            );
+          }
+        }
+
         foreach (JoplinSyncStateEntry entry in rootEntries) {
           if (entry.IsCollection) {
             continue;
@@ -344,6 +385,18 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
           }
 
           if (result == MaterializationResult.PendingDependency) {
+            continue;
+          }
+
+          if (result == MaterializationResult.TemporarilyUnavailable) {
+            DevLogger.LogTrace(
+              0,
+              99999,
+              "Pending Joplin item '"
+              + item.Id
+              + "' remains pending because the knowledge storage is temporarily unavailable."
+            );
+
             continue;
           }
 
@@ -1347,7 +1400,28 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
         return root;
       }
 
-      // A raw state-store item represents Joplin protocol/projection state and always
+      // Known resource metadata is persisted in the sync-state store, but it is derived
+      // projection state. Validate and repair it before raw state-store precedence is
+      // applied so one historical malformed resource item cannot poison every later Joplin
+      // synchronization cycle.
+      if (this.IsRootItemFile(
+            path
+          )) {
+        JoplinResourceProjectionRecord resourceRecord =
+          this.FindResourceProjectionRecordByPath(
+            path,
+            projection.State
+          );
+
+        if (resourceRecord != null) {
+          this.EnsureProjectedResourceStateFile(
+            resourceRecord,
+            projection.State
+          );
+        }
+      }
+
+      // A raw state-store item represents Joplin protocol/projection state and normally
       // takes precedence over the dynamic Knowledge projection.
       JoplinWebDavEntry stateBackedEntry;
 
