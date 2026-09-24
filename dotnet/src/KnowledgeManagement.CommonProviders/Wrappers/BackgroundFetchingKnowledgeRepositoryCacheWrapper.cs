@@ -27,7 +27,7 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
   /// </summary>
   public sealed class BackgroundFetchingKnowledgeRepositoryCacheWrapper : IKnowledgeRepository {
 
-    private const int _CacheFormatVersion = 2;
+    private const int _CacheFormatVersion = 3;
     private const string _CacheDirectoryName = ".knowledge-cache";
     private const string _CacheEntryExtension = ".cache";
     private const string _CacheGenerationFileName = ".generation";

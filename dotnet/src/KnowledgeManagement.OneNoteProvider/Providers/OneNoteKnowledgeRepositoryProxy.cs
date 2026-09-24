@@ -843,6 +843,15 @@ namespace KnowledgeManagement.SmartStandards.Providers {
         RegexOptions.IgnoreCase
       );
 
+      // OneNote may emit U+FFFC OBJECT REPLACEMENT CHARACTER next to embedded objects.
+      // The object itself is projected separately as a knowledge resource, so retaining the
+      // placeholder would only expose an invisible/square replacement marker in Markdown.
+      markdown = markdown.Replace(
+        "\uFFFC",
+        string.Empty,
+        StringComparison.Ordinal
+      );
+
       return markdown.Trim();
     }
 
@@ -878,24 +887,137 @@ namespace KnowledgeManagement.SmartStandards.Providers {
       }
 
       foreach (HtmlNode link in links.ToArray()) {
-        string href = WebUtility.HtmlDecode(link.GetAttributeValue("href", string.Empty)).Trim();
-        string label = WebUtility.HtmlDecode(link.InnerText).Trim();
-        if (string.IsNullOrWhiteSpace(label)) {
-          label = href;
-        }
+        string href = WebUtility.HtmlDecode(
+          link.GetAttributeValue(
+            "href",
+            string.Empty
+          )
+        ).Trim();
 
-        string target = href;
-        if (href.StartsWith("onenote:", StringComparison.OrdinalIgnoreCase)) {
-          string resolvedArea = this.TryResolveOneNoteLinkToKnownArea(href);
+        if (href.StartsWith(
+              "onenote:",
+              StringComparison.OrdinalIgnoreCase
+            )) {
+          string resolvedArea = this.TryResolveOneNoteLinkToKnownArea(
+            href
+          );
+
           if (!string.IsNullOrWhiteSpace(resolvedArea)) {
-            target = _AreaPrefix + resolvedArea;
+            href = _AreaPrefix + resolvedArea;
           }
         }
 
-        string markdown = "[" + this.EscapeMarkdownLinkText(label) + "](" + this.EscapeMarkdownLinkTarget(target) + ")";
-        HtmlNode replacement = document.CreateTextNode(markdown);
-        link.ParentNode.ReplaceChild(replacement, link);
+        // Do not replace the anchor with Markdown text here. ReverseMarkdown is responsible
+        // for the single HTML-to-Markdown conversion. Replacing <a> with "[...](...)" before
+        // that conversion makes the converter escape or re-wrap already generated Markdown.
+        link.SetAttributeValue(
+          "href",
+          href
+        );
+
+        this.NormalizeOneNoteLinkLabel(
+          link,
+          href
+        );
       }
+    }
+
+    /// <summary>
+    /// Normalizes OneNote link labels which already contain a textual Markdown link.
+    ///
+    /// Imported notes can contain constructs such as
+    /// "[https://example.test](https://example.test)" as the visible text of an HTML anchor.
+    /// Keeping that text unchanged would create nested Markdown when ReverseMarkdown converts
+    /// the surrounding anchor. If the embedded textual target equals the actual anchor target,
+    /// only the human-readable label is retained.
+    /// </summary>
+    private void NormalizeOneNoteLinkLabel(
+      HtmlNode link,
+      string href
+    ) {
+      string label = WebUtility.HtmlDecode(
+        link.InnerText
+      ).Trim();
+
+      if (string.IsNullOrWhiteSpace(label)) {
+        link.InnerHtml = WebUtility.HtmlEncode(
+          href
+        );
+
+        return;
+      }
+
+      Match markdownLink = Regex.Match(
+        label,
+        @"^\[(?<label>[^\]]+)\]\((?<target>[^\)]+)\)$",
+        RegexOptions.CultureInvariant
+      );
+
+      if (!markdownLink.Success) {
+        return;
+      }
+
+      string embeddedTarget = WebUtility.HtmlDecode(
+        markdownLink.Groups["target"].Value
+      ).Trim();
+
+      if (!this.AreEquivalentLinkTargets(
+            embeddedTarget,
+            href
+          )) {
+        return;
+      }
+
+      string normalizedLabel = WebUtility.HtmlDecode(
+        markdownLink.Groups["label"].Value
+      ).Trim();
+
+      if (string.IsNullOrWhiteSpace(normalizedLabel)) {
+        normalizedLabel = href;
+      }
+
+      link.InnerHtml = WebUtility.HtmlEncode(
+        normalizedLabel
+      );
+    }
+
+    /// <summary>
+    /// Determines whether two textual link targets identify the same URI after the minimal
+    /// escaping differences introduced by Markdown and HTML have been normalized.
+    /// </summary>
+    private bool AreEquivalentLinkTargets(
+      string first,
+      string second
+    ) {
+      string normalizedFirst = WebUtility.HtmlDecode(
+        first
+      ).Replace(
+        "\\(",
+        "(",
+        StringComparison.Ordinal
+      ).Replace(
+        "\\)",
+        ")",
+        StringComparison.Ordinal
+      ).Trim();
+
+      string normalizedSecond = WebUtility.HtmlDecode(
+        second
+      ).Replace(
+        "\\(",
+        "(",
+        StringComparison.Ordinal
+      ).Replace(
+        "\\)",
+        ")",
+        StringComparison.Ordinal
+      ).Trim();
+
+      return string.Equals(
+        normalizedFirst,
+        normalizedSecond,
+        StringComparison.OrdinalIgnoreCase
+      );
     }
 
     /// <summary>

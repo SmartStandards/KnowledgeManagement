@@ -9,6 +9,7 @@
     <Import_RootNamespace>KnowledgeManagement.SmartStandards</Import_RootNamespace>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="$(MSBuildThisFileDirectory)Providers\FileSystemExposureFilter.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Wrappers\AggregatedKnowledgeRepository.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Wrappers\IKnowledgeRepositoryCacheControl.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Wrappers\BackgroundFetchingKnowledgeRepositoryCacheWrapper.cs" />
@@ -16,8 +17,5 @@
     <Compile Include="$(MSBuildThisFileDirectory)Providers\GitBasedKnowledgeRepository.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Providers\FileBasedKnowledgeRepository.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)[Helpers]\XmlCommentAccessExtensions.cs" />
-  </ItemGroup>
-  <ItemGroup>
-    <Folder Include="$(MSBuildThisFileDirectory)Providers\" />
   </ItemGroup>
 </Project>

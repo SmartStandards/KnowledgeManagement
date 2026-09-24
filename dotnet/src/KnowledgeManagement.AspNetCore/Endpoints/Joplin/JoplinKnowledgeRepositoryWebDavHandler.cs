@@ -1758,9 +1758,66 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Joplin {
         );
 
         if (resource == null) {
-          throw new InvalidOperationException(
-            "Knowledge content references a resource identifier that the provider does not expose in the current scope."
-          );
+          // Structural repository changes can invalidate a previously exposed provider-owned
+          // ResourceId before every persisted knowledge reference has been rewritten. A
+          // resource that has already been synchronized to Joplin can be reconciled safely
+          // as a server-side deletion without aborting the complete projection.
+          JoplinResourceProjectionRecord existingRecord =
+            state.Resources.FirstOrDefault(
+              (JoplinResourceProjectionRecord candidate) =>
+                string.Equals(
+                  candidate.ResourceId,
+                  resourceId,
+                  StringComparison.Ordinal
+                )
+            );
+
+          if (existingRecord == null) {
+            // Never interpret a new or previously unknown broken reference as a deletion.
+            // Without an existing synchronization mapping there is no evidence that Joplin
+            // has ever seen this resource successfully.
+            throw new InvalidOperationException(
+              "Knowledge content references a resource identifier that the provider does not expose in the current scope."
+            );
+          }
+
+          if (!existingRecord.IsSuppressed) {
+            existingRecord.IsSuppressed =
+              true;
+
+            existingRecord.ModifiedUtc =
+              DateTime.UtcNow;
+
+            _SyncStateStore.Delete(
+              "/"
+              + existingRecord.JoplinId
+              + _MarkdownExtension
+            );
+
+            _SyncStateStore.Delete(
+              _ResourceCollection
+              + "/"
+              + existingRecord.JoplinId
+            );
+
+            DevLogger.LogTrace(
+              0,
+              99999,
+              "Joplin resource projection self-healed because previously synchronized Knowledge ResourceId '"
+              + resourceId
+              + "' is no longer exposed by the repository. JoplinId='"
+              + existingRecord.JoplinId
+              + "'. The resource is now suppressed so Joplin can reconcile the server-side deletion."
+            );
+          }
+
+          // Keep the note reference mapped to the previously stable Joplin resource ID for
+          // this projection. The corresponding resource metadata/blob is no longer exposed,
+          // allowing the Joplin client to reconcile the server-side deletion itself.
+          mappings[resourceId] =
+            existingRecord.JoplinId;
+
+          continue;
         }
 
         JoplinResourceProjectionRecord record = state.Resources

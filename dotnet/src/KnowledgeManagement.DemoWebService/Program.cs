@@ -62,10 +62,13 @@ namespace KnowledgeManagement.SmartStandards.DemoWebService {
       //FILESYSTEM
 
       root.Add(
-        new FileBasedKnowledgeRepository("C:\\Temp\\_OneNoteExport", false, true),
+        new FileBasedKnowledgeRepository("C:\\Temp\\_OneNoteExport", readOnly: false, useSoftDelete: true),
+        "/Local writable Demo/"
+      );
+      root.Add(
+        new FileBasedKnowledgeRepository("C:\\GIT-TK\\AI-Skills", readOnly:true, useSoftDelete:true),
         "/AI-Promptlib/"
       );
-
 
       //////////////////////////////////////////////////////////////////////////////////////////
       //GITHUB

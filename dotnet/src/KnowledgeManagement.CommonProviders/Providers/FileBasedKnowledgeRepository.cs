@@ -31,6 +31,11 @@ namespace KnowledgeManagement.SmartStandards.Providers {
   /// operations naturally move such files together with their containing directory,
   /// because the directory itself is the provider's physical representation of the
   /// logical aggregation area.
+  ///
+  /// Physical exposure is filtered before files, directories or binary resources enter the
+  /// logical model. The default global blacklist excludes <c>**/.git</c> and <c>**/.vs</c>.
+  /// Hierarchical <c>.gitignore</c> files are enabled by default and are scoped to their own
+  /// directory subtree. Static blacklist and whitelist rules can be configured independently.
   /// 
   /// The implementation uses atomic mutation scopes. Before a mutating file-system
   /// operation is published, a provider-level snapshot is created. If the mutation
@@ -79,11 +84,20 @@ namespace KnowledgeManagement.SmartStandards.Providers {
       RegexOptions.Compiled | RegexOptions.CultureInvariant
     );
 
+    private static readonly string[] _DefaultBlacklist = new string[] {
+      "**/.git",
+      "**/.vs"
+    };
+
     protected readonly object _SyncRoot = new object();
 
     private string _RootDirectory;
     private readonly bool _ReadOnly;
     private readonly bool _UseSoftDelete;
+    private string[] _Blacklist;
+    private string[] _Whitelist;
+    private bool _UseGitIgnoreFiles;
+    private FileSystemExposureFilter _ExposureFilter;
     private bool _Initialized;
     private readonly object _GeneratedResourceNameSyncRoot = new object();
     private long _LastGeneratedResourceTimestamp;
@@ -91,12 +105,15 @@ namespace KnowledgeManagement.SmartStandards.Providers {
 
     /// <summary>
     /// Creates a file-based knowledge repository rooted at the specified directory.
-    /// 
+    ///
     /// The directory is created when it does not yet exist and the repository is not
     /// read-only. A read-only repository requires the directory to exist.
-    /// 
+    ///
     /// No global process configuration is modified. All operations are scoped to the
     /// supplied directory.
+    ///
+    /// The default exposure policy blocks <c>**/.git</c> and <c>**/.vs</c> everywhere and
+    /// evaluates hierarchical <c>.gitignore</c> files.
     /// </summary>
     /// <param name="rootDirectory">
     /// The physical directory that represents the logical knowledge repository root.
@@ -118,6 +135,9 @@ namespace KnowledgeManagement.SmartStandards.Providers {
     /// <summary>
     /// Creates a file-based knowledge repository rooted at the specified directory and
     /// optionally enables reversible soft deletion for Markdown documents.
+    ///
+    /// The default exposure policy blocks <c>**/.git</c> and <c>**/.vs</c> everywhere and
+    /// evaluates hierarchical <c>.gitignore</c> files.
     /// </summary>
     /// <param name="rootDirectory">
     /// The physical directory that represents the logical knowledge repository root.
@@ -135,20 +155,66 @@ namespace KnowledgeManagement.SmartStandards.Providers {
       string rootDirectory,
       bool readOnly,
       bool useSoftDelete
+    ) : this(
+      rootDirectory,
+      readOnly,
+      useSoftDelete,
+      _DefaultBlacklist,
+      Array.Empty<string>(),
+      true
+    ) {
+    }
+
+    /// <summary>
+    /// Creates a file-based repository with an explicit exposure policy.
+    ///
+    /// Static blacklist and whitelist rules are evaluated globally below the configured
+    /// repository root. When <paramref name="useGitIgnoreFiles"/> is enabled, every
+    /// <c>.gitignore</c> file is evaluated only for its own directory subtree and is combined
+    /// with the static policy.
+    /// </summary>
+    /// <param name="rootDirectory">The physical repository root.</param>
+    /// <param name="readOnly">Whether all repository mutations are disabled.</param>
+    /// <param name="useSoftDelete">Whether provider deletes use reversible soft deletion.</param>
+    /// <param name="blacklist">Global ignore patterns. Blacklist matches hide files and directories.</param>
+    /// <param name="whitelist">
+    /// Global include patterns evaluated after ignore-file and blacklist rules. Explicit
+    /// whitelist matches can re-include a statically or dynamically ignored path.
+    /// </param>
+    /// <param name="useGitIgnoreFiles">
+    /// Whether hierarchical <c>.gitignore</c> files participate in exposure decisions.
+    /// </param>
+    public FileBasedKnowledgeRepository(
+      string rootDirectory,
+      bool readOnly,
+      bool useSoftDelete,
+      string[] blacklist,
+      string[] whitelist,
+      bool useGitIgnoreFiles
     ) {
       _RootDirectory = string.Empty;
       _ReadOnly = readOnly;
       _UseSoftDelete = useSoftDelete;
+      _Blacklist = this.NormalizeExposurePatterns(
+        blacklist
+      );
+      _Whitelist = this.NormalizeExposurePatterns(
+        whitelist
+      );
+      _UseGitIgnoreFiles = useGitIgnoreFiles;
+      _ExposureFilter = null;
       _Initialized = false;
       _LastGeneratedResourceTimestamp = -1;
       _LastGeneratedResourceSequence = 0;
 
-      this.InitializeRootDirectory(rootDirectory);
+      this.InitializeRootDirectory(
+        rootDirectory
+      );
     }
 
     /// <summary>
     /// Initializes the base repository without assigning a physical root immediately.
-    /// 
+    ///
     /// This constructor exists for derived providers that must prepare their storage
     /// before the file-based projection can be attached to it.
     /// </summary>
@@ -172,13 +238,116 @@ namespace KnowledgeManagement.SmartStandards.Providers {
     protected FileBasedKnowledgeRepository(
       bool readOnly,
       bool useSoftDelete
+    ) : this(
+      readOnly,
+      useSoftDelete,
+      _DefaultBlacklist,
+      Array.Empty<string>(),
+      true
+    ) {
+    }
+
+    /// <summary>
+    /// Initializes the base repository for a derived provider with an explicit exposure
+    /// policy while deferring assignment of the physical root.
+    /// </summary>
+    /// <param name="readOnly">Whether the derived repository is read-only.</param>
+    /// <param name="useSoftDelete">Whether provider deletes use reversible soft deletion.</param>
+    /// <param name="blacklist">Global ignore patterns.</param>
+    /// <param name="whitelist">Global include patterns.</param>
+    /// <param name="useGitIgnoreFiles">Whether hierarchical .gitignore files are evaluated.</param>
+    protected FileBasedKnowledgeRepository(
+      bool readOnly,
+      bool useSoftDelete,
+      string[] blacklist,
+      string[] whitelist,
+      bool useGitIgnoreFiles
     ) {
       _RootDirectory = string.Empty;
       _ReadOnly = readOnly;
       _UseSoftDelete = useSoftDelete;
+      _Blacklist = this.NormalizeExposurePatterns(
+        blacklist
+      );
+      _Whitelist = this.NormalizeExposurePatterns(
+        whitelist
+      );
+      _UseGitIgnoreFiles = useGitIgnoreFiles;
+      _ExposureFilter = null;
       _Initialized = false;
       _LastGeneratedResourceTimestamp = -1;
       _LastGeneratedResourceSequence = 0;
+    }
+
+    /// <summary>
+    /// Gets or replaces the global exposure blacklist.
+    ///
+    /// The default value is <c>**/.git</c> and <c>**/.vs</c>. Rules use the same glob
+    /// vocabulary as the exposure filter. Changes apply immediately to subsequent repository
+    /// operations.
+    /// </summary>
+    public string[] Blacklist {
+      get {
+        lock (_SyncRoot) {
+          return _Blacklist.ToArray();
+        }
+      }
+      set {
+        lock (_SyncRoot) {
+          _Blacklist =
+            this.NormalizeExposurePatterns(
+              value
+            );
+
+          this.RebuildExposureFilter();
+        }
+      }
+    }
+
+    /// <summary>
+    /// Gets or replaces the global exposure whitelist.
+    ///
+    /// Whitelist rules are explicit exceptions and are evaluated after .gitignore and static
+    /// blacklist rules.
+    /// </summary>
+    public string[] Whitelist {
+      get {
+        lock (_SyncRoot) {
+          return _Whitelist.ToArray();
+        }
+      }
+      set {
+        lock (_SyncRoot) {
+          _Whitelist =
+            this.NormalizeExposurePatterns(
+              value
+            );
+
+          this.RebuildExposureFilter();
+        }
+      }
+    }
+
+    /// <summary>
+    /// Gets or sets whether hierarchical .gitignore files participate in exposure filtering.
+    ///
+    /// Each .gitignore file affects only its own directory and descendants. Rules discovered
+    /// below one branch never affect siblings or ancestors.
+    /// </summary>
+    public bool UseGitIgnoreFiles {
+      get {
+        lock (_SyncRoot) {
+          return _UseGitIgnoreFiles;
+        }
+      }
+      set {
+        lock (_SyncRoot) {
+          _UseGitIgnoreFiles =
+            value;
+
+          this.RebuildExposureFilter();
+        }
+      }
     }
 
     /// <summary>
@@ -227,6 +396,71 @@ namespace KnowledgeManagement.SmartStandards.Providers {
 
       _RootDirectory = fullPath;
       _Initialized = true;
+
+      this.RebuildExposureFilter();
+    }
+
+    /// <summary>
+    /// Normalizes one externally supplied exposure pattern collection.
+    /// </summary>
+    private string[] NormalizeExposurePatterns(
+      string[] patterns
+    ) {
+      if (patterns == null ||
+          patterns.Length == 0) {
+        return Array.Empty<string>();
+      }
+
+      return patterns
+        .Where(
+          (string pattern) => !string.IsNullOrWhiteSpace(
+            pattern
+          )
+        )
+        .Select(
+          (string pattern) => pattern.Trim()
+        )
+        .Distinct(
+          StringComparer.Ordinal
+        )
+        .ToArray();
+    }
+
+    /// <summary>
+    /// Rebuilds the provider-local exposure filter after root or configuration changes.
+    /// </summary>
+    private void RebuildExposureFilter() {
+      if (!_Initialized) {
+        return;
+      }
+
+      _ExposureFilter =
+        new FileSystemExposureFilter(
+          _RootDirectory,
+          _Blacklist,
+          _Whitelist,
+          _UseGitIgnoreFiles
+        );
+    }
+
+    /// <summary>
+    /// Returns whether one physical file-system path is allowed to participate in the
+    /// repository's externally visible model.
+    /// </summary>
+    private bool IsPhysicalPathExposed(
+      string physicalPath,
+      bool isDirectory
+    ) {
+      this.EnsureInitialized();
+
+      if (_ExposureFilter == null) {
+        this.RebuildExposureFilter();
+      }
+
+      return _ExposureFilter.IsVisible(
+        physicalPath,
+        isDirectory
+      );
     }
 
     /// <summary>
@@ -990,7 +1224,11 @@ namespace KnowledgeManagement.SmartStandards.Providers {
               string.Empty
             );
 
-            if (!Directory.Exists(directoryPath)) {
+            if (!this.IsPhysicalPathExposed(
+                  directoryPath,
+                  true
+                ) ||
+                !Directory.Exists(directoryPath)) {
               throw new InvalidOperationException(
                 "The knowledge area does not exist: " + normalizedArea
               );
@@ -1014,7 +1252,11 @@ namespace KnowledgeManagement.SmartStandards.Providers {
               _MarkdownExtension
             );
 
-            if (!File.Exists(documentPath)) {
+            if (!this.IsPhysicalPathExposed(
+                  documentPath,
+                  false
+                ) ||
+                !File.Exists(documentPath)) {
               throw new InvalidOperationException(
                 "The knowledge area does not exist: " + normalizedArea
               );
@@ -1199,6 +1441,13 @@ namespace KnowledgeManagement.SmartStandards.Providers {
           continue;
         }
 
+        if (!this.IsPhysicalPathExposed(
+              file,
+              false
+            )) {
+          continue;
+        }
+
         result.Add(file);
       }
 
@@ -1218,6 +1467,13 @@ namespace KnowledgeManagement.SmartStandards.Providers {
         );
 
         if (this.IsProviderInternalDirectory(directoryName)) {
+          continue;
+        }
+
+        if (!this.IsPhysicalPathExposed(
+              childDirectory,
+              true
+            )) {
           continue;
         }
 
@@ -1336,7 +1592,11 @@ namespace KnowledgeManagement.SmartStandards.Providers {
           Path.GetExtension(candidateFileName)
         );
 
-        if (!File.Exists(preferredPath) &&
+        if (this.IsPhysicalPathExposed(
+              preferredPath,
+              false
+            ) &&
+            !File.Exists(preferredPath) &&
             !Directory.Exists(preferredPath)) {
           return preferredPath;
         }
@@ -1364,6 +1624,15 @@ namespace KnowledgeManagement.SmartStandards.Providers {
           Path.GetFileNameWithoutExtension(generatedFileName),
           Path.GetExtension(generatedFileName)
         );
+
+        if (!this.IsPhysicalPathExposed(
+              generatedPath,
+              false
+            )) {
+          throw new InvalidOperationException(
+            "The exposure policy does not allow a resource file with the requested content type in this directory."
+          );
+        }
 
         if (!File.Exists(generatedPath) &&
             !Directory.Exists(generatedPath)) {
@@ -1517,6 +1786,15 @@ namespace KnowledgeManagement.SmartStandards.Providers {
         fullResourcePath
       );
 
+      if (!this.IsPhysicalPathExposed(
+            fullResourcePath,
+            false
+          )) {
+        throw new InvalidOperationException(
+          "The requested resource is excluded by the file-system exposure policy."
+        );
+      }
+
       string relativePath = Path.GetRelativePath(
         _RootDirectory,
         fullResourcePath
@@ -1602,6 +1880,15 @@ namespace KnowledgeManagement.SmartStandards.Providers {
       this.EnsurePathInsideRepository(
         physicalPath
       );
+
+      if (!this.IsPhysicalPathExposed(
+            physicalPath,
+            false
+          )) {
+        throw new InvalidOperationException(
+          "The requested knowledge resource does not exist."
+        );
+      }
 
       return physicalPath;
     }
@@ -1726,6 +2013,13 @@ namespace KnowledgeManagement.SmartStandards.Providers {
           continue;
         }
 
+        if (!this.IsPhysicalPathExposed(
+              candidate,
+              false
+            )) {
+          continue;
+        }
+
         if (!File.Exists(candidate)) {
           continue;
         }
@@ -1769,7 +2063,12 @@ namespace KnowledgeManagement.SmartStandards.Providers {
             directory,
             documentName + _ResourceMarker + uid + ".*",
             SearchOption.TopDirectoryOnly
-          );
+          ).Where(
+            (string candidate) => this.IsPhysicalPathExposed(
+              candidate,
+              false
+            )
+          ).ToArray();
 
           if (candidates.Length != 1) {
             return match.Value;
@@ -2014,6 +2313,13 @@ namespace KnowledgeManagement.SmartStandards.Providers {
         physicalPath = rebasedPath;
       }
 
+      if (!this.IsPhysicalPathExposed(
+            physicalPath,
+            false
+          )) {
+        return false;
+      }
+
       if (!File.Exists(physicalPath)) {
         return false;
       }
@@ -2252,6 +2558,17 @@ namespace KnowledgeManagement.SmartStandards.Providers {
         );
       }
       else {
+        targetResourcePath = this.CreateNewResourcePath(
+          targetDocumentPath,
+          string.Empty,
+          this.GetContentTypeFromExtension(extension)
+        );
+      }
+
+      if (!this.IsPhysicalPathExposed(
+            targetResourcePath,
+            false
+          )) {
         targetResourcePath = this.CreateNewResourcePath(
           targetDocumentPath,
           string.Empty,
@@ -2551,6 +2868,13 @@ namespace KnowledgeManagement.SmartStandards.Providers {
       );
 
       foreach (string file in files) {
+        if (!this.IsPhysicalPathExposed(
+              file,
+              false
+            )) {
+          continue;
+        }
+
         if (this.IsOwnedResourceForDocument(
               file,
               documentPath
@@ -2644,6 +2968,81 @@ namespace KnowledgeManagement.SmartStandards.Providers {
       return string.Empty;
     }
 
+    /// <summary>
+    /// Returns whether one physical directory contains an artifact that is deliberately
+    /// outside the repository exposure model.
+    ///
+    /// Directory-level destructive or relocating mutations are rejected in that case so a
+    /// caller cannot indirectly delete, rename or move protected content such as nested
+    /// <c>.git</c> metadata through an otherwise visible parent area.
+    /// </summary>
+    private bool ContainsProtectedPhysicalDescendant(
+      string directoryPath
+    ) {
+      string[] files =
+        Directory.GetFiles(
+          directoryPath,
+          "*",
+          SearchOption.TopDirectoryOnly
+        );
+
+      foreach (string file in files) {
+        if (this.IsReparsePoint(
+              file
+            )) {
+          return true;
+        }
+
+        if (!this.IsPhysicalPathExposed(
+              file,
+              false
+            )) {
+          return true;
+        }
+      }
+
+      string[] directories =
+        Directory.GetDirectories(
+          directoryPath,
+          "*",
+          SearchOption.TopDirectoryOnly
+        );
+
+      foreach (string childDirectory in directories) {
+        string directoryName =
+          Path.GetFileName(
+            childDirectory
+          );
+
+        if (this.IsProviderInternalDirectory(
+              directoryName
+            )) {
+          return true;
+        }
+
+        if (this.IsReparsePoint(
+              childDirectory
+            )) {
+          return true;
+        }
+
+        if (!this.IsPhysicalPathExposed(
+              childDirectory,
+              true
+            )) {
+          return true;
+        }
+
+        if (this.ContainsProtectedPhysicalDescendant(
+              childDirectory
+            )) {
+          return true;
+        }
+      }
+
+      return false;
+    }
+
     private bool TryDeleteCore(string area, MutationContext context) {
       AreaDescriptor descriptor = this.ResolveArea(area, context);
 
@@ -2652,6 +3051,12 @@ namespace KnowledgeManagement.SmartStandards.Providers {
       }
 
       if (descriptor.Kind == AreaKind.Directory) {
+        if (this.ContainsProtectedPhysicalDescendant(
+              descriptor.PhysicalPath
+            )) {
+          return false;
+        }
+
         context.ForgetDocumentsBelow(descriptor.PhysicalPath);
 
         if (_UseSoftDelete) {
@@ -2716,6 +3121,12 @@ namespace KnowledgeManagement.SmartStandards.Providers {
       }
 
       if (descriptor.Kind == AreaKind.Directory) {
+        if (this.ContainsProtectedPhysicalDescendant(
+              descriptor.PhysicalPath
+            )) {
+          return false;
+        }
+
         string directoryName = newName.Trim();
 
         if (this.IsDirectorySegment(directoryName)) {
@@ -2740,6 +3151,13 @@ namespace KnowledgeManagement.SmartStandards.Providers {
           directoryName,
           string.Empty
         );
+
+        if (!this.IsPhysicalPathExposed(
+              targetPath,
+              true
+            )) {
+          return false;
+        }
 
         if (Directory.Exists(targetPath) || File.Exists(targetPath)) {
           return false;
@@ -2784,6 +3202,13 @@ namespace KnowledgeManagement.SmartStandards.Providers {
           documentName,
           _MarkdownExtension
         );
+
+        if (!this.IsPhysicalPathExposed(
+              targetPath,
+              false
+            )) {
+          return false;
+        }
 
         if (File.Exists(targetPath) || Directory.Exists(targetPath)) {
           return false;
@@ -2858,6 +3283,13 @@ namespace KnowledgeManagement.SmartStandards.Providers {
             string.Empty
           );
 
+          if (!this.IsPhysicalPathExposed(
+                directoryPath,
+                true
+              )) {
+            return false;
+          }
+
           if (Directory.Exists(directoryPath) || File.Exists(directoryPath)) {
             return false;
           }
@@ -2878,6 +3310,13 @@ namespace KnowledgeManagement.SmartStandards.Providers {
           logicalName,
           _MarkdownExtension
         );
+
+        if (!this.IsPhysicalPathExposed(
+              documentPath,
+              false
+            )) {
+          return false;
+        }
 
         if (File.Exists(documentPath) || Directory.Exists(documentPath)) {
           return false;
@@ -3017,6 +3456,13 @@ namespace KnowledgeManagement.SmartStandards.Providers {
           }
 
           if (this.IsResourceCompanionFile(markdownFile)) {
+            continue;
+          }
+
+          if (!this.IsPhysicalPathExposed(
+                markdownFile,
+                false
+              )) {
             continue;
           }
 
@@ -3160,6 +3606,12 @@ namespace KnowledgeManagement.SmartStandards.Providers {
         return false;
       }
 
+      if (this.ContainsProtectedPhysicalDescendant(
+            contentToMove.PhysicalPath
+          )) {
+        return false;
+      }
+
       string directoryName = Path.GetFileName(
         contentToMove.PhysicalPath
       );
@@ -3169,6 +3621,13 @@ namespace KnowledgeManagement.SmartStandards.Providers {
         directoryName,
         string.Empty
       );
+
+      if (!this.IsPhysicalPathExposed(
+            targetPath,
+            true
+          )) {
+        return false;
+      }
 
       if (Directory.Exists(targetPath) || File.Exists(targetPath)) {
         return false;
@@ -3210,6 +3669,13 @@ namespace KnowledgeManagement.SmartStandards.Providers {
         documentName,
         _MarkdownExtension
       );
+
+      if (!this.IsPhysicalPathExposed(
+            targetPath,
+            false
+          )) {
+        return false;
+      }
 
       if (File.Exists(targetPath) || Directory.Exists(targetPath)) {
         return false;
@@ -3434,6 +3900,13 @@ namespace KnowledgeManagement.SmartStandards.Providers {
             string.Empty
           );
 
+          if (!this.IsPhysicalPathExposed(
+                directoryPath,
+                true
+              )) {
+            return false;
+          }
+
           if (!Directory.Exists(directoryPath)) {
             if (File.Exists(directoryPath)) {
               return false;
@@ -3476,6 +3949,13 @@ namespace KnowledgeManagement.SmartStandards.Providers {
           documentName,
           _MarkdownExtension
         );
+
+        if (!this.IsPhysicalPathExposed(
+              documentPath,
+              false
+            )) {
+          return false;
+        }
 
         if (!File.Exists(documentPath)) {
           if (Directory.Exists(documentPath)) {
@@ -3866,6 +4346,13 @@ namespace KnowledgeManagement.SmartStandards.Providers {
           continue;
         }
 
+        if (!this.IsPhysicalPathExposed(
+              directoryInfo.FullName,
+              true
+            )) {
+          continue;
+        }
+
         string areaPath = this.CombineAreaPath(
           directoryDescriptor.AreaPath,
           this.CreateDirectorySegment(directoryInfo.Name)
@@ -3894,6 +4381,13 @@ namespace KnowledgeManagement.SmartStandards.Providers {
 
         if (this.IsSoftDeletedMarkdownFile(markdownFile) ||
             this.IsResourceCompanionFile(markdownFile)) {
+          continue;
+        }
+
+        if (!this.IsPhysicalPathExposed(
+              markdownFile,
+              false
+            )) {
           continue;
         }
 
@@ -4572,6 +5066,13 @@ namespace KnowledgeManagement.SmartStandards.Providers {
 
         if (this.IsSoftDeletedMarkdownFile(markdownFile) ||
             this.IsResourceCompanionFile(markdownFile)) {
+          continue;
+        }
+
+        if (!this.IsPhysicalPathExposed(
+              markdownFile,
+              false
+            )) {
           continue;
         }
 

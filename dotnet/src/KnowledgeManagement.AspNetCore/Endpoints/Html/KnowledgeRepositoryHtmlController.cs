@@ -535,6 +535,13 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
           document
         );
 
+      url =
+        this.AppendQueryParameter(
+          url,
+          "highlight",
+          query
+        );
+
       if (document != area) {
         DocumentView view =
           this.Document(
@@ -780,6 +787,37 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
       return url
         + separator
         + "cacheOnly=1";
+    }
+
+    /// <summary>
+    /// Appends one escaped query parameter to a locally generated URL while preserving
+    /// any already existing query string.
+    /// </summary>
+    private string AppendQueryParameter(
+      string url,
+      string name,
+      string value
+    ) {
+      string separator =
+        "?";
+
+      if (url.Contains(
+            "?",
+            StringComparison.Ordinal
+          )) {
+        separator =
+          "&";
+      }
+
+      return url
+        + separator
+        + Uri.EscapeDataString(
+          name
+        )
+        + "="
+        + Uri.EscapeDataString(
+          value
+        );
     }
 
     private void NoStore() {
@@ -1095,67 +1133,40 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
     }
 
     /// <summary>
-    /// Decodes one provider-neutral knowledge-area URI value exactly once.
+    /// Normalizes one provider-neutral knowledge-area target without changing its canonical
+    /// logical repository representation.
     ///
-    /// Providers may percent-encode URI characters such as spaces. The decoded logical
-    /// repository area is passed to BuildHtmlAreaRequestPath afterwards, which performs
-    /// the HTTP transport encoding exactly once. This prevents sequences such as %20 from
-    /// becoming %2520 while remaining fully provider-neutral.
+    /// Percent sequences belong to the logical repository path and are therefore never
+    /// URI-decoded here. HTTP transport escaping is applied later by
+    /// <see cref="BuildHtmlAreaRequestPath(string)"/>.
     /// </summary>
     private string DecodeKnowledgeAreaReference(
-      string encodedArea
+      string logicalArea
     ) {
       if (string.IsNullOrWhiteSpace(
-            encodedArea
+            logicalArea
           ) ||
           string.Equals(
-            encodedArea,
+            logicalArea,
             "/",
             StringComparison.Ordinal
           )) {
         return "/";
       }
 
-      string decodedArea;
+      string normalizedArea =
+        logicalArea.Trim();
 
-      try {
-        decodedArea =
-          Uri.UnescapeDataString(
-            encodedArea
-          );
-      }
-      catch (UriFormatException ex) {
-        DevLogger.LogError(
-          ex
-        );
-
-        // Keep malformed percent sequences literal. BuildHtmlAreaRequestPath will still
-        // transport them safely without introducing provider-specific interpretation.
-        decodedArea =
-          encodedArea;
-      }
-
-      if (string.IsNullOrWhiteSpace(
-            decodedArea
-          ) ||
-          string.Equals(
-            decodedArea,
+      if (!normalizedArea.StartsWith(
             "/",
             StringComparison.Ordinal
           )) {
-        return "/";
-      }
-
-      if (!decodedArea.StartsWith(
-            "/",
-            StringComparison.Ordinal
-          )) {
-        decodedArea =
+        normalizedArea =
           "/"
-          + decodedArea;
+          + normalizedArea;
       }
 
-      return decodedArea;
+      return normalizedArea;
     }
 
     private sealed class Heading {
@@ -2225,13 +2236,26 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
               false
             );
 
+          bool externalLink =
+            this.IsExternalBrowserLink(
+              linkUrl
+            );
+
           builder.Append("<a href=\"");
           builder.Append(
             WebUtility.HtmlEncode(
               linkUrl
             )
           );
-          builder.Append("\">");
+          builder.Append("\"");
+
+          if (externalLink) {
+            builder.Append(
+              " target=\"_blank\" rel=\"noopener noreferrer\""
+            );
+          }
+
+          builder.Append(">");
           builder.Append(
             WebUtility.HtmlEncode(
               match.Groups["linkText"].Value
@@ -2283,6 +2307,80 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
       }
 
       return builder.ToString();
+    }
+
+    /// <summary>
+    /// Returns whether one normalized Markdown link points to an external HTTP(S) origin.
+    /// Relative repository links, same-origin absolute links and non-browser schemes such as
+    /// mailto remain in the current browsing context.
+    /// </summary>
+    private bool IsExternalBrowserLink(
+      string url
+    ) {
+      Uri absoluteUri;
+
+      if (!Uri.TryCreate(
+            url,
+            UriKind.Absolute,
+            out absoluteUri
+          )) {
+        return false;
+      }
+
+      bool http =
+        string.Equals(
+          absoluteUri.Scheme,
+          Uri.UriSchemeHttp,
+          StringComparison.OrdinalIgnoreCase
+        );
+
+      bool https =
+        string.Equals(
+          absoluteUri.Scheme,
+          Uri.UriSchemeHttps,
+          StringComparison.OrdinalIgnoreCase
+        );
+
+      if (!http &&
+          !https) {
+        return false;
+      }
+
+      if (!string.Equals(
+            absoluteUri.Scheme,
+            this.Request.Scheme,
+            StringComparison.OrdinalIgnoreCase
+          )) {
+        return true;
+      }
+
+      if (!string.Equals(
+            absoluteUri.Host,
+            this.Request.Host.Host,
+            StringComparison.OrdinalIgnoreCase
+          )) {
+        return true;
+      }
+
+      int absolutePort =
+        absoluteUri.Port;
+
+      int requestPort;
+
+      if (this.Request.Host.Port.HasValue) {
+        requestPort =
+          this.Request.Host.Port.Value;
+      }
+      else if (this.Request.IsHttps) {
+        requestPort =
+          443;
+      }
+      else {
+        requestPort =
+          80;
+      }
+
+      return absolutePort != requestPort;
     }
 
     /// <summary>
@@ -2905,7 +3003,7 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
       }
     }
 
-    private string GetPageCss() { return @":root{color-scheme:light;--ink:#20372f;--muted:#708079;--line:#e0e7e2;--accent:#216d55}*{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:32px}body{margin:0;background:#fafbf9;color:var(--ink);font:16px/1.65 system-ui,sans-serif}a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}.site-header{display:flex;align-items:center;justify-content:space-between;gap:24px;padding:16px 32px;background:#fff;border-bottom:1px solid var(--line)}.brand{font-weight:700;font-size:22px;letter-spacing:-.03em}.header-actions{display:flex;gap:16px;align-items:center;font-size:12px}.quiet{border:0;background:none;color:var(--muted);padding:4px 0;cursor:pointer;font:inherit;white-space:nowrap}.quiet:hover{color:var(--accent)}#wiki-search{display:flex;gap:8px;align-items:center}#wiki-search input{width:230px;border:1px solid var(--line);background:#fafbf9;padding:7px 11px;font:13px system-ui}.breadcrumbs{max-width:1560px;margin:22px auto 0;padding:0 32px;font-size:12px;color:var(--muted)}.breadcrumbs ol{display:flex;flex-wrap:wrap;gap:0;list-style:none;padding:0;margin:0}.breadcrumbs li+li:before{content:'/';padding:0 10px;color:#a4b0a9}.breadcrumbs a{color:var(--muted)}.layout{max-width:1560px;display:grid;grid-template-columns:240px minmax(0,1fr);gap:32px;margin:20px auto 48px;padding:0 32px}.area-nav,.outline{font-size:13px;align-self:start;position:sticky;top:24px;max-height:calc(100vh - 48px);overflow:auto}.area-nav h2,.outline h2{margin:10px 0 12px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:var(--muted)}.area-nav a,.outline a{display:block;padding:6px 10px;border-radius:5px;color:var(--muted);overflow-wrap:anywhere}.area-nav a[aria-current],.outline a[aria-current]{color:var(--accent);background:#edf3ed}.area-nav a:hover,.outline a:hover{color:var(--accent);text-decoration:none;background:#f0f4f0}.outline nav{border-left:1px solid var(--line)}.outline .outline-level-2{padding-left:18px}.outline .outline-level-3{padding-left:28px}.outline .outline-level-4{padding-left:38px}.outline .outline-level-5,.outline .outline-level-6{padding-left:48px}main{min-width:0;background:white;border:1px solid var(--line);border-radius:8px;padding:32px 40px}h1{font-size:30px;line-height:1.25;margin:0 0 28px;letter-spacing:-.03em}article{overflow-wrap:anywhere}article h1,article h2,article h3,article h4,article h5,article h6{scroll-margin-top:28px}article h1{font-size:26px;margin-top:32px}article h2{font-size:23px;margin-top:30px}article h3{font-size:19px;margin-top:24px}article img{max-width:100%;height:auto}pre{overflow:auto;background:#f2f5f1;padding:16px;border-radius:6px}code{font-size:.9em}table{border-collapse:collapse;display:block;overflow:auto;max-width:100%}td,th{padding:8px 12px;border:1px solid var(--line)}blockquote{border-left:3px solid var(--line);margin-left:0;padding-left:20px;color:var(--muted)}.document-list{list-style:none;margin:0;padding:0}.document-list li{border-top:1px solid var(--line)}.document-list a{display:block;padding:14px 0}.muted{color:var(--muted)}
+    private string GetPageCss() { return @":root{color-scheme:light;--ink:#20372f;--muted:#708079;--line:#e0e7e2;--accent:#216d55}*{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:32px}body{margin:0;background:#fafbf9;color:var(--ink);font:16px/1.65 system-ui,sans-serif}a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}.site-header{display:flex;align-items:center;justify-content:space-between;gap:24px;padding:16px 32px;background:#fff;border-bottom:1px solid var(--line)}.brand{font-weight:700;font-size:22px;letter-spacing:-.03em}.header-actions{display:flex;gap:16px;align-items:center;font-size:12px}.quiet{border:0;background:none;color:var(--muted);padding:4px 0;cursor:pointer;font:inherit;white-space:nowrap}.quiet:hover{color:var(--accent)}#wiki-search{display:flex;gap:8px;align-items:center}#wiki-search input{width:230px;border:1px solid var(--line);background:#fafbf9;padding:7px 11px;font:13px system-ui}.breadcrumbs{max-width:1560px;margin:22px auto 0;padding:0 32px;font-size:12px;color:var(--muted)}.breadcrumbs ol{display:flex;flex-wrap:wrap;gap:0;list-style:none;padding:0;margin:0}.breadcrumbs li+li:before{content:'/';padding:0 10px;color:#a4b0a9}.breadcrumbs a{color:var(--muted)}.layout{max-width:1560px;display:grid;grid-template-columns:240px minmax(0,1fr);gap:32px;margin:20px auto 48px;padding:0 32px}.area-nav,.outline{font-size:13px;align-self:start;position:sticky;top:24px;max-height:calc(100vh - 48px);overflow:auto}.area-nav h2,.outline h2{margin:10px 0 12px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:var(--muted)}.area-nav a,.outline a{display:block;padding:6px 10px;border-radius:5px;color:var(--muted);overflow-wrap:anywhere}.area-nav a[aria-current],.outline a[aria-current]{color:var(--accent);background:#edf3ed}.area-nav a:hover,.outline a:hover{color:var(--accent);text-decoration:none;background:#f0f4f0}.outline nav{border-left:1px solid var(--line)}.outline .outline-level-2{padding-left:18px}.outline .outline-level-3{padding-left:28px}.outline .outline-level-4{padding-left:38px}.outline .outline-level-5,.outline .outline-level-6{padding-left:48px}main{min-width:0;background:white;border:1px solid var(--line);border-radius:8px;padding:32px 40px}h1{font-size:30px;line-height:1.25;margin:0 0 28px;letter-spacing:-.03em}article{overflow-wrap:anywhere}article h1,article h2,article h3,article h4,article h5,article h6{scroll-margin-top:28px}article h1{font-size:26px;margin-top:32px}article h2{font-size:23px;margin-top:30px}article h3{font-size:19px;margin-top:24px}article img{max-width:100%;height:auto}pre{overflow:auto;background:#f2f5f1;padding:16px;border-radius:6px}code{font-size:.9em}.table-scroll{width:calc(100% - 4px);max-width:calc(100% - 4px);overflow-x:auto;overflow-y:hidden}.table-scroll table{border-collapse:collapse;display:table;width:max-content;min-width:100%;max-width:none}.table-scroll td,.table-scroll th{padding:8px 12px;border:1px solid var(--line)}.table-scroll th{white-space:nowrap;position:relative;padding-right:20px}.column-resizer{position:absolute;top:0;right:0;width:8px;height:100%;cursor:col-resize;touch-action:none;user-select:none}.column-resizer:after{content:'';position:absolute;top:20%;bottom:20%;left:3px;border-left:1px solid var(--line)}body.table-resizing{cursor:col-resize;user-select:none}blockquote{border-left:3px solid var(--line);margin-left:0;padding-left:20px;color:var(--muted)}.document-list{list-style:none;margin:0;padding:0}.document-list li{border-top:1px solid var(--line)}.document-list a{display:block;padding:14px 0}.muted{color:var(--muted)}
 .repository-warning{max-width:1100px;margin:12px auto 0;padding:10px 14px;border:1px solid var(--border);border-radius:8px;font-size:.92rem}
 .area-nav a.cache-miss,
 .document-list a.cache-miss{color:#9aa0a6!important}
@@ -2918,7 +3016,7 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
 .document-list a.cache-miss:hover,
 .document-list a.cache-miss:focus{color:#7f868d!important}
 
-.cache-mode-badge{font-size:.78rem;line-height:1;padding:.28rem .48rem;border:1px solid var(--border);border-radius:999px;color:var(--muted);margin-left:.5rem;white-space:nowrap}.source-status{font-size:12px;color:var(--muted);margin-bottom:20px}.source-status summary{cursor:pointer}.source-status li{margin:8px 0}dialog{width:min(780px,calc(100vw - 32px));max-height:85vh;overflow:auto;border:1px solid var(--line);border-radius:12px;padding:24px 28px;color:var(--ink);box-shadow:0 24px 90px #18332f33}dialog:not([open]){display:none}dialog::backdrop{background:#102c254d}.dialog-head{display:flex;align-items:center;justify-content:space-between;gap:24px;border-bottom:1px solid var(--line);padding-bottom:12px;margin-bottom:20px}.dialog-head h2{font-size:19px;margin:0}.close-dialog{font-size:26px;padding:0 8px}input,select,textarea{border:1px solid #bdcbc2;border-radius:5px;color:var(--ink)}input,select{padding:8px}textarea{display:block;width:100%;padding:12px;font:14px/1.55 ui-monospace,monospace;resize:vertical}dialog button:not(.quiet){background:var(--accent);color:#fff;border:0;border-radius:5px;padding:9px 13px;cursor:pointer;margin:10px 8px 10px 0}dialog label{display:block;font-size:13px;margin-bottom:6px}.new-area{border-top:1px solid var(--line);padding-top:16px;margin-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}.api-url{display:block;overflow-wrap:anywhere}.notice{background:#eef5ef;padding:10px 14px;border-radius:5px;font-size:14px}.search-result{padding:16px 0;border-bottom:1px solid var(--line)}.search-result>a{font-weight:600;font-size:17px}.search-result small{display:block;color:var(--muted);overflow-wrap:anywhere}.search-result p{margin:6px 0 0;font-size:14px}button:focus-visible,a:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:3px}@media(max-width:1100px){.layout{grid-template-columns:210px minmax(0,1fr);gap:18px;padding:0 20px}main{padding:24px}.site-header{padding:14px 20px}.breadcrumbs{padding:0 20px}}@media(max-width:800px){.site-header{align-items:flex-start;gap:12px}.header-actions{gap:10px;flex-wrap:wrap;justify-content:flex-end}#wiki-search input{width:170px}.layout{grid-template-columns:minmax(0,1fr)}.area-nav{position:static;display:flex;gap:6px;flex-wrap:wrap;max-height:none}.area-nav h2{width:100%;margin:0}.outline{position:static;grid-row:2;max-height:180px}.outline:empty{display:none}main{grid-row:3}.outline h2{margin-top:0}.outline nav{display:flex;gap:4px;flex-wrap:wrap;border:0}.outline nav a{padding:3px 8px}.breadcrumbs{margin-top:14px}h1{font-size:26px}dialog{padding:18px}}@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+.cache-mode-badge{font-size:.78rem;line-height:1;padding:.28rem .48rem;border:1px solid var(--border);border-radius:999px;color:var(--muted);margin-left:.5rem;white-space:nowrap}.source-status{font-size:12px;color:var(--muted);margin-bottom:20px}.source-status summary{cursor:pointer}.source-status li{margin:8px 0}dialog{width:min(780px,calc(100vw - 32px));max-height:85vh;overflow:auto;border:1px solid var(--line);border-radius:12px;padding:24px 28px;color:var(--ink);box-shadow:0 24px 90px #18332f33}dialog:not([open]){display:none}dialog::backdrop{background:#102c254d}.dialog-head{display:flex;align-items:center;justify-content:space-between;gap:24px;border-bottom:1px solid var(--line);padding-bottom:12px;margin-bottom:20px}.dialog-head h2{font-size:19px;margin:0}.close-dialog{font-size:26px;padding:0 8px}input,select,textarea{border:1px solid #bdcbc2;border-radius:5px;color:var(--ink)}input,select{padding:8px}textarea{display:block;width:100%;padding:12px;font:14px/1.55 ui-monospace,monospace;resize:vertical}dialog button:not(.quiet){background:var(--accent);color:#fff;border:0;border-radius:5px;padding:9px 13px;cursor:pointer;margin:10px 8px 10px 0}dialog label{display:block;font-size:13px;margin-bottom:6px}.new-area{border-top:1px solid var(--line);padding-top:16px;margin-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}.api-url{display:block;overflow-wrap:anywhere}.notice{background:#eef5ef;padding:10px 14px;border-radius:5px;font-size:14px}.search-result{padding:16px 0;border-bottom:1px solid var(--line)}.search-result>a{font-weight:600;font-size:17px}.search-result small{display:block;color:var(--muted);overflow-wrap:anywhere}.search-result p{margin:6px 0 0;font-size:14px}mark.search-highlight{background:#fff0a6;color:inherit;padding:0 .08em;border-radius:2px}button:focus-visible,a:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:3px}@media(max-width:1100px){.layout{grid-template-columns:210px minmax(0,1fr);gap:18px;padding:0 20px}main{padding:24px}.site-header{padding:14px 20px}.breadcrumbs{padding:0 20px}}@media(max-width:800px){.site-header{align-items:flex-start;gap:12px}.header-actions{gap:10px;flex-wrap:wrap;justify-content:flex-end}#wiki-search input{width:170px}.layout{grid-template-columns:minmax(0,1fr)}.area-nav{position:static;display:flex;gap:6px;flex-wrap:wrap;max-height:none}.area-nav h2{width:100%;margin:0}.outline{position:static;grid-row:2;max-height:180px}.outline:empty{display:none}main{grid-row:3}.outline h2{margin-top:0}.outline nav{display:flex;gap:4px;flex-wrap:wrap;border:0}.outline nav a{padding:3px 8px}.breadcrumbs{margin-top:14px}h1{font-size:26px}dialog{padding:18px}}@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
 
 .sidebar{align-self:start;position:sticky;top:24px;max-height:calc(100vh - 48px);overflow:auto}.sidebar .area-nav,.sidebar .outline{position:static;max-height:none;overflow:visible}.sidebar .outline{margin-top:28px;border-top:1px solid var(--line);padding-top:10px}.header-actions form{margin:0}@media(max-width:800px){.sidebar{position:static;max-height:none}.sidebar .outline{max-height:220px;overflow:auto}main{grid-row:auto}}
 "; }
@@ -2931,6 +3029,148 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Html {
     const r = dialog.getBoundingClientRect();
     if (event.clientX < r.left || event.clientX > r.right || event.clientY < r.top || event.clientY > r.bottom) dialog.close();
   }));
+
+  const applyWordHighlight = () => {
+    const query = new URLSearchParams(window.location.search).get('highlight');
+
+    if (!query || !query.trim()) {
+      return;
+    }
+
+    const root = document.querySelector('main');
+
+    if (!root) {
+      return;
+    }
+
+    const needle = query.trim();
+    const needleLower = needle.toLocaleLowerCase();
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const matches = [];
+
+    while (walker.nextNode()) {
+      const node = walker.currentNode;
+      const parent = node.parentElement;
+
+      if (!parent ||
+          parent.closest('script,style,pre,code,mark.search-highlight')) {
+        continue;
+      }
+
+      if (node.nodeValue.toLocaleLowerCase().includes(needleLower)) {
+        matches.push(node);
+      }
+    }
+
+    matches.forEach(node => {
+      const source = node.nodeValue;
+      const sourceLower = source.toLocaleLowerCase();
+      const fragment = document.createDocumentFragment();
+      let position = 0;
+      let matchIndex = sourceLower.indexOf(needleLower);
+
+      while (matchIndex >= 0) {
+        if (matchIndex > position) {
+          fragment.append(
+            document.createTextNode(
+              source.substring(position, matchIndex)
+            )
+          );
+        }
+
+        const mark = document.createElement('mark');
+        mark.className = 'search-highlight';
+        mark.textContent = source.substring(matchIndex, matchIndex + needle.length);
+        fragment.append(mark);
+
+        position = matchIndex + needle.length;
+        matchIndex = sourceLower.indexOf(needleLower, position);
+      }
+
+      if (position < source.length) {
+        fragment.append(
+          document.createTextNode(
+            source.substring(position)
+          )
+        );
+      }
+
+      node.replaceWith(fragment);
+    });
+  };
+
+  const initializeResizableTables = () => {
+    document.querySelectorAll('.table-scroll table').forEach(table => {
+      const headers = [...table.querySelectorAll('thead th')];
+
+      headers.forEach((header, columnIndex) => {
+        if (header.querySelector('.column-resizer')) {
+          return;
+        }
+
+        const handle = document.createElement('span');
+        handle.className = 'column-resizer';
+        handle.setAttribute('role', 'separator');
+        handle.setAttribute('aria-orientation', 'vertical');
+        handle.setAttribute('title', 'Spaltenbreite ändern');
+        header.append(handle);
+
+        handle.addEventListener('pointerdown', event => {
+          if (event.button !== 0) {
+            return;
+          }
+
+          event.preventDefault();
+
+          const startX = event.clientX;
+          const cells = [...table.rows]
+            .map(row => row.cells[columnIndex])
+            .filter(cell => !!cell);
+
+          let startWidth = 0;
+
+          cells.forEach(cell => {
+            startWidth = Math.max(
+              startWidth,
+              cell.getBoundingClientRect().width
+            );
+          });
+
+          const applyWidth = width => {
+            cells.forEach(cell => {
+              cell.style.width = width + 'px';
+              cell.style.minWidth = width + 'px';
+            });
+          };
+
+          const onPointerMove = moveEvent => {
+            const width = Math.max(
+              80,
+              startWidth + moveEvent.clientX - startX
+            );
+
+            applyWidth(width);
+          };
+
+          const stopResize = () => {
+            window.removeEventListener('pointermove', onPointerMove);
+            window.removeEventListener('pointerup', stopResize);
+            window.removeEventListener('pointercancel', stopResize);
+            document.body.classList.remove('table-resizing');
+          };
+
+          document.body.classList.add('table-resizing');
+          window.addEventListener('pointermove', onPointerMove);
+          window.addEventListener('pointerup', stopResize);
+          window.addEventListener('pointercancel', stopResize);
+        });
+      });
+    });
+  };
+
+  applyWordHighlight();
+  initializeResizableTables();
+
   const searchDialog = document.getElementById('search-dialog');
   let activeSearchId = null;
   let activeSearchGeneration = 0;
