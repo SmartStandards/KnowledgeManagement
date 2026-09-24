@@ -1481,3 +1481,20 @@ The Joplin architecture intentionally chooses:
 15. synchronization correctness over aggressive stale-cache preference.
 
 Future changes should be checked against these decisions before modifying the protocol adapter.
+
+---
+
+# 61. External Source References
+
+Use these external references only as source orientation. Keep implementation rules, local architectural decisions, and adapter-specific behavior authoritative in this document and in source code.
+
+Official Joplin references verified as relevant for this adapter:
+
+- Joplin synchronization specification: <https://joplinapp.org/help/dev/spec/sync/>
+- Joplin synchronization lock specification: <https://joplinapp.org/help/dev/spec/sync_lock/>
+- Joplin server item specification: <https://joplinapp.org/help/dev/spec/server_items/>
+- Joplin REST API reference: <https://joplinapp.org/help/api/references/rest_api/>
+- Joplin WebDAV synchronization user documentation: <https://joplinapp.org/help/apps/sync/webdav/>
+- Joplin external link syntax documentation: <https://joplinapp.org/help/apps/external_links/>
+
+Do not copy external documentation text into this repository. Summarize only the implications that are relevant to this adapter.
