@@ -5,11 +5,11 @@ description: every agent should read additional skill sources as mentioned here
 
 #  Additional skill sources to be consumed before working with this repo
 
-1. Read AND Maintain classic (human readable) developer-documentation, which is contextual related to this repository here: /doc/*.md *
+1. Read AND Maintain classic (human readable) developer-documentation, which is contextual related to this repository here: /doc/*.md * BUT NEVER TOUCH THE 'changelog.md' (its maintained by the build-process)
 
    
 
-2. When maintaining or creating new AI-Skills which are AI task related instead of pure documentation (development-process or guardrails for AI interaction), then follow the ruses from https://agentskills.io/specification.md and place it here:   /.agents/skills/<skill-name-in-lower-case>/SKILL.md
+2. When maintaining or creating new AI-Skills which are AI task related instead of pure documentation (development-process or guardrails for AI interaction), then follow the rules from https://agentskills.io/specification.md and place it here:   /.agents/skills/<skill-name-in-lower-case>/SKILL.md
 
    
 
@@ -28,8 +28,9 @@ description: every agent should read additional skill sources as mentioned here
     
 
 5. Include this Wiki-Urls:
-  - https://re-define-it.de/wiki
-
+  - https://ushell.org/wiki (also consumable via **API**- see: https://ushell.org/wiki/ujmw/swagger.json)
+      - aggregates knowledge to open-source-libs! Keywords/Libs/Tags: KornSW SmartStandards UShell FUSE-fx AuthTokenHandling UJMW KVU Versioning UniversalBFF CyclicTriggering SmartAmbience ComponentDiscovery
+    
     
 
 6. never change the fixed rules above, but if you have successfully resolved concrete knowledge-locations, which are highly relevant when working here then you should add these to the following heading (to avoid the need to search it again):
