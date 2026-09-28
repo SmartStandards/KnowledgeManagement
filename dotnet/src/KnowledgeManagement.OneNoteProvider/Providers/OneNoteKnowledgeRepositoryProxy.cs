@@ -39,9 +39,21 @@ namespace KnowledgeManagement.SmartStandards.Providers {
     private readonly ConcurrentDictionary<string, HtmlDocument> _PageCache = new ConcurrentDictionary<string, HtmlDocument>(StringComparer.Ordinal);
     private readonly bool _ReadOnly;
     private readonly string _NotebookName;
-    private readonly HttpClient _HttpClient;
+    private readonly HttpClient _HttpClient;    
     private readonly Converter _HtmlToMarkdown;
-    private readonly string _SiteId;
+
+    private readonly string _OneNoteOrSiteUrl;
+    private string _SiteId = null;
+
+    private string SiteId { 
+      get {
+        if(_SiteId == null) {
+          _SiteId = this.ResolveSiteId(_OneNoteOrSiteUrl);
+        }
+        return _SiteId;
+      }
+    }
+
     private AreaNode _CachedTree;
     private NotebookInfo[] _CachedNotebooks;
     private DateTime _LastGraphRequestUtc = DateTime.MinValue;
@@ -54,22 +66,28 @@ namespace KnowledgeManagement.SmartStandards.Providers {
       string oneNoteOrSiteUrl,
       IOneNoteGraphAuthenticationProvider authenticationProvider,
       bool readOnly = true,
-      string notebookName = "") {
+      string notebookName = ""
+    ) {
 
       if (string.IsNullOrWhiteSpace(oneNoteOrSiteUrl)) {
         throw new ArgumentException("The OneNote or SharePoint URL is required.", nameof(oneNoteOrSiteUrl));
       }
+
       if (authenticationProvider == null) {
         throw new ArgumentNullException(nameof(authenticationProvider));
       }
 
+      _OneNoteOrSiteUrl = oneNoteOrSiteUrl;
+
       _ReadOnly = readOnly;
+
       if (notebookName == null) {
         _NotebookName = string.Empty;
       }
       else {
         _NotebookName = notebookName.Trim();
       }
+
       _HttpClient = authenticationProvider.CreateHttpClient(_ReadOnly);
       if (_HttpClient == null) {
         throw new InvalidOperationException("The authentication provider returned no HTTP client.");
@@ -81,10 +99,9 @@ namespace KnowledgeManagement.SmartStandards.Providers {
       configuration.RemoveComments = true;
       configuration.SmartHrefHandling = true;
       _HtmlToMarkdown = new Converter(configuration);
-      _SiteId = this.ResolveSiteId(oneNoteOrSiteUrl);
 
       if (!string.IsNullOrWhiteSpace(_NotebookName)) {
-        this.GetConfiguredNotebook(this.LoadNotebooks());
+        //this.GetConfiguredNotebook(this.LoadNotebooks());
       }
     }
 
@@ -203,7 +220,7 @@ namespace KnowledgeManagement.SmartStandards.Providers {
     /// </summary>
     public byte[] GetResourceContent(string resourceId) {
       ResourceIdentity identity = this.DecodeResourceId(resourceId);
-      string url = _GraphBaseUrl + "/sites/" + Uri.EscapeDataString(_SiteId) + "/onenote/resources/" + Uri.EscapeDataString(identity.NativeId) + "/content";
+      string url = _GraphBaseUrl + "/sites/" + Uri.EscapeDataString(this.SiteId) + "/onenote/resources/" + Uri.EscapeDataString(identity.NativeId) + "/content";
       using (HttpResponseMessage response = this.SendGraphRequest(HttpMethod.Get, url, null)) {
         this.EnsureSuccess(response, "OneNote resource read failed.");
         return response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
@@ -380,7 +397,7 @@ namespace KnowledgeManagement.SmartStandards.Providers {
         else {
           return false;
         }
-        string deleteUrl = _GraphBaseUrl + "/sites/" + Uri.EscapeDataString(_SiteId) + "/onenote/" + collection + "/" + Uri.EscapeDataString(node.NativeId);
+        string deleteUrl = _GraphBaseUrl + "/sites/" + Uri.EscapeDataString(this.SiteId) + "/onenote/" + collection + "/" + Uri.EscapeDataString(node.NativeId);
         using (HttpResponseMessage response = this.SendGraphRequest(HttpMethod.Delete, deleteUrl, null)) {
           return response.IsSuccessStatusCode;
         }
@@ -1810,7 +1827,7 @@ namespace KnowledgeManagement.SmartStandards.Providers {
     /// Returns a site-scoped OneNote Graph URL.
     /// </summary>
     private string SiteOneNoteUrl(string suffix) {
-      return _GraphBaseUrl + "/sites/" + Uri.EscapeDataString(_SiteId) + "/onenote" + suffix;
+      return _GraphBaseUrl + "/sites/" + Uri.EscapeDataString(this.SiteId) + "/onenote" + suffix;
     }
 
     /// <summary>
@@ -2071,5 +2088,7 @@ namespace KnowledgeManagement.SmartStandards.Providers {
         return result;
       }
     }
+
   }
+
 }

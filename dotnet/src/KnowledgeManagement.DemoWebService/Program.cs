@@ -85,8 +85,7 @@ namespace KnowledgeManagement.SmartStandards.DemoWebService {
       // UJMW-REMOTE (mit cache)
 
       IKnowledgeRepository smartStandardsUjmwRemoteSource = DynamicClientFactory.CreateInstance<IKnowledgeRepository>(
-        "https://re-define-it.de/wiki/ujmw/IKnowledgeRepository",
-        config.GetValue<string>("rdiToken")     
+        "https://ushell.org/wiki/ujmw"
       );
 
       //BackgroundFetchingKnowledgeRepositoryCacheWrapper smartStandardsCached = new BackgroundFetchingKnowledgeRepositoryCacheWrapper(

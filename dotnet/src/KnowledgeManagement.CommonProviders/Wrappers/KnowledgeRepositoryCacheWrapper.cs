@@ -228,6 +228,61 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     }
 
     /// <summary>
+    /// Forces one logical area to be refreshed from the authoritative wrapped repository.
+    /// Existing local entries for the affected area scope are invalidated first.
+    /// </summary>
+    public void ForceRefreshArea(
+      string area
+    ) {
+      lock (_CacheSyncRoot) {
+        IKnowledgeRepositoryCacheControl nestedCacheControl =
+          _WrappedSource as IKnowledgeRepositoryCacheControl;
+
+        if (nestedCacheControl != null) {
+          nestedCacheControl.ForceRefreshArea(
+            area
+          );
+        }
+
+        this.InvalidateAreaScope(
+          area
+        );
+
+        this.RefreshAreaAfterWrite(
+          area
+        );
+      }
+    }
+
+    /// <summary>
+    /// Forces one opaque resource to be refreshed from the authoritative wrapped repository.
+    /// Any existing local resource-content entry is invalidated before the new bytes are read.
+    /// </summary>
+    public void ForceRefreshResource(
+      string resourceId
+    ) {
+      lock (_CacheSyncRoot) {
+        IKnowledgeRepositoryCacheControl nestedCacheControl =
+          _WrappedSource as IKnowledgeRepositoryCacheControl;
+
+        if (nestedCacheControl != null) {
+          nestedCacheControl.ForceRefreshResource(
+            resourceId
+          );
+        }
+
+        this.InvalidateOperationArgument(
+          "resource-content",
+          resourceId
+        );
+
+        this.RefreshResourceContentAfterWrite(
+          resourceId
+        );
+      }
+    }
+
+    /// <summary>
     /// Gets whether the current execution context is inside a prefer-existing cache scope.
     /// </summary>
     private bool PreferExistingCache {

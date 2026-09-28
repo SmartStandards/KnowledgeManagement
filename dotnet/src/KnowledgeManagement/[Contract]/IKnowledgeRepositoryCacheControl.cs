@@ -33,6 +33,26 @@ namespace KnowledgeManagement.SmartStandards {
     /// </summary>
     IDisposable BeginPreferExistingScope();
 
-  }
+    /// <summary>
+    /// Forces the addressed logical area to be reconciled with its authoritative source.
+    ///
+    /// Implementations may invalidate and reload local cache state or repair equivalent
+    /// local projection state. The operation is explicitly allowed to be expensive and must
+    /// never be invoked implicitly during ordinary navigation reads.
+    /// </summary>
+    void ForceRefreshArea(
+      string area
+    );
 
+    /// <summary>
+    /// Forces one opaque resource identifier to be reconciled with its authoritative source.
+    ///
+    /// Implementations may invalidate and reload cached resource bytes or repair equivalent
+    /// local resource-routing/projection state. The operation is explicitly allowed to be
+    /// expensive and is intended for exceptional recovery paths.
+    /// </summary>
+    void ForceRefreshResource(
+      string resourceId
+    );
+  }
 }

@@ -20,8 +20,8 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Raw {
   /// 
   /// - GET on a BeyondContent area returns a self-describing Markdown navigation response
   ///   containing logical child area paths and fully qualified absolute URLs.
-  /// - GET on a ContentAggregation area returns direct navigation only. Callers descend
-  ///   explicitly until a concrete content container is reached.
+  /// - GET on a ContentAggregation area returns the same self-describing navigation
+  ///   preamble followed by the one-level aggregated Markdown content of that area.
   /// - GET on a ContentContainer area returns the complete aggregated Markdown content
   ///   exposed through that container.
   /// - POST appends Markdown content through <see cref="IKnowledgeRepository.TryAppendContent(string, string)"/>.
@@ -30,11 +30,6 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Raw {
   /// 
   /// More advanced repository operations such as rename, physical deletion, replacement
   /// and content movement are intentionally not exposed by this controller.
-  ///
-  /// By default, read requests prefer any existing local cache entry when the directly
-  /// consumed repository exposes <see cref="IKnowledgeRepositoryCacheControl"/>. Missing
-  /// values are still loaded from the authoritative source and cached. This keeps the RAW
-  /// facade fast while preserving complete lazy population of previously unseen data.
   /// </summary>
   [ApiController]
   [Route("api/knowledge/raw")]
@@ -42,18 +37,14 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Raw {
   public class KnowledgeRepositoryRawController : ControllerBase {
 
     private const string _MarkdownContentType = "text/markdown; charset=utf-8";
-    private const string _RouteEscapeMarker = "~";
-    private const string _RouteEscapedTilde = "~7E";
-    private const string _RouteEscapedPercent = "~25";
     private const string _KnowledgeResourceReferencePrefix = "knowledge-resource:";
 
-    private static readonly Regex _KnowledgeReferenceRegex = new Regex(
-      "(?<scheme>knowledge-area|knowledge-resource):(?<target>[^\\s\\)\\]\\>\\\"']+)",
-      RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase
+    private static readonly Regex _KnowledgeResourceReferenceRegex = new Regex(
+      @"knowledge-resource:(?<id>[A-Za-z0-9._~-]+)",
+      RegexOptions.Compiled | RegexOptions.CultureInvariant
     );
 
     private readonly IKnowledgeRepository _KnowledgeRepository;
-    private readonly bool _DisableCacheRefresh;
 
     /// <summary>
     /// Creates the controller using the single knowledge repository supplied through
@@ -62,28 +53,12 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Raw {
     /// <param name="knowledgeRepository">
     /// The repository implementation exposed through this HTTP endpoint.
     /// </param>
-    /// <param name="disableCacheRefresh">
-    /// When true and the directly consumed repository implements
-    /// <see cref="IKnowledgeRepositoryCacheControl"/>, existing cache entries are always
-    /// preferred regardless of age. Missing values are still loaded from the authoritative
-    /// source and cached normally. The default is true because the RAW facade is optimized
-    /// for low-latency read access and should avoid unnecessary source refreshes.
-    /// </param>
-    public KnowledgeRepositoryRawController(
-      IKnowledgeRepository knowledgeRepository,
-      bool disableCacheRefresh = true
-    ) {
+    public KnowledgeRepositoryRawController(IKnowledgeRepository knowledgeRepository) {
       if (knowledgeRepository == null) {
-        throw new ArgumentNullException(
-          nameof(knowledgeRepository)
-        );
+        throw new ArgumentNullException(nameof(knowledgeRepository));
       }
 
-      _KnowledgeRepository =
-        knowledgeRepository;
-
-      _DisableCacheRefresh =
-        disableCacheRefresh;
+      _KnowledgeRepository = knowledgeRepository;
     }
 
     /// <summary>
@@ -98,11 +73,7 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Raw {
     /// </returns>
     [HttpGet(Name = KnowledgeRepositoryHttpRouteNames._RawRoot)]
     public IActionResult GetRoot() {
-      return this.ExecuteReadWithCachePolicy(
-        () => this.GetAreaInternal(
-          "/"
-        )
-      );
+      return this.GetAreaInternal("/");
     }
 
     /// <summary>
@@ -111,23 +82,14 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Raw {
     /// BeyondContent areas return a compact Markdown navigation document containing
     /// logical direct child paths and fully qualified direct child URLs.
     /// 
-    /// ContentAggregation areas return direct navigation. ContentContainer areas return
+    /// ContentAggregation and ContentContainer areas return
     /// <see cref="IKnowledgeRepository.GetAggregatedContent(string)"/> as Markdown.
     /// </summary>
     /// <param name="area">The catch-all logical area path relative to the controller route.</param>
     /// <returns>The navigation listing or aggregated Markdown content.</returns>
     [HttpGet("{**area}", Name = KnowledgeRepositoryHttpRouteNames._RawArea)]
     public IActionResult GetArea(string area) {
-      string repositoryArea =
-        this.ToRepositoryArea(
-          area
-        );
-
-      return this.ExecuteReadWithCachePolicy(
-        () => this.GetAreaInternal(
-          repositoryArea
-        )
-      );
+      return this.GetAreaInternal(this.ToRepositoryArea(area));
     }
 
     /// <summary>
@@ -141,19 +103,6 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Raw {
     /// <returns>The binary resource content or HTTP 404 when the resource does not exist.</returns>
     [HttpGet("resources/{resourceId}", Name = KnowledgeRepositoryHttpRouteNames._RawResource)]
     public IActionResult GetResource(string resourceId) {
-      return this.ExecuteReadWithCachePolicy(
-        () => this.GetResourceInternal(
-          resourceId
-        )
-      );
-    }
-
-    /// <summary>
-    /// Returns one opaque resource while the selected cache read policy is active.
-    /// </summary>
-    private IActionResult GetResourceInternal(
-      string resourceId
-    ) {
       if (string.IsNullOrWhiteSpace(resourceId)) {
         return this.NotFound();
       }
@@ -166,9 +115,34 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Raw {
         );
       }
       catch (InvalidOperationException) {
-        return this.NotFound(
-          "Knowledge resource not found."
-        );
+        IKnowledgeRepositoryCacheControl cacheControl =
+          _KnowledgeRepository as IKnowledgeRepositoryCacheControl;
+
+        if (cacheControl == null) {
+          return this.NotFound(
+            "Knowledge resource not found."
+          );
+        }
+
+        try {
+          cacheControl.ForceRefreshResource(
+            resourceId
+          );
+
+          content =
+            _KnowledgeRepository.GetResourceContent(
+              resourceId
+            );
+        }
+        catch (InvalidOperationException ex) {
+          DevLogger.LogError(
+            ex
+          );
+
+          return this.NotFound(
+            "Knowledge resource not found."
+          );
+        }
       }
 
       string contentType = this.DetectContentType(
@@ -241,32 +215,6 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Raw {
     }
 
     /// <summary>
-    /// Executes one RAW read under prefer-existing cache semantics when cache refresh has
-    /// been disabled for this controller instance and the directly consumed repository
-    /// exposes the optional local cache-control capability.
-    ///
-    /// Missing values are still loaded and cached by the repository cache wrapper.
-    /// </summary>
-    private IActionResult ExecuteReadWithCachePolicy(
-      Func<IActionResult> action
-    ) {
-      if (!_DisableCacheRefresh) {
-        return action();
-      }
-
-      IKnowledgeRepositoryCacheControl cacheControl =
-        _KnowledgeRepository as IKnowledgeRepositoryCacheControl;
-
-      if (cacheControl == null) {
-        return action();
-      }
-
-      using (IDisposable scope = cacheControl.BeginPreferExistingScope()) {
-        return action();
-      }
-    }
-
-    /// <summary>
     /// Performs the polymorphic GET behavior defined by the area's content level.
     /// </summary>
     private IActionResult GetAreaInternal(string repositoryArea) {
@@ -316,7 +264,7 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Raw {
         repositoryArea
       );
 
-      content = this.ResolveKnowledgeReferences(
+      content = this.ResolveKnowledgeResourceReferences(
         content
       );
 
@@ -472,10 +420,10 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Raw {
         return builder.ToString();
       }
 
-      string[] childAreas =
-        this.GetDirectAreas(
-          repositoryArea
-        );
+      string[] childAreas = _KnowledgeRepository.GetAreas(
+        false,
+        repositoryArea
+      );
 
       if (childAreas.Length == 0) {
         builder.Append("This knowledge area contains no directly accessible sub-areas.");
@@ -502,28 +450,14 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Raw {
     }
 
     /// <summary>
-    /// Returns only direct child areas for interactive/raw navigation.
-    ///
-    /// The raw facade intentionally never performs recursive area enumeration. Clients
-    /// discover larger repositories by following the returned direct-child URLs one level
-    /// at a time.
-    /// </summary>
-    private string[] GetDirectAreas(
-      string repositoryArea
-    ) {
-      return _KnowledgeRepository.GetAreas(
-        false,
-        repositoryArea
-      );
-    }
-
-    /// <summary>
     /// Builds the self-describing response for a ContentAggregation area.
     /// 
-    /// Only direct child URLs are rendered. The raw facade deliberately does not request
-    /// aggregated content for an aggregation area because doing so may require a complete
-    /// provider subtree. Callers continue one level at a time until a content container is
-    /// reached.
+    /// Direct child URLs are rendered first so a simple client can continue navigating
+    /// into subdirectories or address individual content containers directly. The
+    /// repository's one-level aggregated Markdown content follows after a separator.
+    /// 
+    /// The repository implementation is responsible for ensuring that aggregation does
+    /// not recursively absorb independent child navigation scopes.
     /// </summary>
     private string BuildContentAggregationResponse(
       string repositoryArea,
@@ -540,137 +474,53 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Raw {
         builder.Append(navigation.TrimEnd('\r', '\n'));
       }
 
-      // ContentAggregation areas are navigation scopes in the raw HTTP facade. Calling
-      // GetAggregatedContent here can force an arbitrarily large provider subtree to be
-      // materialized, especially when an AggregatedKnowledgeRepository is mounted at a
-      // high level. Clients should follow one of the direct child URLs and retrieve
-      // concrete ContentContainer Markdown on demand.
+      string content = _KnowledgeRepository.GetAggregatedContent(
+        repositoryArea
+      );
+
+      content = this.ResolveKnowledgeResourceReferences(
+        content
+      );
+
+      if (!string.IsNullOrWhiteSpace(content)) {
+        if (builder.Length > 0) {
+          builder.Append(Environment.NewLine);
+          builder.Append(Environment.NewLine);
+          builder.Append("---");
+          builder.Append(Environment.NewLine);
+          builder.Append(Environment.NewLine);
+        }
+
+        builder.Append(content.TrimStart('\r', '\n'));
+      }
+
       return builder.ToString();
     }
 
     /// <summary>
-    /// Resolves provider-neutral knowledge references at the final RAW Markdown boundary.
+    /// Replaces provider-neutral <c>knowledge-resource:</c> references with absolute HTTP
+    /// resource URLs exposed by this controller.
     ///
-    /// The RAW endpoint does not have an HTML URL-normalization stage. Therefore every
-    /// provider-neutral knowledge scheme must be converted to a normal HTTP URL before the
-    /// Markdown leaves this controller. A downstream Markdown renderer never receives
-    /// knowledge-area: or knowledge-resource: and consequently cannot collapse such links
-    /// to the current page or to "#".
-    ///
-    /// Ordinary links such as http, https and mailto are not matched and remain unchanged.
+    /// The replacement is intentionally syntax-agnostic. A Markdown image target such as
+    /// <c>![Diagram](knowledge-resource:&lt;id&gt;)</c> therefore becomes an ordinary
+    /// absolute HTTP image URL while links to non-image resources work identically.
     /// </summary>
-    private string ResolveKnowledgeReferences(
-      string content
-    ) {
-      if (string.IsNullOrEmpty(
-            content
-          )) {
+    private string ResolveKnowledgeResourceReferences(string content) {
+      if (string.IsNullOrEmpty(content)) {
         return content;
       }
 
-      return _KnowledgeReferenceRegex.Replace(
+      return _KnowledgeResourceReferenceRegex.Replace(
         content,
         (Match match) => {
-          string scheme =
-            match.Groups["scheme"].Value;
+          string resourceId =
+            match.Groups["id"].Value;
 
-          string target =
-            match.Groups["target"].Value;
-
-          if (string.Equals(
-                scheme,
-                "knowledge-area",
-                StringComparison.OrdinalIgnoreCase
-              )) {
-            string repositoryArea =
-              this.DecodeKnowledgeAreaReference(
-                target
-              );
-
-            return this.BuildAbsoluteAreaUrl(
-              repositoryArea
-            );
-          }
-
-          // Resource IDs are opaque repository identifiers. Do not URI-decode or otherwise
-          // reinterpret them before handing them back to the repository endpoint.
           return this.BuildAbsoluteResourceUrl(
-            target
+            resourceId
           );
         }
       );
-    }
-
-    /// <summary>
-    /// Decodes one provider-neutral knowledge-area URI target exactly once into the logical
-    /// repository area expected by <see cref="IKnowledgeRepository"/>.
-    ///
-    /// Existing percent encoding is therefore not encoded a second time. HTTP route
-    /// transport encoding remains centralized in <see cref="BuildAbsoluteAreaUrl(string)"/>.
-    /// No provider-specific interpretation is performed.
-    /// </summary>
-    private string DecodeKnowledgeAreaReference(
-      string encodedArea
-    ) {
-      if (string.IsNullOrWhiteSpace(
-            encodedArea
-          ) ||
-          string.Equals(
-            encodedArea,
-            "/",
-            StringComparison.Ordinal
-          )) {
-        return "/";
-      }
-
-      string decodedArea;
-
-      try {
-        decodedArea =
-          Uri.UnescapeDataString(
-            encodedArea
-          );
-      }
-      catch (UriFormatException ex) {
-        DevLogger.LogError(
-          ex
-        );
-
-        // Preserve malformed escape sequences literally. BuildAbsoluteAreaUrl will still
-        // apply the RAW endpoint's provider-neutral transport encoding.
-        decodedArea =
-          encodedArea;
-      }
-
-      if (string.IsNullOrWhiteSpace(
-            decodedArea
-          ) ||
-          string.Equals(
-            decodedArea,
-            "/",
-            StringComparison.Ordinal
-          )) {
-        return "/";
-      }
-
-      decodedArea =
-        decodedArea
-        .Replace(
-          '\\',
-          '/'
-        )
-        .Trim();
-
-      if (!decodedArea.StartsWith(
-            "/",
-            StringComparison.Ordinal
-          )) {
-        decodedArea =
-          "/"
-          + decodedArea;
-      }
-
-      return decodedArea;
     }
 
     /// <summary>
@@ -679,45 +529,22 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Raw {
     /// configured forwarded-header pipeline while local HTTP development continues to work.
     /// </summary>
     private string BuildAbsoluteResourceUrl(string resourceId) {
-      string routePath =
-        this.Url.RouteUrl(
-          KnowledgeRepositoryHttpRouteNames._RawResource,
-          new {
-            resourceId = resourceId
-          }
-        );
+      string url = this.Url.RouteUrl(
+        KnowledgeRepositoryHttpRouteNames._RawResource,
+        new {
+          resourceId = resourceId
+        },
+        this.Request.Scheme,
+        this.Request.Host.Value
+      );
 
-      if (string.IsNullOrWhiteSpace(
-            routePath
-          )) {
+      if (string.IsNullOrWhiteSpace(url)) {
         throw new InvalidOperationException(
           "The ASP.NET Core route for the knowledge resource endpoint could not be resolved."
         );
       }
 
-      string pathBase =
-        this.Request.PathBase.Value;
-
-      if (string.IsNullOrEmpty(
-            pathBase
-          )) {
-        pathBase =
-          string.Empty;
-      }
-
-      if (routePath.StartsWith(
-            pathBase,
-            StringComparison.OrdinalIgnoreCase
-          )) {
-        pathBase =
-          string.Empty;
-      }
-
-      return this.Request.Scheme
-        + "://"
-        + this.Request.Host.Value
-        + pathBase
-        + routePath;
+      return url;
     }
 
     /// <summary>
@@ -825,62 +652,30 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Raw {
             "/",
             StringComparison.Ordinal
           )) {
-        routeName =
-          KnowledgeRepositoryHttpRouteNames._RawRoot;
-
-        routeValues =
-          new {
-          };
+        routeName = KnowledgeRepositoryHttpRouteNames._RawRoot;
+        routeValues = new { };
       }
       else {
-        routeName =
-          KnowledgeRepositoryHttpRouteNames._RawArea;
-
-        routeValues =
-          new {
-            area = EncodeAreaForRoute(
-              repositoryArea
-            )
-          };
+        routeName = KnowledgeRepositoryHttpRouteNames._RawArea;
+        routeValues = new {
+          area = repositoryArea.TrimStart('/')
+        };
       }
 
-      string routePath =
-        this.Url.RouteUrl(
-          routeName,
-          routeValues
-        );
+      string url = this.Url.RouteUrl(
+        routeName,
+        routeValues,
+        this.Request.Scheme,
+        this.Request.Host.Value
+      );
 
-      if (string.IsNullOrWhiteSpace(
-            routePath
-          )) {
+      if (string.IsNullOrWhiteSpace(url)) {
         throw new InvalidOperationException(
           "The ASP.NET Core route for the knowledge area endpoint could not be resolved."
         );
       }
 
-      string pathBase =
-        this.Request.PathBase.Value;
-
-      if (string.IsNullOrEmpty(
-            pathBase
-          )) {
-        pathBase =
-          string.Empty;
-      }
-
-      if (routePath.StartsWith(
-            pathBase,
-            StringComparison.OrdinalIgnoreCase
-          )) {
-        pathBase =
-          string.Empty;
-      }
-
-      return this.Request.Scheme
-        + "://"
-        + this.Request.Host.Value
-        + pathBase
-        + routePath;
+      return url;
     }
 
     /// <summary>
@@ -898,71 +693,7 @@ namespace KnowledgeManagement.SmartStandards.Endpoints.Raw {
         return "/";
       }
 
-      string[] parts = normalized.Split(
-        '/',
-        StringSplitOptions.RemoveEmptyEntries
-      );
-
-      for (int index = 0; index < parts.Length; index++) {
-        parts[index] = DecodeAreaSegmentFromRoute(
-          parts[index]
-        );
-      }
-
-      return "/" + string.Join("/", parts);
-    }
-
-    /// <summary>
-    /// Encodes one complete logical area for public URL transport without producing IIS
-    /// double-escape sequences for logical percent characters.
-    /// </summary>
-    private static string EncodeAreaForRoute(
-      string area
-    ) {
-      string[] parts = area
-        .TrimStart('/')
-        .Split(
-          '/',
-          StringSplitOptions.RemoveEmptyEntries
-        );
-
-      for (int index = 0; index < parts.Length; index++) {
-        parts[index] = parts[index]
-          .Replace(
-            _RouteEscapeMarker,
-            _RouteEscapedTilde,
-            StringComparison.Ordinal
-          )
-          .Replace(
-            "%",
-            _RouteEscapedPercent,
-            StringComparison.Ordinal
-          );
-      }
-
-      return string.Join(
-        "/",
-        parts
-      );
-    }
-
-    /// <summary>
-    /// Restores one logical area segment from the route-safe transport representation.
-    /// </summary>
-    private static string DecodeAreaSegmentFromRoute(
-      string segment
-    ) {
-      return segment
-        .Replace(
-          _RouteEscapedPercent,
-          "%",
-          StringComparison.Ordinal
-        )
-        .Replace(
-          _RouteEscapedTilde,
-          _RouteEscapeMarker,
-          StringComparison.Ordinal
-        );
+      return "/" + normalized;
     }
 
     /// <summary>
