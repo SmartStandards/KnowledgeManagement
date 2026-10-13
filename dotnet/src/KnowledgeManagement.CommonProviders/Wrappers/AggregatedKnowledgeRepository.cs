@@ -68,6 +68,7 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     private readonly Dictionary<string, MountedRepository> _ForcedResourceMappings;
     private AggregatedTree _CachedTree;
     private DateTime _CachedTreeLastAccessUtc;
+    private AuthoritativeReadObservation _AuthoritativeReadObservation;
 
     /// <summary>
     /// Creates an empty aggregated knowledge repository.
@@ -81,6 +82,142 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         );
       _CachedTree = null;
       _CachedTreeLastAccessUtc = DateTime.MinValue;
+      _AuthoritativeReadObservation = null;
+    }
+
+    /// <summary>
+    /// Executes one synchronous read while observing whether any mounted provider had to be
+    /// isolated because it failed.
+    ///
+    /// Normal aggregate reads deliberately remain partially usable when one provider fails.
+    /// A persistent cache refresh has a stricter requirement: a partial result must never
+    /// replace a previously complete cache value. This concrete helper provides that stricter
+    /// signal without changing the provider-neutral IKnowledgeRepository contract.
+    /// </summary>
+    /// <param name="readOperation">The aggregate read operation to execute synchronously.</param>
+    /// <param name="value">The read value when the read completed without provider failures.</param>
+    /// <param name="failedProviderIdentities">
+    /// Stable diagnostic identities of mounted providers which failed during this read.
+    /// </param>
+    /// <returns>
+    /// True only when no mounted provider failed while producing the result. False means the
+    /// result is incomplete and must not be committed over an existing persistent cache value.
+    /// </returns>
+    public bool TryExecuteAuthoritativeRead(
+      Func<object> readOperation,
+      out object value,
+      out string[] failedProviderIdentities
+    ) {
+      if (readOperation == null) {
+        throw new ArgumentNullException(nameof(readOperation));
+      }
+
+      lock (_SyncRoot) {
+        if (_AuthoritativeReadObservation != null) {
+          throw new InvalidOperationException("An authoritative aggregate read observation is already active.");
+        }
+
+        AuthoritativeReadObservation observation = new AuthoritativeReadObservation();
+        _AuthoritativeReadObservation = observation;
+
+        try {
+          try {
+            value = readOperation();
+          }
+          catch (InvalidOperationException ex) when (observation.HasProviderFailures) {
+            DevLogger.LogError(ex);
+            value = null;
+            failedProviderIdentities = observation.GetFailedProviderIdentities();
+            return false;
+          }
+
+          failedProviderIdentities = observation.GetFailedProviderIdentities();
+          return !observation.HasProviderFailures;
+        }
+        finally {
+          _AuthoritativeReadObservation = null;
+        }
+      }
+    }
+
+    /// <summary>
+    /// Returns stable identities of mounted providers which can participate in one concrete
+    /// cache operation without performing any provider read.
+    ///
+    /// The method is intentionally specific to AggregatedKnowledgeRepository and does not
+    /// extend IKnowledgeRepository. It exists so the background cache can temporarily skip
+    /// work owned by a provider which has recently failed, while unrelated providers continue
+    /// to make progress.
+    /// </summary>
+    public string[] GetProviderIdentitiesForCacheWork(
+      string operation,
+      string argument
+    ) {
+      lock (_SyncRoot) {
+        List<string> identities = new List<string>();
+
+        if (string.Equals(operation, "resource-content", StringComparison.Ordinal)) {
+          MountedRepository mountedRepository;
+          string childResourceId;
+
+          if (this.TryResolveAggregatedResourceId(
+                argument,
+                out mountedRepository,
+                out childResourceId
+              )) {
+            identities.Add(this.GetMountedRepositoryIdentity(mountedRepository));
+          }
+
+          return identities.ToArray();
+        }
+
+        string area = argument;
+
+        if (string.Equals(operation, "search", StringComparison.Ordinal)) {
+          int separator = argument.IndexOf('\n');
+
+          if (separator >= 0) {
+            area = argument.Substring(0, separator);
+          }
+        }
+
+        string normalizedArea = this.NormalizeAreaPath(area);
+
+        foreach (MountedRepository mountedRepository in _Repositories) {
+          bool providerOwnsArea = this.IsSameOrDescendant(
+            normalizedArea,
+            mountedRepository.MountPoint
+          );
+
+          bool searchCanReachProvider =
+            string.Equals(operation, "search", StringComparison.Ordinal) &&
+            this.IsSameOrDescendant(
+              mountedRepository.MountPoint,
+              normalizedArea
+            );
+
+          if (!providerOwnsArea && !searchCanReachProvider) {
+            continue;
+          }
+
+          identities.Add(this.GetMountedRepositoryIdentity(mountedRepository));
+        }
+
+        return identities
+          .Distinct(StringComparer.Ordinal)
+          .ToArray();
+      }
+    }
+
+    /// <summary>
+    /// Returns the stable diagnostic identity used for provider-failure freezing.
+    /// </summary>
+    private string GetMountedRepositoryIdentity(MountedRepository mountedRepository) {
+      if (mountedRepository == null) {
+        throw new ArgumentNullException(nameof(mountedRepository));
+      }
+
+      return $"{mountedRepository.MountPoint}#{mountedRepository.MountPointOrdinal}";
     }
 
     /// <summary>
@@ -2257,21 +2394,12 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       string operation,
       string area
     ) {
-      DevLogger.LogError(
-        ex
-      );
+      if (_AuthoritativeReadObservation != null) {
+        _AuthoritativeReadObservation.RegisterFailure(mountedRepository);
+      }
 
-      DevLogger.LogTrace(
-        0,
-        99999,
-        "Aggregated knowledge provider read failed and was isolated: operation='"
-        + operation
-        + "' mount='"
-        + mountedRepository.MountPoint
-        + "' area='"
-        + area
-        + "'. Healthy providers remain available."
-      );
+      DevLogger.LogError(ex);
+      DevLogger.LogTrace(7421903804123L, 75222, $"Aggregated knowledge provider read failed and was isolated: operation='{operation}' mount='{mountedRepository.MountPoint}' providerOrdinal={mountedRepository.MountPointOrdinal} area='{area}'. Healthy providers remain available; authoritative cache refreshes must preserve their previous value.");
     }
 
     /// <summary>
@@ -2997,8 +3125,7 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     ) {
       string normalizedGlobalArea =
         this.NormalizeAreaPath(
-          globalArea
-        );
+          globalArea);
 
       if (mountedRepository.MountPoint == _RootArea) {
         localArea =
@@ -3255,6 +3382,56 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
             );
           }
         }
+      }
+    }
+
+    /// <summary>
+    /// Tracks mounted providers which failed during one cache-sensitive aggregate read.
+    /// The observation is intentionally private to the aggregate implementation; the public
+    /// IKnowledgeRepository contract remains unchanged.
+    /// </summary>
+    private sealed class AuthoritativeReadObservation {
+
+      private readonly List<string> _FailedProviderIdentities;
+      private readonly HashSet<string> _FailedProviderIdentitySet;
+
+      /// <summary>
+      /// Creates an empty provider-failure observation.
+      /// </summary>
+      public AuthoritativeReadObservation() {
+        _FailedProviderIdentities = new List<string>();
+        _FailedProviderIdentitySet = new HashSet<string>(StringComparer.Ordinal);
+      }
+
+      /// <summary>
+      /// Gets whether at least one mounted provider failed during the observed read.
+      /// </summary>
+      public bool HasProviderFailures {
+        get {
+          return _FailedProviderIdentities.Count > 0;
+        }
+      }
+
+      /// <summary>
+      /// Registers one mounted provider failure once while preserving first-failure order.
+      /// </summary>
+      public void RegisterFailure(MountedRepository mountedRepository) {
+        if (mountedRepository == null) {
+          throw new ArgumentNullException(nameof(mountedRepository));
+        }
+
+        string identity = $"{mountedRepository.MountPoint}#{mountedRepository.MountPointOrdinal}";
+
+        if (_FailedProviderIdentitySet.Add(identity)) {
+          _FailedProviderIdentities.Add(identity);
+        }
+      }
+
+      /// <summary>
+      /// Returns the provider identities recorded for the observed read.
+      /// </summary>
+      public string[] GetFailedProviderIdentities() {
+        return _FailedProviderIdentities.ToArray();
       }
     }
 

@@ -22,7 +22,10 @@
         ],
         "dependencySync": {
           "addMissing":true, "updateExisting":true, "allowDowngrades":true, "removeOrphaned":false,
-          "constraintLevel":"SEM-SAFE",
+          "constraintLevel":"SEM-SAFE",          
+          "blacklist": [
+            "Microsoft.CodeAnalysis.CSharp",
+          ],
           "sources": [         
             { "origin":"src\\KnowledgeManagement.OneNoteProvider.net8.0\\KnowledgeManagement.OneNoteProvider.net8.0.csproj", "targetFramework":"=" },
             { "origin":"src\\KnowledgeManagement.OneNoteProvider.net10.0\\KnowledgeManagement.OneNoteProvider.net10.0.csproj", "targetFramework":"=" }
@@ -32,7 +35,6 @@
       <group targetFramework="net8.0">
         <dependency id="SmartStandards.KnowledgeManagement" version="[0.1.4]" />
         <dependency id="LibGit2Sharp" version="[0.32.0,2.0)" />
-        <dependency id="Microsoft.CodeAnalysis.CSharp" version="[5.9.0,6.0)" />
         <dependency id="Newtonsoft.Json" version="[13.0.4,14.0)" />
         <dependency id="UJMW.DynamicClient" version="[5.6.2,6.0)" />
         <dependency id="Azure.Identity" version="[1.21.0,2.0)" />
@@ -44,7 +46,6 @@
       <group targetFramework="net10.0">
         <dependency id="SmartStandards.KnowledgeManagement" version="[0.1.4]" />
         <dependency id="LibGit2Sharp" version="[0.32.0,2.0)" />
-        <dependency id="Microsoft.CodeAnalysis.CSharp" version="[5.9.0,6.0)" />
         <dependency id="Newtonsoft.Json" version="[13.0.4,14.0)" />
         <dependency id="UJMW.DynamicClient" version="[5.6.2,6.0)" />
         <dependency id="Azure.Identity" version="[1.21.0,2.0)" />

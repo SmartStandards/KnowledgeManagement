@@ -27,11 +27,13 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
   /// </summary>
   public sealed class BackgroundFetchingKnowledgeRepositoryCacheWrapper : IKnowledgeRepository {
 
-    private const int _CacheFormatVersion = 3;
+    private const int _CacheFormatVersion = 2;
+    private const int _CompatibleAccidentalCacheFormatVersion = 3;
     private const string _CacheDirectoryName = ".knowledge-cache";
     private const string _CacheEntryExtension = ".cache";
     private const string _CacheGenerationFileName = ".generation";
     private const string _KnowledgeResourceReferencePrefix = "knowledge-resource:";
+    private const int _ProviderFailureCooldownSeconds = 60;
 
 
     private readonly object _SyncRoot;
@@ -45,6 +47,7 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     private string _KnownCacheGeneration;
     private readonly Queue<FetchWorkItem> _PriorityQueue;
     private readonly HashSet<string> _QueuedWorkKeys;
+    private readonly Dictionary<string, DateTime> _FrozenProviderUntilUtc;
 
     /// <summary>
     /// Creates a background-fetching cache around an authoritative repository.
@@ -78,20 +81,15 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       _MemoryCache = new Dictionary<string, MemoryCacheEntry>(StringComparer.Ordinal);
       _PriorityQueue = new Queue<FetchWorkItem>();
       _QueuedWorkKeys = new HashSet<string>(StringComparer.Ordinal);
+      _FrozenProviderUntilUtc = new Dictionary<string, DateTime>(StringComparer.Ordinal);
 
       Directory.CreateDirectory(_CacheDirectory);
       _KnownCacheGeneration = this.GetOrCreateCacheGeneration();
 
-      // The persistent cache can survive application restarts while the composition of an
-      // aggregated repository may have changed, for example because a provider was mounted
-      // at a different logical path. Always revalidate the root structure on the first
-      // available heartbeat instead of trusting a still-fresh persisted root enumeration.
-      this.EnqueuePriorityWork(
-        "children",
-        "/",
-        "startup root structure revalidation",
-        true
-      );
+      // Persisted structure may have been produced while one provider was unavailable.
+      // Revalidate cached child enumerations incrementally after startup without discarding
+      // any existing cache value. One heartbeat still performs only one source operation.
+      this.EnqueueStartupStructureRevalidation();
     }
 
     /// <summary>
@@ -581,7 +579,38 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
             + "'."
           );
 
-          object value = this.FetchFromSource(workItem);
+          object value;
+          AggregatedKnowledgeRepository aggregatedSource = _WrappedSource as AggregatedKnowledgeRepository;
+
+          if (aggregatedSource != null) {
+            string[] failedProviderIdentities;
+            bool authoritativeReadSucceeded = aggregatedSource.TryExecuteAuthoritativeRead(
+              () => this.FetchFromSource(workItem),
+              out value,
+              out failedProviderIdentities
+            );
+
+            if (!authoritativeReadSucceeded) {
+              lock (_SyncRoot) {
+                this.FreezeProviders(failedProviderIdentities);
+              }
+
+              DevLogger.LogTrace(7421903804124L, 75223, $"Background knowledge cache froze existing value after incomplete aggregate read: operation='{workItem.Operation}', argument='{workItem.Argument}', failedProviders=[{string.Join(", ", failedProviderIdentities)}]. No cache value, child transition or orphan cleanup was committed. Failed providers are temporarily excluded from autonomous scheduling so healthy providers can continue.");
+              return false;
+            }
+          }
+          else {
+            value = this.FetchFromSource(workItem);
+          }
+
+          if (aggregatedSource != null) {
+            lock (_SyncRoot) {
+              this.ThawProvidersForSuccessfulWork(
+                aggregatedSource,
+                workItem
+              );
+            }
+          }
 
           if (string.Equals(workItem.Operation, "children", StringComparison.Ordinal)) {
             string[] sourceChildren = value as string[];
@@ -685,6 +714,46 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
             + "'."
           );
 
+          return false;
+        }
+        catch (HttpRequestException ex) {
+          DevLogger.LogError(ex);
+
+          lock (_SyncRoot) {
+            this.FreezeProvidersForFailedWork(workItem);
+          }
+
+          DevLogger.LogTrace(7421903804125L, 75224, $"Background knowledge cache preserved existing value after source HTTP failure: operation='{workItem.Operation}', argument='{workItem.Argument}', statusCode='{ex.StatusCode}'. The owning provider is temporarily frozen so unrelated providers can continue.");
+          return false;
+        }
+        catch (IOException ex) {
+          DevLogger.LogError(ex);
+
+          lock (_SyncRoot) {
+            this.FreezeProvidersForFailedWork(workItem);
+          }
+
+          DevLogger.LogTrace(7421903804126L, 75224, $"Background knowledge cache preserved existing value after source I/O failure: operation='{workItem.Operation}', argument='{workItem.Argument}'. The owning provider is temporarily frozen so unrelated providers can continue.");
+          return false;
+        }
+        catch (UnauthorizedAccessException ex) {
+          DevLogger.LogError(ex);
+
+          lock (_SyncRoot) {
+            this.FreezeProvidersForFailedWork(workItem);
+          }
+
+          DevLogger.LogTrace(7421903804127L, 75224, $"Background knowledge cache preserved existing value after unauthorized source access: operation='{workItem.Operation}', argument='{workItem.Argument}'. The owning provider is temporarily frozen so unrelated providers can continue.");
+          return false;
+        }
+        catch (TimeoutException ex) {
+          DevLogger.LogError(ex);
+
+          lock (_SyncRoot) {
+            this.FreezeProvidersForFailedWork(workItem);
+          }
+
+          DevLogger.LogTrace(7421903804128L, 75224, $"Background knowledge cache preserved existing value after source timeout: operation='{workItem.Operation}', argument='{workItem.Argument}'. The owning provider is temporarily frozen so unrelated providers can continue.");
           return false;
         }
       }
@@ -892,7 +961,7 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
           this.EnqueuePriorityWork(operation, argument, "stale cache value was served");
         }
         else {
-          //DevLogger.LogTrace(0, 99999, "Background knowledge cache answered from cache: operation='" + operation + "', argument='" + argument + "', ageSeconds=" + ((long)age.TotalSeconds).ToString() + ".");
+          DevLogger.LogTrace(0, 99999, "Background knowledge cache answered from cache: operation='" + operation + "', argument='" + argument + "', ageSeconds=" + ((long)age.TotalSeconds).ToString() + ".");
         }
         return value;
       }
@@ -934,6 +1003,60 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         reason,
         false
       );
+    }
+
+    /// <summary>
+    /// Queues revalidation of every persisted direct-child enumeration in breadth-first
+    /// order without deleting or invalidating the existing values.
+    ///
+    /// This repairs structure which may previously have been cached as incomplete while a
+    /// provider was unavailable. Failed providers are skipped by the provider-freeze logic,
+    /// while healthy providers continue to rebuild their structure.
+    /// </summary>
+    private void EnqueueStartupStructureRevalidation() {
+      PersistentCacheEntry[] entries = this.ReadAllPersistentEntries();
+
+      PersistentCacheEntry[] childEntries = entries
+        .Where(
+          (PersistentCacheEntry entry) =>
+            string.Equals(
+              entry.Operation,
+              "children",
+              StringComparison.Ordinal
+            )
+        )
+        .OrderBy(
+          (PersistentCacheEntry entry) => this.GetAreaDepth(entry.Argument)
+        )
+        .ThenBy(
+          (PersistentCacheEntry entry) => entry.Argument,
+          StringComparer.Ordinal
+        )
+        .ToArray();
+
+      bool rootQueued = false;
+
+      foreach (PersistentCacheEntry entry in childEntries) {
+        if (string.Equals(entry.Argument, "/", StringComparison.Ordinal)) {
+          rootQueued = true;
+        }
+
+        this.EnqueuePriorityWork(
+          "children",
+          entry.Argument,
+          "startup persisted structure revalidation",
+          true
+        );
+      }
+
+      if (!rootQueued) {
+        this.EnqueuePriorityWork(
+          "children",
+          "/",
+          "startup root structure discovery",
+          true
+        );
+      }
     }
 
     /// <summary>
@@ -1065,16 +1188,30 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     /// those requests must not be reordered behind unrelated autonomous structural work.
     /// </summary>
     private bool TryDequeuePriorityWork(out FetchWorkItem workItem) {
-      while (_PriorityQueue.Count > 0) {
+      int itemsToInspect = _PriorityQueue.Count;
+      int frozenItemCount = 0;
+
+      for (int index = 0; index < itemsToInspect; index++) {
         FetchWorkItem candidate = _PriorityQueue.Dequeue();
-        _QueuedWorkKeys.Remove(candidate.Key);
 
         if (!this.IsPriorityWorkStillRelevant(candidate)) {
+          _QueuedWorkKeys.Remove(candidate.Key);
           continue;
         }
 
+        if (this.IsWorkItemBlockedByFrozenProvider(candidate)) {
+          _PriorityQueue.Enqueue(candidate);
+          frozenItemCount++;
+          continue;
+        }
+
+        _QueuedWorkKeys.Remove(candidate.Key);
         workItem = candidate;
         return true;
+      }
+
+      if (frozenItemCount > 0) {
+        DevLogger.LogTrace(7421903804129L, 75225, $"Background knowledge cache deferred {frozenItemCount} priority work item(s) owned by temporarily frozen providers. Healthy-provider work and autonomous scheduling may continue during the cooldown.");
       }
 
       workItem = null;
@@ -1270,27 +1407,39 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         }
 
         if (!this.HasCacheEntry("name", area)) {
-          return new FetchWorkItem(
+          FetchWorkItem candidate = new FetchWorkItem(
             "name",
             area,
             "missing breadth-first structural name"
           );
+
+          if (!this.IsWorkItemBlockedByFrozenProvider(candidate)) {
+            return candidate;
+          }
         }
 
         if (!this.HasCacheEntry("capabilities", area)) {
-          return new FetchWorkItem(
+          FetchWorkItem candidate = new FetchWorkItem(
             "capabilities",
             area,
             "missing breadth-first structural capabilities"
           );
+
+          if (!this.IsWorkItemBlockedByFrozenProvider(candidate)) {
+            return candidate;
+          }
         }
 
         if (!this.HasCacheEntry("children", area)) {
-          return new FetchWorkItem(
+          FetchWorkItem candidate = new FetchWorkItem(
             "children",
             area,
             "missing breadth-first structural children"
           );
+
+          if (!this.IsWorkItemBlockedByFrozenProvider(candidate)) {
+            return candidate;
+          }
         }
 
         string[] children;
@@ -1345,27 +1494,39 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
 
         if (capabilities.SupportsResources &&
             !this.HasCacheEntry("resources", area)) {
-          return new FetchWorkItem(
+          FetchWorkItem candidate = new FetchWorkItem(
             "resources",
             area,
             "missing deepest-first resource metadata"
           );
+
+          if (!this.IsWorkItemBlockedByFrozenProvider(candidate)) {
+            return candidate;
+          }
         }
 
         if (!this.HasCacheEntry("has-direct-content", area)) {
-          return new FetchWorkItem(
+          FetchWorkItem candidate = new FetchWorkItem(
             "has-direct-content",
             area,
             "missing deepest-first direct-content state"
           );
+
+          if (!this.IsWorkItemBlockedByFrozenProvider(candidate)) {
+            return candidate;
+          }
         }
 
         if (!this.HasCacheEntry("direct-content", area)) {
-          return new FetchWorkItem(
+          FetchWorkItem candidate = new FetchWorkItem(
             "direct-content",
             area,
             "missing deepest-first direct content"
           );
+
+          if (!this.IsWorkItemBlockedByFrozenProvider(candidate)) {
+            return candidate;
+          }
         }
       }
 
@@ -1462,7 +1623,15 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
 
         foreach (KnowledgeResourceInfo resource in resources) {
           if (!this.HasCacheEntry("resource-content", resource.ResourceId)) {
-            return new FetchWorkItem("resource-content", resource.ResourceId, "missing binary content for known resource");
+            FetchWorkItem candidate = new FetchWorkItem(
+              "resource-content",
+              resource.ResourceId,
+              "missing binary content for known resource"
+            );
+
+            if (!this.IsWorkItemBlockedByFrozenProvider(candidate)) {
+              return candidate;
+            }
           }
         }
       }
@@ -1508,6 +1677,16 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         }
 
         expiredStructuralEntryCount++;
+
+        FetchWorkItem candidate = new FetchWorkItem(
+          entry.Operation,
+          entry.Argument,
+          "expired structural candidate"
+        );
+
+        if (this.IsWorkItemBlockedByFrozenProvider(candidate)) {
+          continue;
+        }
 
         if (oldest == null ||
             entry.CreatedUtc < oldest.CreatedUtc) {
@@ -1559,7 +1738,14 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         .Where(
           (PersistentCacheEntry entry) =>
             this.IsAutonomousContentOperation(entry.Operation) &&
-            !this.IsFresh(entry.CreatedUtc, utcNow)
+            !this.IsFresh(entry.CreatedUtc, utcNow) &&
+            !this.IsWorkItemBlockedByFrozenProvider(
+              new FetchWorkItem(
+                entry.Operation,
+                entry.Argument,
+                "expired content candidate"
+              )
+            )
         )
         .OrderByDescending(
           (PersistentCacheEntry entry) => this.GetAreaDepth(entry.Argument)
@@ -1617,6 +1803,105 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         string.Equals(operation, "direct-content", StringComparison.Ordinal) ||
         string.Equals(operation, "resources", StringComparison.Ordinal) ||
         string.Equals(operation, "resource-content", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Freezes mounted providers after a failed aggregate read for a bounded cooldown period.
+    /// Existing cached values remain readable; only source work owned by the failed providers
+    /// is temporarily skipped.
+    /// </summary>
+    private void FreezeProviders(string[] providerIdentities) {
+      if (providerIdentities == null || providerIdentities.Length == 0) {
+        return;
+      }
+
+      DateTime untilUtc = DateTime.UtcNow.AddSeconds(_ProviderFailureCooldownSeconds);
+
+      foreach (string providerIdentity in providerIdentities) {
+        if (string.IsNullOrWhiteSpace(providerIdentity)) {
+          continue;
+        }
+
+        _FrozenProviderUntilUtc[providerIdentity] = untilUtc;
+      }
+    }
+
+    /// <summary>
+    /// Resolves and freezes the provider or providers owning one failed work item.
+    /// </summary>
+    private void FreezeProvidersForFailedWork(FetchWorkItem workItem) {
+      AggregatedKnowledgeRepository aggregatedSource = _WrappedSource as AggregatedKnowledgeRepository;
+
+      if (aggregatedSource == null || workItem == null) {
+        return;
+      }
+
+      string[] providerIdentities = aggregatedSource.GetProviderIdentitiesForCacheWork(
+        workItem.Operation,
+        workItem.Argument
+      );
+
+      this.FreezeProviders(providerIdentities);
+    }
+
+    /// <summary>
+    /// Removes provider freezes after a successful authoritative work item involving them.
+    /// </summary>
+    private void ThawProvidersForSuccessfulWork(
+      AggregatedKnowledgeRepository aggregatedSource,
+      FetchWorkItem workItem
+    ) {
+      if (aggregatedSource == null || workItem == null) {
+        return;
+      }
+
+      string[] providerIdentities = aggregatedSource.GetProviderIdentitiesForCacheWork(
+        workItem.Operation,
+        workItem.Argument
+      );
+
+      foreach (string providerIdentity in providerIdentities) {
+        _FrozenProviderUntilUtc.Remove(providerIdentity);
+      }
+    }
+
+    /// <summary>
+    /// Returns whether one source work item belongs to a provider which is still inside its
+    /// failure cooldown. Expired freezes are removed lazily.
+    /// </summary>
+    private bool IsWorkItemBlockedByFrozenProvider(FetchWorkItem workItem) {
+      AggregatedKnowledgeRepository aggregatedSource = _WrappedSource as AggregatedKnowledgeRepository;
+
+      if (aggregatedSource == null || workItem == null || _FrozenProviderUntilUtc.Count == 0) {
+        return false;
+      }
+
+      string[] providerIdentities = aggregatedSource.GetProviderIdentitiesForCacheWork(
+        workItem.Operation,
+        workItem.Argument
+      );
+
+      DateTime utcNow = DateTime.UtcNow;
+
+      foreach (string providerIdentity in providerIdentities) {
+        DateTime frozenUntilUtc;
+
+        if (!_FrozenProviderUntilUtc.TryGetValue(
+              providerIdentity,
+              out frozenUntilUtc
+            )) {
+          continue;
+        }
+
+        if (frozenUntilUtc <= utcNow) {
+          _FrozenProviderUntilUtc.Remove(providerIdentity);
+          continue;
+        }
+
+        return true;
+      }
+
+      return false;
     }
 
     /// <summary>
@@ -1858,7 +2143,10 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       try {
         string json = File.ReadAllText(file, Encoding.UTF8);
         PersistentCacheEntry loaded = JsonConvert.DeserializeObject<PersistentCacheEntry>(json);
-        if (loaded == null || loaded.FormatVersion != _CacheFormatVersion || string.IsNullOrWhiteSpace(loaded.Operation)) {
+        if (loaded == null ||
+            (loaded.FormatVersion != _CacheFormatVersion &&
+             loaded.FormatVersion != _CompatibleAccidentalCacheFormatVersion) ||
+            string.IsNullOrWhiteSpace(loaded.Operation)) {
           return false;
         }
         entry = loaded;
