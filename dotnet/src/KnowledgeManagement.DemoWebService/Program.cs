@@ -63,7 +63,7 @@ namespace KnowledgeManagement.SmartStandards.DemoWebService {
 
       root.Add(
         new FileBasedKnowledgeRepository("C:\\Temp\\_OneNoteExport", readOnly: false, useSoftDelete: true),
-        "/Local writable Demo/"
+        "/.agents/SKILLS/.selfmaintained"
       );
       root.Add(
         new FileBasedKnowledgeRepository("C:\\GIT-TK\\AI-Skills", readOnly:true, useSoftDelete:true),

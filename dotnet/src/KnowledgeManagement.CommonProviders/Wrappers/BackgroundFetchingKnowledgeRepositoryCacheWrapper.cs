@@ -48,6 +48,10 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     private readonly Queue<FetchWorkItem> _PriorityQueue;
     private readonly HashSet<string> _QueuedWorkKeys;
     private readonly Dictionary<string, DateTime> _FrozenProviderUntilUtc;
+    private readonly Queue<FetchWorkItem> _StartupStructureRevalidationQueue;
+    private readonly DateTime _StartupUtc;
+    private bool _PreferStartupStructureRevalidation;
+    private bool _StartupStructureRevalidationInitializationCompleted;
 
     /// <summary>
     /// Creates a background-fetching cache around an authoritative repository.
@@ -82,14 +86,19 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       _PriorityQueue = new Queue<FetchWorkItem>();
       _QueuedWorkKeys = new HashSet<string>(StringComparer.Ordinal);
       _FrozenProviderUntilUtc = new Dictionary<string, DateTime>(StringComparer.Ordinal);
+      _StartupStructureRevalidationQueue = new Queue<FetchWorkItem>();
+      _StartupUtc = DateTime.UtcNow;
+      _PreferStartupStructureRevalidation = true;
+      _StartupStructureRevalidationInitializationCompleted = false;
 
       Directory.CreateDirectory(_CacheDirectory);
       _KnownCacheGeneration = this.GetOrCreateCacheGeneration();
 
-      // Persisted structure may have been produced while one provider was unavailable.
-      // Revalidate cached child enumerations incrementally after startup without discarding
-      // any existing cache value. One heartbeat still performs only one source operation.
-      this.EnqueueStartupStructureRevalidation();
+      // Enumerating and deserializing thousands of persistent cache files can take seconds or
+      // minutes. Never perform that work on the application configuration/startup thread.
+      // The dedicated background thread only prepares the autonomous startup-revalidation lane;
+      // normal cache reads remain available immediately.
+      this.StartStartupStructureRevalidationInitialization();
     }
 
     /// <summary>
@@ -1013,50 +1022,160 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     /// provider was unavailable. Failed providers are skipped by the provider-freeze logic,
     /// while healthy providers continue to rebuild their structure.
     /// </summary>
-    private void EnqueueStartupStructureRevalidation() {
-      PersistentCacheEntry[] entries = this.ReadAllPersistentEntries();
+    /// <summary>
+    /// Starts preparation of the startup structure-revalidation lane on a dedicated
+    /// background thread so application startup is never blocked by scanning the persistent
+    /// cache directory.
+    /// </summary>
+    private void StartStartupStructureRevalidationInitialization() {
+      Thread initializationThread = new Thread(
+        () => this.InitializeStartupStructureRevalidationQueueInBackground()
+      );
 
-      PersistentCacheEntry[] childEntries = entries
-        .Where(
-          (PersistentCacheEntry entry) =>
-            string.Equals(
-              entry.Operation,
-              "children",
-              StringComparison.Ordinal
-            )
-        )
-        .OrderBy(
-          (PersistentCacheEntry entry) => this.GetAreaDepth(entry.Argument)
-        )
-        .ThenBy(
-          (PersistentCacheEntry entry) => entry.Argument,
-          StringComparer.Ordinal
-        )
-        .ToArray();
+      initializationThread.IsBackground = true;
+      initializationThread.Name = "KnowledgeCacheStartupRevalidation";
+      initializationThread.Start();
 
-      bool rootQueued = false;
+      DevLogger.LogTrace(7421903804135L, 75230, "Background knowledge cache deferred persistent startup-structure scan to a dedicated background thread. Application startup can continue immediately.");
+    }
 
-      foreach (PersistentCacheEntry entry in childEntries) {
-        if (string.Equals(entry.Argument, "/", StringComparison.Ordinal)) {
-          rootQueued = true;
+    /// <summary>
+    /// Scans persisted cache entries outside the main application-startup thread and publishes
+    /// the resulting revalidation work atomically afterwards.
+    ///
+    /// File-system availability failures do not invalidate existing cache data. In that case
+    /// only a root discovery item is published so a later heartbeat can still recover.
+    /// </summary>
+    private void InitializeStartupStructureRevalidationQueueInBackground() {
+      try {
+        PersistentCacheEntry[] entries = this.ReadAllPersistentEntries();
+
+        PersistentCacheEntry[] childEntries = entries
+          .Where(
+            (PersistentCacheEntry entry) =>
+              string.Equals(
+                entry.Operation,
+                "children",
+                StringComparison.Ordinal
+              )
+          )
+          .OrderBy(
+            (PersistentCacheEntry entry) => this.GetAreaDepth(entry.Argument)
+          )
+          .ThenBy(
+            (PersistentCacheEntry entry) => entry.Argument,
+            StringComparer.Ordinal
+          )
+          .ToArray();
+
+        bool rootQueued = false;
+        FetchWorkItem[] workItems = new FetchWorkItem[childEntries.Length + 1];
+        int workItemCount = 0;
+
+        foreach (PersistentCacheEntry entry in childEntries) {
+          if (string.Equals(entry.Argument, "/", StringComparison.Ordinal)) {
+            rootQueued = true;
+          }
+
+          workItems[workItemCount] = new FetchWorkItem(
+            "children",
+            entry.Argument,
+            "startup persisted structure revalidation",
+            true
+          );
+
+          workItemCount++;
         }
 
-        this.EnqueuePriorityWork(
-          "children",
-          entry.Argument,
-          "startup persisted structure revalidation",
-          true
+        if (!rootQueued) {
+          workItems[workItemCount] = new FetchWorkItem(
+            "children",
+            "/",
+            "startup root structure discovery",
+            true
+          );
+
+          workItemCount++;
+        }
+
+        lock (_SyncRoot) {
+          for (int index = 0; index < workItemCount; index++) {
+            _StartupStructureRevalidationQueue.Enqueue(workItems[index]);
+          }
+
+          _StartupStructureRevalidationInitializationCompleted = true;
+        }
+
+        DevLogger.LogTrace(7421903804136L, 75231, $"Background knowledge cache completed asynchronous startup-structure scan and published {workItemCount} revalidation item(s).");
+      }
+      catch (IOException ex) {
+        DevLogger.LogError(ex);
+        this.CompleteStartupStructureRevalidationInitializationWithRootFallback();
+      }
+      catch (UnauthorizedAccessException ex) {
+        DevLogger.LogError(ex);
+        this.CompleteStartupStructureRevalidationInitializationWithRootFallback();
+      }
+    }
+
+    /// <summary>
+    /// Completes failed startup scanning without deleting existing cache values and publishes
+    /// one conservative root-discovery item for later recovery.
+    /// </summary>
+    private void CompleteStartupStructureRevalidationInitializationWithRootFallback() {
+      lock (_SyncRoot) {
+        _StartupStructureRevalidationQueue.Enqueue(
+          new FetchWorkItem(
+            "children",
+            "/",
+            "startup structure scan unavailable; conservative root discovery fallback",
+            true
+          )
         );
+
+        _StartupStructureRevalidationInitializationCompleted = true;
       }
 
-      if (!rootQueued) {
-        this.EnqueuePriorityWork(
-          "children",
-          "/",
-          "startup root structure discovery",
-          true
-        );
+      DevLogger.LogTrace(7421903804137L, 75232, "Background knowledge cache startup-structure scan could not read the persistent cache directory. Existing cache data remains untouched; root discovery was queued as a conservative fallback.");
+    }
+
+    /// <summary>
+    /// Returns one still-relevant startup structure revalidation item.
+    ///
+    /// Items which were already refreshed after wrapper startup are discarded. Work owned by
+    /// a temporarily frozen provider is rotated to the back so healthy providers continue.
+    /// </summary>
+    private FetchWorkItem TryTakeStartupStructureRevalidationWork() {
+      if (!_StartupStructureRevalidationInitializationCompleted &&
+          _StartupStructureRevalidationQueue.Count == 0) {
+        return null;
       }
+
+      int itemsToInspect = _StartupStructureRevalidationQueue.Count;
+
+      for (int index = 0; index < itemsToInspect; index++) {
+        FetchWorkItem candidate = _StartupStructureRevalidationQueue.Dequeue();
+
+        PersistentCacheEntry entry;
+
+        if (this.TryReadCacheEntry(
+              candidate.Operation,
+              candidate.Argument,
+              out entry
+            ) &&
+            entry.CreatedUtc >= _StartupUtc) {
+          continue;
+        }
+
+        if (this.IsWorkItemBlockedByFrozenProvider(candidate)) {
+          _StartupStructureRevalidationQueue.Enqueue(candidate);
+          continue;
+        }
+
+        return candidate;
+      }
+
+      return null;
     }
 
     /// <summary>
@@ -1261,127 +1380,102 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     private FetchWorkItem FindNextBackgroundWorkItem() {
       DateTime schedulerStartedUtc = DateTime.UtcNow;
 
-      DevLogger.LogTrace(
-        7421903804105L,
-        75204,
-        "Background knowledge cache autonomous scheduler entered."
-      );
+      DevLogger.LogTrace(7421903804105L, 75204, "Background knowledge cache autonomous scheduler entered.");
 
       FetchWorkItem missingStructure = this.FindNextMissingStructureBreadthFirst();
-      if (missingStructure != null) {
-        DevLogger.LogTrace(
-          7421903804107L,
-          75206,
-          "Background knowledge cache autonomous scheduler selected missing structure: operation='"
-          + missingStructure.Operation
-          + "', argument='"
-          + missingStructure.Argument
-          + "', elapsedMilliseconds="
-          + ((long)(DateTime.UtcNow - schedulerStartedUtc).TotalMilliseconds).ToString()
-          + "."
-        );
 
+      if (missingStructure != null) {
+        DevLogger.LogTrace(7421903804107L, 75206, $"Background knowledge cache autonomous scheduler selected missing structure: operation='{missingStructure.Operation}', argument='{missingStructure.Argument}', elapsedMilliseconds={(long)(DateTime.UtcNow - schedulerStartedUtc).TotalMilliseconds}.");
         return missingStructure;
       }
 
-      DevLogger.LogTrace(
-        7421903804106L,
-        75205,
-        "Background knowledge cache autonomous scheduler found no missing structural work."
-      );
+      DevLogger.LogTrace(7421903804106L, 75205, "Background knowledge cache autonomous scheduler found no missing structural work.");
 
-      FetchWorkItem missingContent = this.FindNextMissingContentDeepestFirst();
-      if (missingContent != null) {
-        DevLogger.LogTrace(
-          7421903804109L,
-          75208,
-          "Background knowledge cache autonomous scheduler selected missing content: operation='"
-          + missingContent.Operation
-          + "', argument='"
-          + missingContent.Argument
-          + "', elapsedMilliseconds="
-          + ((long)(DateTime.UtcNow - schedulerStartedUtc).TotalMilliseconds).ToString()
-          + "."
-        );
+      FetchWorkItem startupStructure = null;
+      FetchWorkItem missingTextContent = null;
 
-        return missingContent;
+      if (_PreferStartupStructureRevalidation) {
+        startupStructure = this.TryTakeStartupStructureRevalidationWork();
+
+        if (startupStructure != null) {
+          _PreferStartupStructureRevalidation = false;
+          DevLogger.LogTrace(7421903804131L, 75227, $"Background knowledge cache autonomous scheduler selected startup structure revalidation: argument='{startupStructure.Argument}', remainingStartupStructureItems={_StartupStructureRevalidationQueue.Count}, elapsedMilliseconds={(long)(DateTime.UtcNow - schedulerStartedUtc).TotalMilliseconds}.");
+          return startupStructure;
+        }
+
+        missingTextContent = this.FindNextMissingTextContentDeepestFirst();
+      }
+      else {
+        missingTextContent = this.FindNextMissingTextContentDeepestFirst();
+
+        if (missingTextContent == null) {
+          startupStructure = this.TryTakeStartupStructureRevalidationWork();
+        }
       }
 
-      DevLogger.LogTrace(
-        7421903804108L,
-        75207,
-        "Background knowledge cache autonomous scheduler found no missing content work."
-      );
-
-      FetchWorkItem missingResource = this.FindMissingResourceContentWorkItem();
-      if (missingResource != null) {
-        DevLogger.LogTrace(
-          7421903804111L,
-          75210,
-          "Background knowledge cache autonomous scheduler selected missing resource binary: argument='"
-          + missingResource.Argument
-          + "', elapsedMilliseconds="
-          + ((long)(DateTime.UtcNow - schedulerStartedUtc).TotalMilliseconds).ToString()
-          + "."
-        );
-
-        return missingResource;
+      if (missingTextContent != null) {
+        _PreferStartupStructureRevalidation = true;
+        DevLogger.LogTrace(7421903804109L, 75208, $"Background knowledge cache autonomous scheduler selected missing text content: operation='{missingTextContent.Operation}', argument='{missingTextContent.Argument}', elapsedMilliseconds={(long)(DateTime.UtcNow - schedulerStartedUtc).TotalMilliseconds}.");
+        return missingTextContent;
       }
 
-      DevLogger.LogTrace(
-        7421903804110L,
-        75209,
-        "Background knowledge cache autonomous scheduler found no missing resource binary work."
-      );
+      if (startupStructure != null) {
+        _PreferStartupStructureRevalidation = false;
+        DevLogger.LogTrace(7421903804132L, 75227, $"Background knowledge cache autonomous scheduler selected startup structure revalidation: argument='{startupStructure.Argument}', remainingStartupStructureItems={_StartupStructureRevalidationQueue.Count}, elapsedMilliseconds={(long)(DateTime.UtcNow - schedulerStartedUtc).TotalMilliseconds}.");
+        return startupStructure;
+      }
+
+      DevLogger.LogTrace(7421903804108L, 75207, "Background knowledge cache autonomous scheduler found no missing text-content work.");
+
+      // The remaining autonomous phases scan the complete persistent cache directory. While
+      // the dedicated startup thread is already doing exactly that, starting another full scan
+      // would duplicate disk I/O and can make the application feel stalled immediately after
+      // startup. Consumer-priority work is still processed before reaching this point.
+      if (!_StartupStructureRevalidationInitializationCompleted) {
+        DevLogger.LogTrace(7421903804138L, 75233, "Background knowledge cache deferred scan-heavy autonomous phases because asynchronous startup cache enumeration is still running.");
+        return null;
+      }
 
       FetchWorkItem expiredStructure = this.FindOldestExpiredStructuralWorkItem();
-      if (expiredStructure != null) {
-        DevLogger.LogTrace(
-          7421903804113L,
-          75212,
-          "Background knowledge cache autonomous scheduler selected expired structure: operation='"
-          + expiredStructure.Operation
-          + "', argument='"
-          + expiredStructure.Argument
-          + "', elapsedMilliseconds="
-          + ((long)(DateTime.UtcNow - schedulerStartedUtc).TotalMilliseconds).ToString()
-          + "."
-        );
 
+      if (expiredStructure != null) {
+        DevLogger.LogTrace(7421903804113L, 75212, $"Background knowledge cache autonomous scheduler selected expired structure: operation='{expiredStructure.Operation}', argument='{expiredStructure.Argument}', elapsedMilliseconds={(long)(DateTime.UtcNow - schedulerStartedUtc).TotalMilliseconds}.");
         return expiredStructure;
       }
 
-      DevLogger.LogTrace(
-        7421903804112L,
-        75211,
-        "Background knowledge cache autonomous scheduler found no expired structural work."
-      );
+      DevLogger.LogTrace(7421903804112L, 75211, "Background knowledge cache autonomous scheduler found no expired structural work.");
 
-      FetchWorkItem expiredContent = this.FindOldestExpiredContentWorkItem();
-      if (expiredContent != null) {
-        DevLogger.LogTrace(
-          7421903804115L,
-          75214,
-          "Background knowledge cache autonomous scheduler selected expired content: operation='"
-          + expiredContent.Operation
-          + "', argument='"
-          + expiredContent.Argument
-          + "', elapsedMilliseconds="
-          + ((long)(DateTime.UtcNow - schedulerStartedUtc).TotalMilliseconds).ToString()
-          + "."
-        );
+      FetchWorkItem expiredTextContent = this.FindOldestExpiredTextContentWorkItem();
 
-        return expiredContent;
+      if (expiredTextContent != null) {
+        DevLogger.LogTrace(7421903804115L, 75214, $"Background knowledge cache autonomous scheduler selected expired text content: operation='{expiredTextContent.Operation}', argument='{expiredTextContent.Argument}', elapsedMilliseconds={(long)(DateTime.UtcNow - schedulerStartedUtc).TotalMilliseconds}.");
+        return expiredTextContent;
       }
 
-      DevLogger.LogTrace(
-        7421903804114L,
-        75213,
-        "Background knowledge cache autonomous scheduler found no expired content work. totalElapsedMilliseconds="
-        + ((long)(DateTime.UtcNow - schedulerStartedUtc).TotalMilliseconds).ToString()
-        + "."
-      );
+      FetchWorkItem missingResourceMetadata = this.FindNextMissingResourceMetadataDeepestFirst();
 
+      if (missingResourceMetadata != null) {
+        DevLogger.LogTrace(7421903804133L, 75228, $"Background knowledge cache autonomous scheduler selected missing resource metadata: argument='{missingResourceMetadata.Argument}', elapsedMilliseconds={(long)(DateTime.UtcNow - schedulerStartedUtc).TotalMilliseconds}.");
+        return missingResourceMetadata;
+      }
+
+      FetchWorkItem missingResource = this.FindMissingResourceContentWorkItem();
+
+      if (missingResource != null) {
+        DevLogger.LogTrace(7421903804111L, 75210, $"Background knowledge cache autonomous scheduler selected missing resource binary: argument='{missingResource.Argument}', elapsedMilliseconds={(long)(DateTime.UtcNow - schedulerStartedUtc).TotalMilliseconds}.");
+        return missingResource;
+      }
+
+      DevLogger.LogTrace(7421903804110L, 75209, "Background knowledge cache autonomous scheduler found no missing resource binary work.");
+
+      FetchWorkItem expiredResource = this.FindOldestExpiredResourceWorkItem();
+
+      if (expiredResource != null) {
+        DevLogger.LogTrace(7421903804134L, 75229, $"Background knowledge cache autonomous scheduler selected expired resource work: operation='{expiredResource.Operation}', argument='{expiredResource.Argument}', elapsedMilliseconds={(long)(DateTime.UtcNow - schedulerStartedUtc).TotalMilliseconds}.");
+        return expiredResource;
+      }
+
+      DevLogger.LogTrace(7421903804114L, 75213, $"Background knowledge cache autonomous scheduler found no work. totalElapsedMilliseconds={(long)(DateTime.UtcNow - schedulerStartedUtc).TotalMilliseconds}.");
       return null;
     }
 
@@ -1470,7 +1564,7 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     /// content and avoids using aggregated-content as an implicit recursive discovery
     /// mechanism.
     /// </summary>
-    private FetchWorkItem FindNextMissingContentDeepestFirst() {
+    private FetchWorkItem FindNextMissingTextContentDeepestFirst() {
       DateTime scanStartedUtc = DateTime.UtcNow;
       string[] knownAreas = this.GetKnownAreasOrderedByDescendingDepth();
       int contentCapableAreaCount = 0;
@@ -1491,19 +1585,6 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         }
 
         contentCapableAreaCount++;
-
-        if (capabilities.SupportsResources &&
-            !this.HasCacheEntry("resources", area)) {
-          FetchWorkItem candidate = new FetchWorkItem(
-            "resources",
-            area,
-            "missing deepest-first resource metadata"
-          );
-
-          if (!this.IsWorkItemBlockedByFrozenProvider(candidate)) {
-            return candidate;
-          }
-        }
 
         if (!this.HasCacheEntry("has-direct-content", area)) {
           FetchWorkItem candidate = new FetchWorkItem(
@@ -1530,17 +1611,48 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         }
       }
 
-      DevLogger.LogTrace(
-        7421903804118L,
-        75217,
-        "Background knowledge cache content missing scan completed without candidate. knownAreaCount="
-        + knownAreas.Length.ToString()
-        + ", contentCapableAreaCount="
-        + contentCapableAreaCount.ToString()
-        + ", elapsedMilliseconds="
-        + ((long)(DateTime.UtcNow - scanStartedUtc).TotalMilliseconds).ToString()
-        + "."
-      );
+      DevLogger.LogTrace(7421903804118L, 75217, $"Background knowledge cache text-content missing scan completed without candidate. knownAreaCount={knownAreas.Length}, contentCapableAreaCount={contentCapableAreaCount}, elapsedMilliseconds={(long)(DateTime.UtcNow - scanStartedUtc).TotalMilliseconds}.");
+      return null;
+    }
+
+    /// <summary>
+    /// Finds one missing resource-metadata operation after structure and textual content have
+    /// had an opportunity to converge. Resource metadata is deliberately lower priority than
+    /// user-visible text because binary/resource discovery can otherwise dominate the mirror
+    /// for hours.
+    /// </summary>
+    private FetchWorkItem FindNextMissingResourceMetadataDeepestFirst() {
+      string[] knownAreas = this.GetKnownAreasOrderedByDescendingDepth();
+
+      foreach (string area in knownAreas) {
+        CachedCapabilities capabilities;
+
+        if (!this.TryReadCachedPayloadOnly(
+              "capabilities",
+              area,
+              out capabilities
+            )) {
+          continue;
+        }
+
+        if (!capabilities.SupportsResources) {
+          continue;
+        }
+
+        if (this.HasCacheEntry("resources", area)) {
+          continue;
+        }
+
+        FetchWorkItem candidate = new FetchWorkItem(
+          "resources",
+          area,
+          "missing deepest-first resource metadata"
+        );
+
+        if (!this.IsWorkItemBlockedByFrozenProvider(candidate)) {
+          return candidate;
+        }
+      }
 
       return null;
     }
@@ -1729,21 +1841,20 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     /// refreshed only after a consumer requests it and thereby places it in the priority
     /// queue.
     /// </summary>
-    private FetchWorkItem FindOldestExpiredContentWorkItem() {
-      DateTime scanStartedUtc = DateTime.UtcNow;
+    private FetchWorkItem FindOldestExpiredTextContentWorkItem() {
       DateTime utcNow = DateTime.UtcNow;
       PersistentCacheEntry[] entries = this.ReadAllPersistentEntries();
 
       PersistentCacheEntry[] candidates = entries
         .Where(
           (PersistentCacheEntry entry) =>
-            this.IsAutonomousContentOperation(entry.Operation) &&
+            this.IsAutonomousTextContentOperation(entry.Operation) &&
             !this.IsFresh(entry.CreatedUtc, utcNow) &&
             !this.IsWorkItemBlockedByFrozenProvider(
               new FetchWorkItem(
                 entry.Operation,
                 entry.Argument,
-                "expired content candidate"
+                "expired text-content candidate"
               )
             )
         )
@@ -1755,17 +1866,44 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         )
         .ToArray();
 
-      DevLogger.LogTrace(
-        7421903804121L,
-        75220,
-        "Background knowledge cache expired content scan completed. persistentEntryCount="
-        + entries.Length.ToString()
-        + ", expiredAutonomousContentEntryCount="
-        + candidates.Length.ToString()
-        + ", elapsedMilliseconds="
-        + ((long)(DateTime.UtcNow - scanStartedUtc).TotalMilliseconds).ToString()
-        + "."
+      if (candidates.Length == 0) {
+        return null;
+      }
+
+      PersistentCacheEntry selected = candidates[0];
+
+      return new FetchWorkItem(
+        selected.Operation,
+        selected.Argument,
+        "expired deepest-first text-content cache entry"
       );
+    }
+
+    /// <summary>
+    /// Finds one expired resource operation only after structure and textual content work have
+    /// been exhausted for the current heartbeat.
+    /// </summary>
+    private FetchWorkItem FindOldestExpiredResourceWorkItem() {
+      DateTime utcNow = DateTime.UtcNow;
+      PersistentCacheEntry[] entries = this.ReadAllPersistentEntries();
+
+      PersistentCacheEntry[] candidates = entries
+        .Where(
+          (PersistentCacheEntry entry) =>
+            this.IsAutonomousResourceOperation(entry.Operation) &&
+            !this.IsFresh(entry.CreatedUtc, utcNow) &&
+            !this.IsWorkItemBlockedByFrozenProvider(
+              new FetchWorkItem(
+                entry.Operation,
+                entry.Argument,
+                "expired resource candidate"
+              )
+            )
+        )
+        .OrderBy(
+          (PersistentCacheEntry entry) => entry.CreatedUtc
+        )
+        .ToArray();
 
       if (candidates.Length == 0) {
         return null;
@@ -1776,7 +1914,7 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
       return new FetchWorkItem(
         selected.Operation,
         selected.Argument,
-        "expired deepest-first content cache entry"
+        "expired resource cache entry"
       );
     }
 
@@ -1797,10 +1935,17 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
     /// Aggregated content is intentionally absent because it can represent an arbitrarily
     /// large explicit subtree operation.
     /// </summary>
-    private bool IsAutonomousContentOperation(string operation) {
+    private bool IsAutonomousTextContentOperation(string operation) {
       return
         string.Equals(operation, "has-direct-content", StringComparison.Ordinal) ||
-        string.Equals(operation, "direct-content", StringComparison.Ordinal) ||
+        string.Equals(operation, "direct-content", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Determines whether an operation belongs to the low-priority autonomous resource lane.
+    /// </summary>
+    private bool IsAutonomousResourceOperation(string operation) {
+      return
         string.Equals(operation, "resources", StringComparison.Ordinal) ||
         string.Equals(operation, "resource-content", StringComparison.Ordinal);
     }

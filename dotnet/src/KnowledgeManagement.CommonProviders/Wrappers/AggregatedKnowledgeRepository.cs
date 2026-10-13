@@ -184,19 +184,17 @@ namespace KnowledgeManagement.SmartStandards.Wrappers {
         string normalizedArea = this.NormalizeAreaPath(area);
 
         foreach (MountedRepository mountedRepository in _Repositories) {
-          bool providerOwnsArea = this.IsSameOrDescendant(
+          bool areaIsInsideMount = this.IsSameOrDescendant(
             normalizedArea,
             mountedRepository.MountPoint
           );
 
-          bool searchCanReachProvider =
-            string.Equals(operation, "search", StringComparison.Ordinal) &&
-            this.IsSameOrDescendant(
-              mountedRepository.MountPoint,
-              normalizedArea
-            );
+          bool mountIsInsideArea = this.IsSameOrDescendant(
+            mountedRepository.MountPoint,
+            normalizedArea
+          );
 
-          if (!providerOwnsArea && !searchCanReachProvider) {
+          if (!areaIsInsideMount && !mountIsInsideArea) {
             continue;
           }
 
